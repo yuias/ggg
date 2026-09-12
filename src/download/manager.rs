@@ -1079,6 +1079,16 @@ impl DownloadManager {
         new_folder_id: String,
         config: Option<&tokio::sync::RwLock<crate::app::config::Config>>,
     ) -> Result<()> {
+        // An in-flight download holds a clone of its source folder's queue, so
+        // moving it would send every later count update to the wrong queue and
+        // leave it stuck `Downloading`. Pause first: that aborts the spawned
+        // future and settles the source queue's counts before the move.
+        if let Some(task) = self.get_by_id(id).await
+            && task.status == DownloadStatus::Downloading
+        {
+            self.pause_download(id).await?;
+        }
+
         // Find and remove from old folder queue
         let task = {
             let queues = self.folder_queues.read().await;
@@ -1141,6 +1151,12 @@ impl DownloadManager {
             // Add to new folder queue
             let new_queue = self.get_or_create_folder_queue(&new_folder_id).await;
             new_queue.add(task).await;
+
+            // The source folder may have just been drained. Release its
+            // activation slot, otherwise `parallel_folder_count` keeps the
+            // destination folder from ever being activated and its tasks stay
+            // `Pending`. Done after the re-add so a same-folder move is a no-op.
+            self.deactivate_folder_if_empty(&old_folder_id).await;
             Ok(())
         } else {
             Err(anyhow::anyhow!("Task not found"))
@@ -1964,5 +1980,85 @@ mod tests {
 
         // Should return error
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_change_folder_releases_source_activation_slot() {
+        // parallel_folder_count = 1: the destination folder can only be
+        // activated if the move released the source folder's slot.
+        let manager = DownloadManager::with_config(3, 3, 1, 3, 5);
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        assert!(manager.try_activate_folder("folder1").await);
+
+        manager
+            .change_folder(id, "folder2".to_string(), None)
+            .await
+            .expect("move should succeed");
+
+        assert!(
+            !manager.active_folders.read().await.contains("folder1"),
+            "source folder slot must be released once it is drained"
+        );
+        assert!(
+            manager.try_activate_folder("folder2").await,
+            "destination folder must be activatable after the move"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_change_folder_keeps_slot_when_source_still_has_tasks() {
+        let manager = DownloadManager::with_config(3, 3, 2, 3, 5);
+
+        let mut moved = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        moved.folder_id = "folder1".to_string();
+        let moved_id = moved.id;
+        manager.add_download(moved).await;
+
+        let mut stays = DownloadTask::new("https://example.com/b.bin".to_string(), "/tmp".into());
+        stays.folder_id = "folder1".to_string();
+        manager.add_download(stays).await;
+
+        assert!(manager.try_activate_folder("folder1").await);
+
+        manager
+            .change_folder(moved_id, "folder2".to_string(), None)
+            .await
+            .expect("move should succeed");
+
+        assert!(
+            manager.active_folders.read().await.contains("folder1"),
+            "source folder still has a pending task, so it stays active"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_change_folder_moves_task_between_queues() {
+        let manager = DownloadManager::new();
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        manager
+            .change_folder(id, "folder2".to_string(), None)
+            .await
+            .expect("move should succeed");
+
+        let source = manager.get_folder_queue("folder1").await.expect("source queue");
+        assert_eq!(source.get_counts().await.pending, 0);
+        assert!(source.get_all().await.is_empty());
+
+        let dest = manager.get_folder_queue("folder2").await.expect("destination queue");
+        assert_eq!(dest.get_counts().await.pending, 1);
+        assert_eq!(
+            manager.get_by_id(id).await.expect("task still exists").folder_id,
+            "folder2"
+        );
     }
 }

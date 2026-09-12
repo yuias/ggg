@@ -1750,7 +1750,13 @@ impl TuiApp {
                 }
             }
             if changed {
+                // Selection is global, not per-folder: leaving it set would carry
+                // the checkmarks into the destination folder and fan subsequent
+                // single-item actions out to every moved task.
+                self.state.clear_selections();
                 self.save_queue().await?;
+                // The source list just shrank; keep the cursor in range.
+                self.state.adjust_selection_after_delete();
             }
         }
         self.state.ui_mode = UiMode::Normal;
@@ -2119,7 +2125,12 @@ impl TuiApp {
                     // Reference item is not downloading → start startable items
                     match task.status {
                         DownloadStatus::Pending | DownloadStatus::Paused | DownloadStatus::Error => {
-                            self.manager.start_download(id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await?;
+                            // A refused start (folder limit reached, circuit
+                            // breaker open) is an expected outcome, not a reason
+                            // to tear down the TUI.
+                            if let Err(e) = self.manager.start_download(id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await {
+                                tracing::warn!("Failed to start download {}: {}", id, e);
+                            }
                         }
                         _ => {}
                     }
@@ -2179,7 +2190,9 @@ impl TuiApp {
     async fn retry_download(&mut self) -> Result<()> {
         if let Some(task) = self.state.get_selected_download() {
             if task.status == DownloadStatus::Error {
-                self.manager.start_download(task.id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await?;
+                if let Err(e) = self.manager.start_download(task.id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await {
+                    tracing::warn!("Failed to retry download {}: {}", task.id, e);
+                }
                 self.save_queue().await?;
             }
         }
@@ -2694,14 +2707,20 @@ impl TuiApp {
 
         // Auto-start if enabled
         if should_auto_start {
-            self.manager
+            match self
+                .manager
                 .start_download(
                     task_id,
                     self.state.app_state.script_sender.clone(),
                     self.state.app_state.config.clone(),
                 )
-                .await?;
-            tracing::info!("Auto-started download in folder '{}'", folder_id);
+                .await
+            {
+                Ok(()) => tracing::info!("Auto-started download in folder '{}'", folder_id),
+                // The task stays queued as Pending; refusing to start it must
+                // not abort the whole add.
+                Err(e) => tracing::warn!("Auto-start failed in folder '{}': {}", folder_id, e),
+            }
         }
 
         self.save_queue().await?;
