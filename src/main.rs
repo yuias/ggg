@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
 
     // Set up daily rotating file appender (YYYYMMDD.jsonl format)
     let file_appender = tracing_appender::rolling::daily(&logs_dir, "app.jsonl");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, log_guard) = tracing_appender::non_blocking(file_appender);
 
     // Set log level based on verbose flag
     let log_level = if cli.verbose {
@@ -41,6 +41,19 @@ async fn main() -> Result<()> {
                 )),
         )
         .init();
+
+    // Panics otherwise only reach stderr, which the TUI's alternate screen hides.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        tracing::error!(
+            thread = thread.name().unwrap_or("<unnamed>"),
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "Panic: {}",
+            info
+        );
+        default_panic_hook(info);
+    }));
 
     tracing::info!("Starting GGG...");
     if cli.verbose {
@@ -101,6 +114,8 @@ async fn main() -> Result<()> {
                 download_manager,
             ).await;
 
+            // process::exit skips destructors; flush buffered log lines first.
+            drop(log_guard);
             std::process::exit(exit_code);
         }
         None => {
