@@ -524,6 +524,19 @@ impl ScriptEngine {
         }
     }
 
+    /// Run V8 foreground tasks queued by the platform (GC and similar).
+    ///
+    /// deno_core drains these only inside the event loop, which this engine
+    /// never runs otherwise, so they would pile up without this.
+    pub fn pump_v8_tasks(&mut self) {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let std::task::Poll::Ready(Err(e)) =
+            self.runtime.poll_event_loop(&mut cx, Default::default())
+        {
+            tracing::warn!("V8 event loop tick failed: {}", e);
+        }
+    }
+
     /// Get handler count for an event (for testing)
     #[cfg(test)]
     pub fn handler_count(&self, event: HookEvent) -> usize {

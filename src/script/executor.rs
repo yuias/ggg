@@ -6,6 +6,7 @@
 use super::message::ScriptRequest;
 use super::ScriptManager;
 use std::sync::mpsc;
+use std::time::Duration;
 
 /// Script executor loop
 ///
@@ -25,9 +26,21 @@ pub fn script_executor_loop(
 ) {
     tracing::info!("Starting script executor loop");
 
+    // Delayed V8 tasks (e.g. GC memory reducer) also arrive while idle, so the
+    // loop wakes up periodically to run them.
+    const IDLE_PUMP_INTERVAL: Duration = Duration::from_secs(5);
+
     // Process requests
     let mut request_count = 0;
-    while let Ok(request) = rx.recv() {
+    loop {
+        let request = match rx.recv_timeout(IDLE_PUMP_INTERVAL) {
+            Ok(request) => request,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                script_manager.pump_v8_tasks();
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         request_count += 1;
         tracing::debug!("Processing script request #{}: {:?}", request_count, request);
 
@@ -93,6 +106,8 @@ pub fn script_executor_loop(
                 let _ = response.send(result);
             }
         }
+
+        script_manager.pump_v8_tasks();
     }
 
     tracing::info!(

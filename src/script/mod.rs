@@ -89,6 +89,11 @@ impl ScriptManager {
         Ok(())
     }
 
+    /// Run pending V8 foreground tasks (see `ScriptEngine::pump_v8_tasks`)
+    pub fn pump_v8_tasks(&mut self) {
+        self.engine.pump_v8_tasks();
+    }
+
     /// Trigger beforeRequest hook
     ///
     /// # Parameters

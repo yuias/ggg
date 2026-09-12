@@ -53,8 +53,15 @@ impl AppState {
 
             let script_config = config.scripts.clone();
 
+            // deno_core captures the current tokio handle when the JsRuntime is
+            // created and uses it to schedule V8 delayed tasks (e.g. GC). Without
+            // one, the first delayed task aborts the whole process.
+            let tokio_handle = tokio::runtime::Handle::current();
+
             // Spawn in a dedicated OS thread since ScriptManager (!Send) cannot cross thread boundaries
             std::thread::spawn(move || {
+                let _rt_guard = tokio_handle.enter();
+
                 // Create ScriptManager
                 let mut script_manager = match crate::script::ScriptManager::new(&script_config) {
                     Ok(sm) => {
@@ -77,7 +84,7 @@ impl AppState {
                     tracing::info!("Scripts loaded successfully");
                 }
 
-                // Run executor loop (no tokio runtime needed)
+                // Run executor loop (the runtime guard above stays entered)
                 executor::script_executor_loop(rx, script_manager);
             });
 
