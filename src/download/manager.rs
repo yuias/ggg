@@ -1044,7 +1044,7 @@ impl DownloadManager {
             tracing::error!("Failed to persist queue after completion: {}", e);
         }
 
-        tracing::info!("Download completed and logged: {}", task.filename);
+        tracing::debug!("Download completed and logged: {}", task.filename);
 
         Ok(task)
     }
@@ -1291,7 +1291,7 @@ impl DownloadManager {
         // Check if we can activate more folders
         if active.len() < self.parallel_folder_count {
             active.insert(folder_id.to_string());
-            tracing::info!(
+            tracing::trace!(
                 "Activated folder '{}' ({}/{} active folders)",
                 folder_id,
                 active.len(),
@@ -1325,7 +1325,7 @@ impl DownloadManager {
         if !self.folder_has_active_tasks(folder_id).await {
             let mut active = self.active_folders.write().await;
             if active.remove(folder_id) {
-                tracing::info!(
+                tracing::trace!(
                     "Deactivated folder '{}' ({}/{} active folders)",
                     folder_id,
                     active.len(),

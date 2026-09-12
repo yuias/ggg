@@ -167,7 +167,7 @@ async fn process_request(
 ) -> IpcResponse {
     match request {
         IpcRequest::AddUrl { url } => {
-            tracing::info!("IPC received URL: {}", url);
+            tracing::debug!("IPC received URL: {}", url);
 
             // Forward to TUI event loop
             match event_tx.send(IpcEvent::UrlReceived(url.clone())).await {

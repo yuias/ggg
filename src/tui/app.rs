@@ -98,7 +98,7 @@ impl TuiApp {
             }
             #[cfg(windows)]
             TuiEvent::IpcUrl(url) => {
-                tracing::info!("IPC URL received from ggg-dnd: {}", url);
+                tracing::debug!("IPC URL received from ggg-dnd: {}", url);
                 if let Err(e) = self.add_download_from_paste(&url).await {
                     tracing::error!("Failed to add download from IPC: {}", e);
                 }
@@ -2716,7 +2716,7 @@ impl TuiApp {
                 )
                 .await
             {
-                Ok(()) => tracing::info!("Auto-started download in folder '{}'", folder_id),
+                Ok(()) => tracing::debug!("Auto-started download in folder '{}'", folder_id),
                 // The task stays queued as Pending; refusing to start it must
                 // not abort the whole add.
                 Err(e) => tracing::warn!("Auto-start failed in folder '{}': {}", folder_id, e),
@@ -2748,7 +2748,7 @@ impl TuiApp {
             self.add_download_with_auto_start(task).await?;
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Auto-added {} download(s) from paste/D&D to folder '{}'",
             urls.len(),
             folder_id
