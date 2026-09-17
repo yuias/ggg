@@ -1079,13 +1079,22 @@ impl DownloadManager {
         new_folder_id: String,
         config: Option<&tokio::sync::RwLock<crate::app::config::Config>>,
     ) -> Result<()> {
+        let current = self
+            .get_by_id(id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Task not found"))?;
+
+        // A task already in the destination folder has nothing to move, and the
+        // pause below would interrupt its download for no reason.
+        if current.folder_id == new_folder_id {
+            return Ok(());
+        }
+
         // An in-flight download holds a clone of its source folder's queue, so
         // moving it would send every later count update to the wrong queue and
         // leave it stuck `Downloading`. Pause first: that aborts the spawned
         // future and settles the source queue's counts before the move.
-        if let Some(task) = self.get_by_id(id).await
-            && task.status == DownloadStatus::Downloading
-        {
+        if current.status == DownloadStatus::Downloading {
             self.pause_download(id).await?;
         }
 
@@ -1155,7 +1164,7 @@ impl DownloadManager {
             // The source folder may have just been drained. Release its
             // activation slot, otherwise `parallel_folder_count` keeps the
             // destination folder from ever being activated and its tasks stay
-            // `Pending`. Done after the re-add so a same-folder move is a no-op.
+            // `Pending`.
             self.deactivate_folder_if_empty(&old_folder_id).await;
             Ok(())
         } else {
@@ -2060,5 +2069,34 @@ mod tests {
             manager.get_by_id(id).await.expect("task still exists").folder_id,
             "folder2"
         );
+    }
+
+    #[tokio::test]
+    async fn test_change_folder_to_same_folder_leaves_task_untouched() {
+        let manager = DownloadManager::new();
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        task.status = DownloadStatus::Downloading;
+        task.downloaded = 1234;
+        let id = task.id;
+        manager.add_download(task).await;
+
+        manager
+            .change_folder(id, "folder1".to_string(), None)
+            .await
+            .expect("same-folder move should succeed");
+
+        let moved = manager.get_by_id(id).await.expect("task still exists");
+        assert_eq!(
+            moved.status,
+            DownloadStatus::Downloading,
+            "a same-folder move must not interrupt the download"
+        );
+        assert_eq!(moved.downloaded, 1234);
+
+        let queue = manager.get_folder_queue("folder1").await.expect("queue");
+        assert_eq!(queue.len().await, 1);
+        assert_eq!(queue.get_counts().await.downloading, 1);
     }
 }
