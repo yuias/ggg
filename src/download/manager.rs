@@ -1121,18 +1121,21 @@ impl DownloadManager {
             self.pause_download(id).await?;
         }
 
-        // Find and remove from old folder queue
-        let task = {
-            let queues = self.folder_queues.read().await;
-            let mut found_task = None;
-            for queue in queues.values() {
-                if let Some(t) = queue.remove(id).await {
-                    found_task = Some(t);
-                    break;
-                }
-            }
-            found_task
+        // Find and remove from old folder queue. Snapshot the queues (cheap Arc
+        // clones) and drop the outer lock before awaiting on individual queues,
+        // so a concurrent writer to `folder_queues` can't be blocked behind
+        // this read guard.
+        let queues: Vec<FolderQueue> = {
+            let guard = self.folder_queues.read().await;
+            guard.values().cloned().collect()
         };
+        let mut task = None;
+        for queue in queues {
+            if let Some(t) = queue.remove(id).await {
+                task = Some(t);
+                break;
+            }
+        }
 
         if let Some(mut task) = task {
             let old_folder_id = task.folder_id.clone();
