@@ -1073,6 +1073,17 @@ impl DownloadManager {
         Ok(())
     }
 
+    /// Move a task to another folder queue, adopting the destination folder's
+    /// settings for every value the task had inherited from its old folder.
+    ///
+    /// A task that was downloading is re-queued as `Pending`, not `Paused`: it
+    /// has to start over anyway, and only `Pending` tasks are picked up by the
+    /// folder-scoped start actions. The destination folder's
+    /// `auto_start_downloads` is deliberately not consulted — a move never
+    /// starts a download on its own.
+    ///
+    /// `config` may be `None`, which skips both the settings adoption and the
+    /// destination-folder check.
     pub async fn change_folder(
         &self,
         id: Uuid,
@@ -1094,7 +1105,8 @@ impl DownloadManager {
         // moving it would send every later count update to the wrong queue and
         // leave it stuck `Downloading`. Pause first: that aborts the spawned
         // future and settles the source queue's counts before the move.
-        if current.status == DownloadStatus::Downloading {
+        let was_downloading = current.status == DownloadStatus::Downloading;
+        if was_downloading {
             self.pause_download(id).await?;
         }
 
@@ -1155,6 +1167,21 @@ impl DownloadManager {
                         task.headers.entry(k.clone()).or_insert_with(|| v.clone());
                     }
                 }
+            }
+
+            // An interrupted download cannot be resumed across the move:
+            // `start_download` only sends a Range request for a `Paused`/`Error`
+            // task, and the partial file may not even live under the destination
+            // folder's save_path. Re-queue it as `Pending` — that is the state
+            // the folder-scoped start actions look for — and drop the progress
+            // that no longer describes anything on disk.
+            if was_downloading {
+                task.status = DownloadStatus::Pending;
+                task.downloaded = 0;
+                task.log_info(format!(
+                    "Re-queued as pending after moving to folder '{}'",
+                    new_folder_id
+                ));
             }
 
             // Add to new folder queue
@@ -2098,5 +2125,38 @@ mod tests {
         let queue = manager.get_folder_queue("folder1").await.expect("queue");
         assert_eq!(queue.len().await, 1);
         assert_eq!(queue.get_counts().await.downloading, 1);
+    }
+
+    #[tokio::test]
+    async fn test_change_folder_requeues_downloading_task_as_pending() {
+        let manager = DownloadManager::new();
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        task.status = DownloadStatus::Downloading;
+        task.downloaded = 1234;
+        let id = task.id;
+        manager.add_download(task).await;
+
+        manager
+            .change_folder(id, "folder2".to_string(), None)
+            .await
+            .expect("move should succeed");
+
+        let moved = manager.get_by_id(id).await.expect("task still exists");
+        assert_eq!(
+            moved.status,
+            DownloadStatus::Pending,
+            "a moved in-flight task must be startable from the destination folder"
+        );
+        assert_eq!(moved.downloaded, 0, "stale progress must not survive the move");
+
+        let source = manager.get_folder_queue("folder1").await.expect("source queue");
+        assert_eq!(source.get_counts().await.downloading, 0);
+
+        let dest = manager.get_folder_queue("folder2").await.expect("destination queue");
+        let counts = dest.get_counts().await;
+        assert_eq!(counts.pending, 1);
+        assert_eq!(counts.downloading, 0);
     }
 }
