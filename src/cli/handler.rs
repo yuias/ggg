@@ -1530,7 +1530,15 @@ async fn handle_move(
             .map_err(|_| anyhow::anyhow!("Invalid before UUID format"))?;
         manager.move_before(id, before_id).await?;
         println!("Moved download {} before {}", id, before_id);
-    } else if let Some(folder_id) = folder {
+    } else if let Some(folder_arg) = folder {
+        // Accept a display name as well as the UUID key, as the other folder
+        // subcommands do. The read guard is dropped before the move, which
+        // takes the config lock itself.
+        let folder_id = {
+            let config = state.config.read().await;
+            resolve_folder_id(&config, &folder_arg)
+                .ok_or_else(|| anyhow::anyhow!("Folder '{}' not found", folder_arg))?
+        };
         manager.change_folder(id, folder_id.clone(), Some(&state.config)).await?;
         println!("Moved download {} to folder '{}'", id, folder_id);
     }

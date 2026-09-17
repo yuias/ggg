@@ -1101,6 +1101,17 @@ impl DownloadManager {
             return Ok(());
         }
 
+        // Reject an unknown destination rather than letting the queue creation
+        // below invent a folder that no config entry backs: such a queue is
+        // reachable by task id only, so its tasks disappear from the folder
+        // tree and from every folder-scoped operation.
+        if let Some(config_lock) = config {
+            let cfg = config_lock.read().await;
+            if !cfg.folders.contains_key(&new_folder_id) {
+                return Err(anyhow::anyhow!("Folder '{}' not found", new_folder_id));
+            }
+        }
+
         // An in-flight download holds a clone of its source folder's queue, so
         // moving it would send every later count update to the wrong queue and
         // leave it stuck `Downloading`. Pause first: that aborts the spawned
@@ -2158,5 +2169,39 @@ mod tests {
         let counts = dest.get_counts().await;
         assert_eq!(counts.pending, 1);
         assert_eq!(counts.downloading, 0);
+    }
+
+    #[tokio::test]
+    async fn test_change_folder_rejects_destination_missing_from_config() {
+        let manager = DownloadManager::new();
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let mut cfg = Config::default();
+        cfg.folders
+            .insert("known".to_string(), FolderConfig::default());
+        let config = tokio::sync::RwLock::new(cfg);
+
+        let result = manager
+            .change_folder(id, "ghost".to_string(), Some(&config))
+            .await;
+
+        assert!(result.is_err(), "an unknown destination must be rejected");
+        assert!(
+            manager.get_folder_queue("ghost").await.is_none(),
+            "a rejected move must not create a queue for the unknown folder"
+        );
+        assert_eq!(
+            manager.get_by_id(id).await.expect("task still exists").folder_id,
+            "folder1"
+        );
+
+        manager
+            .change_folder(id, "known".to_string(), Some(&config))
+            .await
+            .expect("a destination present in the config must be accepted");
     }
 }
