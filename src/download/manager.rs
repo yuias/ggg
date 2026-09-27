@@ -1249,8 +1249,10 @@ impl DownloadManager {
 
     /// Removes and stops `id`'s download, waiting for it to actually end so
     /// no late queue write from it can land after the caller's own write.
-    async fn stop_handle(&self, id: Uuid) {
+    /// Returns whether a live entry was actually found (and stopped).
+    async fn stop_handle(&self, id: Uuid) -> bool {
         let entry = self.active_downloads.write().await.remove(&id); // lock dropped here
+        let found = entry.is_some();
         if let Some(entry) = entry {
             entry.handle.abort();
             // Bounded: the completion path has a synchronous file rename.
@@ -1261,16 +1263,12 @@ impl DownloadManager {
                 tracing::warn!("download {id} did not stop within 5s after abort");
             }
         }
+        found
     }
 
-    /// Stops `id`'s live handle (including retry backoff) and marks it
-    /// `Paused`. A caller already holding the claim must call this, not
-    /// `pause_download`, which would wait on its own claim. A missing task
-    /// is a no-op.
-    async fn pause_claimed(&self, id: Uuid, _claim: &StartClaim) {
-        self.stop_handle(id).await;
-
-        // Update status and counts
+    /// Marks `id` `Paused` and updates counts/events. A missing task is a
+    /// no-op.
+    async fn write_paused_status(&self, id: Uuid) {
         if let Some(mut task) = self.get_by_id(id).await {
             let folder_id = task.folder_id.clone();
             task.status = DownloadStatus::Paused;
@@ -1285,6 +1283,15 @@ impl DownloadManager {
         }
     }
 
+    /// Stops `id`'s live handle (including retry backoff) and marks it
+    /// `Paused`. A caller already holding the claim must call this, not
+    /// `pause_download`, which would wait on its own claim. A missing task
+    /// is a no-op.
+    async fn pause_claimed(&self, id: Uuid, _claim: &StartClaim) {
+        self.stop_handle(id).await;
+        self.write_paused_status(id).await;
+    }
+
     /// Pauses `id`: stops its live handle (downloading or retry backoff) and
     /// marks it `Paused`. Waits up to the claim-wait budget for another
     /// operation holding `id`'s claim (typically a start still running its
@@ -1295,6 +1302,40 @@ impl DownloadManager {
         let claim = self.acquire_claim_waiting(id, self.claim_wait_budget).await?;
         self.pause_claimed(id, &claim).await;
         Ok(())
+    }
+
+    /// Batch-pause version of `pause_download`/`pause_claimed`: takes `id`'s
+    /// claim, then re-checks whether the task is still in flight if no live
+    /// handle was found before touching it. A candidate can leave the
+    /// in-flight set between the batch's snapshot and this call taking the
+    /// claim -- for example a backoff task whose retries were just
+    /// exhausted and became `Error` -- and without the re-check this would
+    /// overwrite that terminal status with `Paused`. Returns `Ok(true)` if
+    /// the task was paused, `Ok(false)` if it was skipped as no longer in
+    /// flight.
+    async fn pause_if_in_flight(&self, id: Uuid) -> Result<bool, TaskBusy> {
+        let claim = self.acquire_claim_waiting(id, self.claim_wait_budget).await?;
+        let had_handle = self.stop_handle(id).await;
+        // Can't use `task_in_flight`/`run_state` here: this call itself holds
+        // `id`'s only claim, so `is_start_in_progress` would always report
+        // `Claimed`. Decide from the persisted status instead. A handle can
+        // still be found after its body wrote a final `Error` and before it
+        // released its entry, so a handle alone doesn't make the task
+        // pausable: only `Downloading`, or `Paused` with a handle (retry
+        // backoff), is.
+        let pausable = match self.get_by_id(id).await {
+            Some(task) => {
+                task.status == DownloadStatus::Downloading
+                    || (had_handle && task.status == DownloadStatus::Paused)
+            }
+            None => false,
+        };
+        if !pausable {
+            return Ok(false);
+        }
+        self.write_paused_status(id).await;
+        drop(claim);
+        Ok(true)
     }
 
     /// Applies a header edit to a queued task. Takes the same start claim
@@ -1559,20 +1600,47 @@ impl DownloadManager {
         resumed
     }
 
-    /// Pause all currently downloading tasks
+    /// Pause every task that is in flight (downloading, waiting for a
+    /// permit, in retry backoff, or mid-start).
     /// Returns the number of downloads paused
     pub async fn pause_all(&self) -> usize {
-        let downloads = self.get_all_downloads().await;
-        let active: Vec<Uuid> = downloads
-            .iter()
-            .filter(|t| t.status == DownloadStatus::Downloading)
-            .map(|t| t.id)
-            .collect();
-        
+        self.pause_in_flight(None).await
+    }
+
+    /// Pauses every in-flight task, optionally limited to one folder.
+    /// Returns how many pauses succeeded; a task whose claim stays busy is
+    /// logged and skipped.
+    async fn pause_in_flight(&self, folder_id: Option<&str>) -> usize {
+        let candidates = match folder_id {
+            Some(folder_id) => match self.get_folder_queue(folder_id).await {
+                Some(queue) => queue.get_all().await,
+                None => return 0,
+            },
+            None => self.get_all_downloads().await,
+        };
+
+        let mut in_flight = Vec::new();
+        for task in &candidates {
+            if self.task_in_flight(task).await {
+                in_flight.push(task.id);
+            }
+        }
+
+        // Different ids use different claims, so pausing them concurrently is
+        // safe -- and required: sequentially, N busy tasks would each pay the
+        // claim-wait budget plus up to 5s for the handle to stop, easily
+        // exceeding the daemon client's request timeout.
+        let results = futures_util::future::join_all(
+            in_flight.into_iter().map(|id| self.pause_if_in_flight(id)),
+        )
+        .await;
+
         let mut paused = 0;
-        for id in active {
-            if self.pause_download(id).await.is_ok() {
-                paused += 1;
+        for result in results {
+            match result {
+                Ok(true) => paused += 1,
+                Ok(false) => {}
+                Err(e) => tracing::warn!("skipped during a batch pause: {e}"),
             }
         }
         paused
@@ -2054,29 +2122,11 @@ impl DownloadManager {
         started
     }
 
-    /// Stop (pause) all downloading tasks in a specific folder
+    /// Stop (pause) every in-flight task in a specific folder (downloading,
+    /// waiting for a permit, in retry backoff, or mid-start).
     /// Returns the number of tasks stopped
     pub async fn stop_folder_tasks(&self, folder_id: &str) -> usize {
-        let queue = match self.get_folder_queue(folder_id).await {
-            Some(q) => q,
-            None => return 0,
-        };
-
-        let all_tasks = queue.get_all().await;
-        let downloading: Vec<Uuid> = all_tasks
-            .iter()
-            .filter(|t| t.status == DownloadStatus::Downloading)
-            .map(|t| t.id)
-            .collect();
-
-        let mut stopped = 0;
-        for id in downloading {
-            if self.pause_download(id).await.is_ok() {
-                stopped += 1;
-            }
-        }
-
-        stopped
+        self.pause_in_flight(Some(folder_id)).await
     }
 
     /// Start all pending tasks across all folders
@@ -2103,24 +2153,11 @@ impl DownloadManager {
         started
     }
 
-    /// Stop all downloading tasks across all folders
+    /// Stop every in-flight task across all folders (downloading, waiting
+    /// for a permit, in retry backoff, or mid-start).
     /// Returns the number of tasks stopped
     pub async fn stop_all_tasks(&self) -> usize {
-        let downloads = self.get_all_downloads().await;
-        let downloading: Vec<Uuid> = downloads
-            .iter()
-            .filter(|t| t.status == DownloadStatus::Downloading)
-            .map(|t| t.id)
-            .collect();
-
-        let mut stopped = 0;
-        for id in downloading {
-            if self.pause_download(id).await.is_ok() {
-                stopped += 1;
-            }
-        }
-
-        stopped
+        self.pause_in_flight(None).await
     }
 
     /// Get folder queue counts for display
@@ -3326,5 +3363,149 @@ mod tests {
         );
 
         drop(claim);
+    }
+
+    /// `pause_all` uses the in-flight rule, so a task sleeping in retry
+    /// backoff (persisted status `Paused`, live handle) is paused too.
+    #[tokio::test]
+    async fn pause_all_pauses_retry_backoff_task() {
+        let manager = DownloadManager::with_retry_settings(3, 60);
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            if manager.run_state(id).await == RunState::RetryBackoff {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "download did not reach RetryBackoff within 10s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(manager.pause_all().await, 1);
+
+        assert_eq!(manager.run_state(id).await, RunState::Idle);
+        let task = manager.get_by_id(id).await.expect("task still exists");
+        assert_eq!(task.status, DownloadStatus::Paused);
+    }
+
+    /// `stop_folder_tasks` counts a task whose claim is currently held by an
+    /// in-progress start (its beforeRequest script still running) as in
+    /// flight, and pauses the download that start ends up spawning -- the
+    /// task's persisted status is still `Pending` at the moment the batch
+    /// pause takes its snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_folder_tasks_pauses_claim_held_task() {
+        let manager = DownloadManager::new();
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let (script_tx, script_rx) = mpsc::channel::<ScriptRequest>();
+        // Never join this thread: nothing else drains the channel after the
+        // test's assertions run, and the retry loop's own clone would keep
+        // it open, so joining would hang.
+        let _responder = std::thread::spawn(move || {
+            while let Ok(req) = script_rx.recv() {
+                if let ScriptRequest::BeforeRequest { ctx, response, .. } = req {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = response.send((ctx, Ok(())));
+                }
+            }
+        });
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        let manager_start = manager.clone();
+        let start_handle = tokio::spawn(async move {
+            manager_start.start_download(id, Some(script_tx), config).await
+        });
+
+        // Let `start_download` acquire the claim before racing it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !manager.is_start_in_progress(id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "start did not claim the id within 2s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let stopped = manager.stop_folder_tasks("folder1").await;
+        assert_eq!(stopped, 1, "the claim-held task must be counted as in flight");
+
+        let start_outcome = start_handle.await.unwrap().expect("start must not error");
+        assert_eq!(start_outcome, StartOutcome::Started);
+
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(task.status, DownloadStatus::Paused);
+        assert_eq!(manager.get_active_count().await, 0);
+    }
+
+    /// A batch pause only touches in-flight tasks: a `Pending` task and a
+    /// task already `Paused` with no live handle are left alone.
+    #[tokio::test]
+    async fn stop_all_tasks_skips_idle_tasks() {
+        let manager = DownloadManager::new();
+
+        let pending = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        let pending_id = pending.id;
+        manager.add_download(pending).await;
+
+        let mut paused = DownloadTask::new("https://example.com/b.bin".to_string(), "/tmp".into());
+        paused.status = DownloadStatus::Paused;
+        let paused_id = paused.id;
+        manager.add_download(paused).await;
+
+        assert_eq!(manager.stop_all_tasks().await, 0);
+
+        assert_eq!(
+            manager.get_by_id(pending_id).await.expect("task exists").status,
+            DownloadStatus::Pending
+        );
+        assert_eq!(
+            manager.get_by_id(paused_id).await.expect("task exists").status,
+            DownloadStatus::Paused
+        );
+    }
+
+    /// `pause_if_in_flight` re-checks after taking the claim: a task that
+    /// left the in-flight set between the batch's snapshot and this call
+    /// (e.g. a backoff task whose retries were just exhausted, leaving it
+    /// `Error` with no live handle) must not have its terminal status
+    /// overwritten with `Paused`, and must not be counted as paused.
+    #[tokio::test]
+    async fn pause_if_in_flight_skips_task_no_longer_in_flight() {
+        let manager = DownloadManager::new();
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.status = DownloadStatus::Error;
+        let id = task.id;
+        manager.add_download(task).await;
+
+        match manager.pause_if_in_flight(id).await {
+            Ok(false) => {}
+            other => panic!("expected Ok(false) (not in flight), got {other:?}"),
+        }
+
+        assert_eq!(
+            manager.get_by_id(id).await.expect("task exists").status,
+            DownloadStatus::Error,
+            "a stale candidate must not have its terminal status overwritten"
+        );
     }
 }

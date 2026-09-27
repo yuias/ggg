@@ -2117,12 +2117,14 @@ impl TuiApp {
 
     /// Toggle download (start/pause) - supports multi-selection
     async fn toggle_download(&mut self) -> Result<()> {
-        // Use current item's status as the reference to determine start vs pause
-        let reference_downloading = self
-            .state
-            .get_selected_download()
-            .map(|t| t.status == DownloadStatus::Downloading)
-            .unwrap_or(false);
+        // Use the current item's in-flight state (downloading, waiting for a
+        // permit, in retry backoff, or mid-start) as the reference to decide
+        // start vs pause.
+        let reference_id = self.state.get_selected_download().map(|t| t.id);
+        let reference_in_flight = match reference_id {
+            Some(id) => self.manager.is_in_flight(id).await,
+            None => false,
+        };
 
         let target_ids = self.state.get_target_download_ids();
         if target_ids.is_empty() {
@@ -2131,31 +2133,29 @@ impl TuiApp {
 
         let mut busy_count = 0;
         for id in target_ids {
-            if let Some(task) = self.manager.get_by_id(id).await {
-                if reference_downloading {
-                    // Reference item is downloading → pause active downloads.
-                    // A busy claim (start still running its beforeRequest
-                    // script) is an expected outcome, not a reason to tear
-                    // down the TUI.
-                    if task.status == DownloadStatus::Downloading {
-                        if let Err(e) = self.manager.pause_download(id).await {
-                            tracing::warn!("Failed to pause download {}: {}", id, e);
-                            busy_count += 1;
+            if reference_in_flight {
+                // Reference item is in flight → pause in-flight targets, so
+                // a target still in retry backoff is paused too. A busy
+                // claim (start still running its beforeRequest script) is an
+                // expected outcome, not a reason to tear down the TUI.
+                if self.manager.is_in_flight(id).await {
+                    if let Err(e) = self.manager.pause_download(id).await {
+                        tracing::warn!("Failed to pause download {}: {}", id, e);
+                        busy_count += 1;
+                    }
+                }
+            } else if let Some(task) = self.manager.get_by_id(id).await {
+                // Reference item is not in flight → start startable items
+                match task.status {
+                    DownloadStatus::Pending | DownloadStatus::Paused | DownloadStatus::Error => {
+                        // A refused start (folder limit reached, circuit
+                        // breaker open) is an expected outcome, not a reason
+                        // to tear down the TUI.
+                        if let Err(e) = self.manager.start_download(id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await {
+                            tracing::warn!("Failed to start download {}: {}", id, e);
                         }
                     }
-                } else {
-                    // Reference item is not downloading → start startable items
-                    match task.status {
-                        DownloadStatus::Pending | DownloadStatus::Paused | DownloadStatus::Error => {
-                            // A refused start (folder limit reached, circuit
-                            // breaker open) is an expected outcome, not a reason
-                            // to tear down the TUI.
-                            if let Err(e) = self.manager.start_download(id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await {
-                                tracing::warn!("Failed to start download {}: {}", id, e);
-                            }
-                        }
-                        _ => {}
-                    }
+                    _ => {}
                 }
             }
         }

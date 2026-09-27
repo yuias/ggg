@@ -1478,24 +1478,10 @@ async fn handle_pause_all(
         return Ok(error::INVALID_INPUT);
     };
 
-    let tasks = manager.get_all_downloads().await;
-
-    let mut paused_count = 0;
-    for task in tasks {
-        if let Some(ref f) = folder_id {
-            if task.folder_id != *f {
-                continue;
-            }
-        }
-
-        // Only pause downloading tasks
-        if matches!(task.status, DownloadStatus::Downloading) {
-            match manager.pause_download(task.id).await {
-                Ok(_) => paused_count += 1,
-                Err(e) => tracing::warn!("Failed to pause {}: {}", task.filename, e),
-            }
-        }
-    }
+    let paused_count = match folder_id {
+        Some(ref f) => manager.stop_folder_tasks(f).await,
+        None => manager.pause_all().await,
+    };
 
     manager.save_queue_to_folders().await?;
 
