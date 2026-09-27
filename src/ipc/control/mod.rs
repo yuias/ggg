@@ -5,5 +5,7 @@
 //! `ggg` binary is both the only client and the only server.
 pub mod protocol;
 
-// server.rs (Windows) and client.rs are added once the pipe transport
-// itself is implemented.
+#[cfg(windows)]
+pub mod server;
+#[cfg(windows)]
+pub mod client;
