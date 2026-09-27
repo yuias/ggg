@@ -1335,11 +1335,17 @@ impl DownloadManager {
     /// Move a task to another folder queue, adopting the destination folder's
     /// settings for every value the task had inherited from its old folder.
     ///
-    /// A task that was downloading is re-queued as `Pending`, not `Paused`: it
-    /// has to start over anyway, and only `Pending` tasks are picked up by the
-    /// folder-scoped start actions. The destination folder's
-    /// `auto_start_downloads` is deliberately not consulted — a move never
-    /// starts a download on its own.
+    /// A task that was downloading or sleeping in retry backoff is re-queued
+    /// as `Pending`, not `Paused`: it has to start over anyway, and only
+    /// `Pending` tasks are picked up by the folder-scoped start actions. The
+    /// destination folder's `auto_start_downloads` is deliberately not
+    /// consulted — a move never starts a download on its own.
+    ///
+    /// Held for the whole move: `id`'s claim, so a concurrent start cannot
+    /// write this task back into the source queue after it is gone, and no
+    /// other pause/remove/move can interleave with this one. `Err` downcasts
+    /// to `TaskBusy` when another operation still holds the claim after the
+    /// wait budget; nothing is changed in that case.
     ///
     /// `config` may be `None`, which skips both the settings adoption and the
     /// destination-folder check.
@@ -1355,7 +1361,7 @@ impl DownloadManager {
             .ok_or_else(|| anyhow::anyhow!("Task not found"))?;
 
         // A task already in the destination folder has nothing to move, and the
-        // pause below would interrupt its download for no reason.
+        // stop below would interrupt its download for no reason.
         if current.folder_id == new_folder_id {
             return Ok(());
         }
@@ -1371,13 +1377,27 @@ impl DownloadManager {
             }
         }
 
-        // An in-flight download holds a clone of its source folder's queue, so
-        // moving it would send every later count update to the wrong queue and
-        // leave it stuck `Downloading`. Pause first: that aborts the spawned
-        // future and settles the source queue's counts before the move.
-        let was_downloading = current.status == DownloadStatus::Downloading;
-        if was_downloading {
-            self.pause_download(id).await?;
+        let claim = self.acquire_claim_waiting(id, self.claim_wait_budget).await?;
+
+        // Re-read under the claim: `current` above may be stale by the time
+        // the claim was granted, e.g. a concurrent move already landed it in
+        // the destination.
+        let current = self
+            .get_by_id(id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Task not found"))?;
+        if current.folder_id == new_folder_id {
+            return Ok(());
+        }
+
+        // An in-flight download (downloading, or sleeping in retry backoff)
+        // holds a clone of its source folder's queue, so moving it would send
+        // every later count update to the wrong queue and leave it stuck.
+        // Stop it first: that aborts the spawned future (or the retry sleep)
+        // and settles the source queue's counts before the move.
+        let must_stop = current.status == DownloadStatus::Downloading || self.is_running(id).await;
+        if must_stop {
+            self.pause_claimed(id, &claim).await;
         }
 
         // Find and remove from old folder queue. Snapshot the queues (cheap Arc
@@ -1448,7 +1468,7 @@ impl DownloadManager {
             // folder's save_path. Re-queue it as `Pending` — that is the state
             // the folder-scoped start actions look for — and drop the progress
             // that no longer describes anything on disk.
-            if was_downloading {
+            if must_stop {
                 task.status = DownloadStatus::Pending;
                 task.downloaded = 0;
                 task.log_info(format!(
@@ -2616,6 +2636,74 @@ mod tests {
             .change_folder(id, "known".to_string(), Some(&config))
             .await
             .expect("a destination present in the config must be accepted");
+    }
+
+    #[tokio::test]
+    async fn change_folder_moves_backoff_task_as_pending() {
+        let manager = DownloadManager::with_retry_settings(3, 60);
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            if manager.run_state(id).await == RunState::RetryBackoff {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "download did not reach RetryBackoff within 10s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        manager
+            .change_folder(id, "folder2".to_string(), None)
+            .await
+            .expect("move must stop the backoff task and succeed");
+
+        let task = manager.get_by_id(id).await.expect("task still exists");
+        assert_eq!(task.folder_id, "folder2");
+        assert_eq!(task.status, DownloadStatus::Pending);
+        assert_eq!(task.downloaded, 0);
+        assert_eq!(manager.run_state(id).await, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn change_folder_busy_leaves_task_in_place() {
+        let mut manager = DownloadManager::new();
+        manager.set_claim_wait_budget(std::time::Duration::from_millis(100));
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let claim = StartClaim::try_acquire(&manager.start_claims, id).expect("claim must be free");
+
+        let result = manager.change_folder(id, "folder2".to_string(), None).await;
+        let err = result.expect_err("a busy claim must block the move");
+        assert!(
+            err.downcast_ref::<TaskBusy>().is_some(),
+            "expected TaskBusy, got {err:?}"
+        );
+
+        assert_eq!(
+            manager.get_by_id(id).await.expect("task still exists").folder_id,
+            "folder1"
+        );
+
+        drop(claim);
     }
 
     #[tokio::test]
