@@ -14,6 +14,12 @@ async fn main() -> Result<()> {
     // Parse CLI arguments first to get verbose flag
     let cli = Cli::parse();
 
+    // Applied before the log appender is created, so `--config X` writes logs
+    // under X, where `logs` looks for them.
+    if let Some(ref config_dir) = cli.config {
+        ggg::util::paths::set_config_dir_override(Some(config_dir.clone()));
+    }
+
     // Get logs directory (creates if needed)
     let logs_dir = ggg::util::paths::get_logs_dir().unwrap_or_else(|_| PathBuf::from("."));
     std::fs::create_dir_all(&logs_dir).ok();
@@ -61,10 +67,8 @@ async fn main() -> Result<()> {
     }
     tracing::trace!("CLI arguments: {:?}", cli);
 
-    // Set config directory override if --config flag was used
     if let Some(ref config_dir) = cli.config {
         tracing::info!("Using config directory override: {:?}", config_dir);
-        ggg::util::paths::set_config_dir_override(Some(config_dir.clone()));
     }
 
     // Computed once: routing needs it for every subcommand, and a headless
