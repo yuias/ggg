@@ -11,9 +11,15 @@
 use crate::download::task::{DownloadStatus, DownloadTask};
 use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use uuid::Uuid;
+
+/// Disambiguates temp file names for `save()`. The PID separates processes
+/// writing the same folder (e.g. a standalone CLI invocation next to a
+/// running TUI); this counter separates writes within one process.
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Task counts for a folder queue
 #[derive(Debug, Clone, Default)]
@@ -53,6 +59,12 @@ pub struct FolderQueue {
     semaphore: Arc<Semaphore>,
     /// Task counts (pending/downloading) for efficient status checks
     counts: Arc<RwLock<FolderTaskCounts>>,
+    /// Serializes `save()` calls for this folder so a completion save
+    /// (`download_task` in manager.rs) can never overlap another save of
+    /// the same folder and race on the temp-file rename. Shared across
+    /// clones since all `FolderQueue` clones for a folder write the same
+    /// `queue.toml`.
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl FolderQueue {
@@ -67,6 +79,7 @@ impl FolderQueue {
             tasks: Arc::new(RwLock::new(VecDeque::new())),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             counts: Arc::new(RwLock::new(FolderTaskCounts::default())),
+            save_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -287,6 +300,11 @@ impl FolderQueue {
     ///
     /// Uses the folder-specific queue path: {config_dir}/{folder_id}/queue.toml
     pub async fn save(&self) -> anyhow::Result<()> {
+        // Held across serialization, write and rename: callers include the
+        // per-completion save in `download_task` and the daemon's batch
+        // saves, and they can run concurrently for the same folder.
+        let _guard = self.save_lock.lock().await;
+
         let queue_path = crate::util::paths::get_folder_queue_path(&self.folder_id)?;
 
         // Create parent directory if needed
@@ -294,20 +312,42 @@ impl FolderQueue {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let tasks = self.tasks.read().await;
-        let queue_file = QueueFile {
-            tasks: tasks.iter().cloned().collect(),
+        // Snapshot under the read lock, then release it before touching the
+        // filesystem so saving doesn't block concurrent queue mutations.
+        let (task_count, toml) = {
+            let tasks = self.tasks.read().await;
+            let queue_file = QueueFile {
+                tasks: tasks.iter().cloned().collect(),
+            };
+            (tasks.len(), toml::to_string_pretty(&queue_file)?)
         };
-        let toml = toml::to_string_pretty(&queue_file)?;
 
-        // Atomic write: temp file + rename
-        let temp_path = queue_path.with_extension("toml.tmp");
-        tokio::fs::write(&temp_path, &toml).await?;
-        tokio::fs::rename(&temp_path, &queue_path).await?;
+        // Atomic write: unique temp file + rename. The unique name (pid +
+        // counter) keeps this process's writes from clobbering another
+        // process's (e.g. standalone CLI next to the TUI) temp file for the
+        // same folder; `save_lock` only serializes writers within this
+        // process.
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = queue_path.with_extension(format!(
+            "toml.{}.{}.tmp",
+            std::process::id(),
+            counter
+        ));
+
+        let write_result = tokio::fs::write(&temp_path, &toml).await;
+        if let Err(e) = write_result {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
+
+        if let Err(e) = tokio::fs::rename(&temp_path, &queue_path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
 
         tracing::debug!(
             "Saved {} tasks to folder queue: {}",
-            tasks.len(),
+            task_count,
             queue_path.display()
         );
 
@@ -455,7 +495,9 @@ impl FolderQueue {
 mod tests {
     use super::*;
     use crate::download::task::DownloadTask;
+    use serial_test::serial;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn create_test_task(status: DownloadStatus) -> DownloadTask {
         let mut task = DownloadTask::new(
@@ -658,5 +700,57 @@ mod tests {
         queue.add(task).await;
         assert!(queue.contains_url(&url).await);
         assert!(!queue.contains_url("https://example.com/other.txt").await);
+    }
+
+    /// Regression test for the queue-save race: many concurrent `save()`
+    /// calls on the same folder (mirroring the per-completion save racing
+    /// the daemon's batch saves) must all succeed, leave a parseable
+    /// `queue.toml`, and never leave a stray `.tmp` file behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[serial]
+    async fn test_concurrent_save_no_race() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().to_path_buf();
+        crate::util::paths::set_config_dir_override(Some(config_dir));
+
+        let queue = FolderQueue::new("concurrent-folder", 3);
+        for _ in 0..5 {
+            queue.add(create_test_task(DownloadStatus::Pending)).await;
+        }
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let q = queue.clone();
+            handles.push(tokio::spawn(async move { q.save().await }));
+        }
+
+        for handle in handles {
+            handle
+                .await
+                .expect("save task panicked")
+                .expect("concurrent save should not fail");
+        }
+
+        let queue_path = crate::util::paths::get_folder_queue_path("concurrent-folder").unwrap();
+        let content = tokio::fs::read_to_string(&queue_path)
+            .await
+            .expect("queue.toml should exist after concurrent saves");
+        let parsed: QueueFile = toml::from_str(&content).expect("queue.toml should parse");
+        assert_eq!(parsed.tasks.len(), 5);
+
+        let folder_dir = queue_path.parent().unwrap();
+        let leftover_tmp: Vec<_> = std::fs::read_dir(folder_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(
+            leftover_tmp.is_empty(),
+            "leftover temp files: {:?}",
+            leftover_tmp
+        );
+
+        crate::util::paths::set_config_dir_override(None);
     }
 }

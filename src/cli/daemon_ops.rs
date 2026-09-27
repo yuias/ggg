@@ -62,12 +62,15 @@ pub struct DaemonContext {
     pub shutdown: Arc<Notify>,
     pub started_at: Instant,
     pub pipe_name: String,
-    /// Serializes every `save_queue_to_folders()` call the daemon makes:
-    /// one from each mutating connection's `after_response` (these run on
-    /// detached per-connection tasks that outlive `server_handle.abort()`),
-    /// one from the periodic auto-save, and the final save on shutdown.
-    /// `FolderQueue::save` writes a fixed `queue.toml.tmp` and renames it,
-    /// so two concurrent saves of the same folder race on that rename.
+    /// Orders the daemon's own `save_queue_to_folders()` call sites relative
+    /// to each other: one from each mutating connection's `after_response`
+    /// (these run on detached per-connection tasks that outlive
+    /// `server_handle.abort()`), one from the periodic auto-save, and the
+    /// final save on shutdown. Per-file write safety (unique temp names,
+    /// serializing concurrent writers of the same folder) now lives in
+    /// `FolderQueue::save` itself, so this lock only needs to keep the
+    /// daemon's saves in a sane order, e.g. the final save running after
+    /// the others.
     pub save_lock: Arc<Mutex<()>>,
 }
 

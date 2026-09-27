@@ -92,11 +92,11 @@ pub async fn run_daemon(
     let config = state.config.clone();
     let script_sender = state.script_sender.clone();
     let shutdown = Arc::new(Notify::new());
-    // Serializes every `save_queue_to_folders()` call: `DaemonContext`'s
-    // `after_response` (on detached per-connection tasks that outlive
-    // aborting the server), the auto-save below, and the final save. Two
-    // concurrent saves of the same folder race on `FolderQueue::save`'s
-    // fixed tmp-file rename.
+    // Orders the daemon's own `save_queue_to_folders()` calls relative to
+    // each other: `DaemonContext`'s `after_response` (on detached
+    // per-connection tasks that outlive aborting the server), the auto-save
+    // below, and the final save. Per-file write safety now lives in
+    // `FolderQueue::save` itself.
     let save_lock = Arc::new(Mutex::new(()));
 
     #[cfg(windows)]
