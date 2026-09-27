@@ -42,7 +42,9 @@ pub fn script_executor_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         request_count += 1;
-        tracing::debug!("Processing script request #{}: {:?}", request_count, request);
+        // Log only the request number and event kind: `request`'s context
+        // carries task headers, which may include a secret.
+        tracing::debug!("Processing script request #{}: {}", request_count, request.kind());
 
         match request {
             ScriptRequest::BeforeRequest { mut ctx, effective_script_files, response } => {

@@ -113,7 +113,15 @@ async fn main() -> Result<()> {
     // Load configuration
     tracing::trace!("Loading configuration from file...");
     let config = Config::load().unwrap_or_default();
-    tracing::info!("Config loaded: {:?}", config);
+    // `{:?}` on `Config` would include every folder's `default_headers`,
+    // which can carry secrets (a `Cookie`/`Authorization` value); log a
+    // summary instead.
+    tracing::info!(
+        "Config loaded: {} folder(s), max_concurrent={}, retry_count={}",
+        config.folders.len(),
+        config.download.max_concurrent,
+        config.download.retry_count,
+    );
     tracing::trace!("Configuration details: max_concurrent={}, retry_count={}",
         config.download.max_concurrent,
         config.download.retry_count);

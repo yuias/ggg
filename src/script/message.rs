@@ -72,16 +72,26 @@ pub enum ScriptRequest {
     },
 }
 
+impl ScriptRequest {
+    /// The event kind, with no context: every `ctx` variant carries task
+    /// headers (`BeforeRequestContext`, etc.), which may include a secret
+    /// such as a `Cookie` or `Authorization` value, so logging must never
+    /// format the context itself.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::BeforeRequest { .. } => "BeforeRequest",
+            Self::HeadersReceived { .. } => "HeadersReceived",
+            Self::Completed { .. } => "Completed",
+            Self::Error { .. } => "Error",
+            Self::Progress { .. } => "Progress",
+            Self::AuthRequired { .. } => "AuthRequired",
+            Self::Reload { .. } => "Reload",
+        }
+    }
+}
+
 impl std::fmt::Debug for ScriptRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BeforeRequest { .. } => write!(f, "ScriptRequest::BeforeRequest"),
-            Self::HeadersReceived { .. } => write!(f, "ScriptRequest::HeadersReceived"),
-            Self::Completed { .. } => write!(f, "ScriptRequest::Completed"),
-            Self::Error { .. } => write!(f, "ScriptRequest::Error"),
-            Self::Progress { .. } => write!(f, "ScriptRequest::Progress"),
-            Self::AuthRequired { .. } => write!(f, "ScriptRequest::AuthRequired"),
-            Self::Reload { .. } => write!(f, "ScriptRequest::Reload"),
-        }
+        write!(f, "ScriptRequest::{}", self.kind())
     }
 }
