@@ -441,15 +441,17 @@ async fn dispatch_pause_all(folder: Option<String>, ctx: &DaemonContext) -> Cont
 /// Checks whether `id` has already reached a final state: a history entry
 /// always means `Completed`, even if the id also somehow lingers in a queue;
 /// missing from both means `Removed`; otherwise the live task's status
-/// decides. `None` means "keep waiting" -- a `Pending`/`Downloading` task, or
-/// a `Paused` task with a handle still alive (retry backoff, not a real
-/// pause).
-async fn check_wait_state(id: Uuid, manager: &DownloadManager) -> Option<ControlResponse> {
+/// decides. `None` means "keep waiting" -- a `Pending`/`Downloading` task, a
+/// `Paused` task with a handle still alive (retry backoff, not a real
+/// pause), or a task whose start is still in progress. Shared by the
+/// daemon's `Wait` dispatch and standalone `start --wait`, so both agree on
+/// what counts as terminal.
+pub(crate) async fn wait_state(
+    id: Uuid,
+    manager: &DownloadManager,
+) -> Option<(WaitOutcome, Option<DownloadTask>)> {
     if let Some(task) = manager.get_history_item(id).await {
-        return Some(ControlResponse::Waited {
-            outcome: WaitOutcome::Completed,
-            task: Some(task),
-        });
+        return Some((WaitOutcome::Completed, Some(task)));
     }
     let Some(task) = manager.get_by_id(id).await else {
         // A completing download is removed from its folder queue, then
@@ -463,24 +465,15 @@ async fn check_wait_state(id: Uuid, manager: &DownloadManager) -> Option<Control
         // the task from the queue, so this check is never fooled by an
         // actual removal.
         if let Some(task) = manager.get_history_item(id).await {
-            return Some(ControlResponse::Waited {
-                outcome: WaitOutcome::Completed,
-                task: Some(task),
-            });
+            return Some((WaitOutcome::Completed, Some(task)));
         }
         if manager.is_running(id).await {
             return None;
         }
-        return Some(ControlResponse::Waited {
-            outcome: WaitOutcome::Removed,
-            task: None,
-        });
+        return Some((WaitOutcome::Removed, None));
     };
     match task.status {
-        DownloadStatus::Error => Some(ControlResponse::Waited {
-            outcome: WaitOutcome::Failed,
-            task: Some(task),
-        }),
+        DownloadStatus::Error => Some((WaitOutcome::Failed, Some(task))),
         // A start claimed after the task was paused (a sweep, or another
         // client) is about to make it Downloading again; report it only
         // once nothing -- a live handle or an in-flight start -- can still
@@ -488,13 +481,17 @@ async fn check_wait_state(id: Uuid, manager: &DownloadManager) -> Option<Control
         DownloadStatus::Paused
             if !manager.is_running(id).await && !manager.is_start_in_progress(id) =>
         {
-            Some(ControlResponse::Waited {
-                outcome: WaitOutcome::Paused,
-                task: Some(task),
-            })
+            Some((WaitOutcome::Paused, Some(task)))
         }
         _ => None,
     }
+}
+
+/// Wraps `wait_state` for the daemon's own `Wait` dispatch.
+async fn check_wait_state(id: Uuid, manager: &DownloadManager) -> Option<ControlResponse> {
+    wait_state(id, manager)
+        .await
+        .map(|(outcome, task)| ControlResponse::Waited { outcome, task })
 }
 
 /// Answers `Wait`. Subscribes before the first state check so a result that

@@ -1,16 +1,18 @@
 use super::error;
 use super::output;
+use super::remote;
+use super::daemon_ops;
 use super::{BridgeAction, Commands, ConfigAction, DebugAction, ScriptAction, FolderAction, ExportAction, ImportAction, TestAction};
 use super::bridge;
 use crate::app::config::{Config, FolderConfig};
 use crate::app::state::AppState;
-use crate::download::manager::{DownloadManager, EditHeadersError, StartOutcome};
+use crate::download::manager::{DownloadManager, EditHeadersError, RunState, StartOutcome};
 use crate::download::task::{DownloadTask, DownloadStatus};
 use crate::download::completion_log::CompletedEntry;
 use crate::download::enqueue::{
     build_task, enqueue, resolve_folder_id, resolve_target_folder, EnqueueOptions, EnqueueOutcome,
 };
-use crate::ipc::control::protocol::{AddedTask, SkippedUrl};
+use crate::ipc::control::protocol::{AddedTask, SkippedUrl, WaitOutcome};
 use crate::script::events::{BeforeRequestContext, HookEvent};
 use anyhow::Result;
 use std::path::PathBuf;
@@ -256,58 +258,64 @@ async fn handle_start(
     }
 
     if wait {
-        // Wait for download to complete and show progress
-        wait_for_download(id, manager).await?;
+        let (outcome, task) =
+            wait_until_final(id, manager, tokio::time::Duration::from_millis(500)).await;
+        // The failure path (max retries exceeded) never saves the terminal
+        // `Error` status on its own; every other terminal path already went
+        // through a queue write, so this is a harmless extra save for them.
+        // A failed save must not mask the outcome's exit code.
+        if let Err(e) = manager.save_queue_to_folders().await {
+            tracing::error!("Failed to save queue after wait: {e}");
+        }
+        remote::render_waited(outcome, task, false);
+        return Ok(remote::exit_code_for_wait(outcome));
     }
 
     Ok(error::SUCCESS)
 }
 
-/// Wait for download to complete and show progress
-async fn wait_for_download(id: Uuid, manager: &DownloadManager) -> Result<()> {
+/// Polls until `id` reaches a state `daemon_ops::wait_state` treats as
+/// final -- the same rule the daemon's own `Wait` uses -- printing progress
+/// and one notice per backoff episode along the way. A task in retry
+/// backoff (live handle, persisted status `Paused`) is not terminal, so
+/// this keeps waiting through it instead of reporting a stale pause.
+async fn wait_until_final(
+    id: Uuid,
+    manager: &DownloadManager,
+    poll: tokio::time::Duration,
+) -> (WaitOutcome, Option<DownloadTask>) {
     use std::io::{self, Write};
 
     println!("Monitoring download progress...");
+    let mut was_backoff = false;
 
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Some(task) = manager.get_by_id(id).await {
+            if let Some(total) = task.size {
+                let progress = (task.downloaded as f64 / total as f64 * 100.0) as u8;
+                let downloaded_str = output::format_bytes(task.downloaded);
+                let total_str = output::format_bytes(total);
+                print!("\r[{:3}%] {} / {}   ", progress, downloaded_str, total_str);
+            } else {
+                let downloaded_str = output::format_bytes(task.downloaded);
+                print!("\rDownloaded: {}   ", downloaded_str);
+            }
+            let _ = io::stdout().flush();
 
-        let task = manager.get_by_id(id).await
-            .ok_or_else(|| anyhow::anyhow!("Download disappeared"))?;
-
-        // Show progress
-        if let Some(total) = task.size {
-            let progress = (task.downloaded as f64 / total as f64 * 100.0) as u8;
-            let downloaded_str = output::format_bytes(task.downloaded);
-            let total_str = output::format_bytes(total);
-
-            print!("\r[{:3}%] {} / {}   ", progress, downloaded_str, total_str);
-            io::stdout().flush()?;
-        } else {
-            let downloaded_str = output::format_bytes(task.downloaded);
-            print!("\rDownloaded: {}   ", downloaded_str);
-            io::stdout().flush()?;
+            let in_backoff = manager.run_state(id).await == RunState::RetryBackoff;
+            if in_backoff && !was_backoff {
+                println!("\nRetrying (attempt {})...", task.retry_count + 1);
+            }
+            was_backoff = in_backoff;
         }
 
-        // Check if completed or failed
-        match task.status {
-            DownloadStatus::Completed => {
-                println!("\n✓ Download completed!");
-                break;
-            }
-            DownloadStatus::Error => {
-                println!("\n✗ Download failed!");
-                return Err(anyhow::anyhow!("Download failed"));
-            }
-            DownloadStatus::Paused => {
-                println!("\n⏸ Download paused");
-                break;
-            }
-            _ => {}
+        if let Some((outcome, task)) = daemon_ops::wait_state(id, manager).await {
+            println!();
+            return (outcome, task);
         }
+
+        tokio::time::sleep(poll).await;
     }
-
-    Ok(())
 }
 
 /// Pause a download
@@ -1898,4 +1906,78 @@ async fn handle_test_reset_config(state: &AppState) -> Result<i32> {
     println!("Reset configuration to defaults");
     println!("Note: Application restart may be required");
     Ok(error::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task_with_status(status: DownloadStatus) -> DownloadTask {
+        let mut task = DownloadTask::new(
+            "https://example.com/a".to_string(),
+            std::path::PathBuf::from("a"),
+        );
+        task.status = status;
+        task
+    }
+
+    /// A task in retry backoff (live handle, persisted status `Paused`) must
+    /// not be reported as a real pause: the daemon's own `wait_state` treats
+    /// it as "keep waiting", so `wait_until_final` must poll past it rather
+    /// than returning `Paused` early.
+    #[tokio::test]
+    async fn standalone_wait_backoff_is_not_terminal() {
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Paused);
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+        manager.mark_backoff_for_test(id, true).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_until_final(id, &manager, std::time::Duration::from_millis(50)),
+        )
+        .await;
+        assert!(result.is_err(), "a backoff task must not be reported as terminal");
+
+        manager.abort_active_handle_for_test(id).await;
+    }
+
+    #[tokio::test]
+    async fn standalone_wait_completed_via_history() {
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Downloading);
+        let id = task.id;
+        manager.add_to_history(task).await;
+
+        let (outcome, task) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_until_final(id, &manager, std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect("a history entry must resolve immediately");
+        assert_eq!(outcome, WaitOutcome::Completed);
+        assert_eq!(task.map(|t| t.id), Some(id));
+    }
+
+    #[tokio::test]
+    async fn standalone_wait_manual_pause_is_paused() {
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Paused);
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let (outcome, task) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_until_final(id, &manager, std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect("a manually paused task with no live handle must resolve immediately");
+        assert_eq!(outcome, WaitOutcome::Paused);
+        assert_eq!(task.map(|t| t.status), Some(DownloadStatus::Paused));
+        assert_eq!(remote::exit_code_for_wait(WaitOutcome::Paused), error::TASK_PAUSED);
+    }
 }

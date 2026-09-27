@@ -625,8 +625,10 @@ impl DownloadManager {
                             );
                             current_task.status = DownloadStatus::Paused;
                             current_task.log_info(format!("Retrying in {} seconds...", backoff_delay));
-                            in_backoff.store(true, Ordering::Relaxed);
+                            // Flag after the write, so a reader that sees backoff
+                            // also sees this attempt's retry_count.
                             queue.update(current_task.clone()).await;
+                            in_backoff.store(true, Ordering::Relaxed);
 
                             // Wait before retry with exponential backoff
                             tokio::time::sleep(tokio::time::Duration::from_secs(backoff_delay)).await;

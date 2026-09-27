@@ -19,10 +19,10 @@ use super::error;
 use super::output;
 // `protocol` is compiled on every target (see `src/ipc/control/mod.rs`), so
 // the `add` payload types are available to render standalone output too.
-use crate::ipc::control::protocol::{AddedTask, SkippedUrl};
+use crate::ipc::control::protocol::{AddedTask, SkippedUrl, WaitOutcome};
 #[cfg(windows)]
 use crate::ipc::control::protocol::{
-    ControlErrorCode, ControlRequest, ControlResponse, HeaderEdit, WaitOutcome,
+    ControlErrorCode, ControlRequest, ControlResponse, HeaderEdit,
 };
 use crate::download::task::{DownloadStatus, DownloadTask};
 #[cfg(windows)]
@@ -523,9 +523,9 @@ async fn send_wait(pipe_name: &str, id: uuid::Uuid, timeout_secs: Option<u64>, j
 
 /// Renders a `Wait` outcome. The JSON form redacts header values the same
 /// way `render_task` does; a waited-on task can carry a `Cookie` or
-/// `Authorization` header just like any other.
-#[cfg(windows)]
-fn render_waited(outcome: WaitOutcome, task: Option<DownloadTask>, json: bool) {
+/// `Authorization` header just like any other. Shared by the daemon-routed
+/// `Wait` request and standalone `start --wait`.
+pub(crate) fn render_waited(outcome: WaitOutcome, task: Option<DownloadTask>, json: bool) {
     if json {
         #[derive(serde::Serialize)]
         struct WaitedPayload {
@@ -551,8 +551,8 @@ fn render_waited(outcome: WaitOutcome, task: Option<DownloadTask>, json: bool) {
     }
 }
 
-#[cfg(windows)]
-fn exit_code_for_wait(outcome: WaitOutcome) -> i32 {
+/// Shared by the daemon-routed `Wait` request and standalone `start --wait`.
+pub(crate) fn exit_code_for_wait(outcome: WaitOutcome) -> i32 {
     match outcome {
         WaitOutcome::Completed => error::SUCCESS,
         WaitOutcome::Failed => error::TASK_FAILED,
