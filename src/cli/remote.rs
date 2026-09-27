@@ -16,11 +16,13 @@ use super::{
     ImportAction, ScriptAction, TestAction,
 };
 use super::error;
+use super::output;
 // `protocol` is compiled on every target (see `src/ipc/control/mod.rs`), so
 // the `add` payload types are available to render standalone output too.
 use crate::ipc::control::protocol::{AddedTask, SkippedUrl};
 #[cfg(windows)]
 use crate::ipc::control::protocol::{ControlErrorCode, ControlRequest, ControlResponse};
+use crate::download::task::{DownloadStatus, DownloadTask};
 #[cfg(windows)]
 use std::time::Duration;
 
@@ -58,17 +60,22 @@ pub fn classify(cmd: &Commands) -> RemoteClass {
         // standalone path.
         Commands::Add { .. } => RemoteClass::Routed,
 
-        // Not yet wired to apply their writes through the daemon;
-        // `RefuseWhileRunning` is the safe class until they are, since
-        // running them standalone next to a live daemon would race its
-        // writes to the same queue files.
-        Commands::List { .. } => RemoteClass::RefuseWhileRunning,
-        Commands::Start { .. } => RemoteClass::RefuseWhileRunning,
-        Commands::Pause { .. } => RemoteClass::RefuseWhileRunning,
-        Commands::Remove { .. } => RemoteClass::RefuseWhileRunning,
-        Commands::Status { .. } => RemoteClass::RefuseWhileRunning,
-        Commands::StartAll { .. } => RemoteClass::RefuseWhileRunning,
-        Commands::PauseAll { .. } => RemoteClass::RefuseWhileRunning,
+        Commands::List { .. } => RemoteClass::Routed,
+        // `--wait` isn't sent to the daemon as a `Wait` request yet, so a
+        // live daemon must refuse it rather than let a standalone `--wait`
+        // poll a queue the daemon also writes to.
+        Commands::Start { wait, .. } => {
+            if *wait {
+                RemoteClass::RefuseWhileRunning
+            } else {
+                RemoteClass::Routed
+            }
+        }
+        Commands::Pause { .. } => RemoteClass::Routed,
+        Commands::Remove { .. } => RemoteClass::Routed,
+        Commands::Status { .. } => RemoteClass::Routed,
+        Commands::StartAll { .. } => RemoteClass::Routed,
+        Commands::PauseAll { .. } => RemoteClass::Routed,
 
         Commands::Config { action } => match action {
             ConfigAction::Get { .. } => RemoteClass::ReadOnly,
@@ -288,6 +295,123 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
         }
         Commands::Daemon { action: DaemonAction::Stop } => stop_daemon(pipe_name).await,
 
+        Commands::List { json, status, folder } => {
+            let statuses = match parse_status_arg(status.as_deref()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            let req = ControlRequest::List { statuses, folder: folder.clone() };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Tasks { tasks }) => {
+                    render_tasks(tasks, *json);
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+        Commands::Status { id, json } => {
+            let uid = match super::handler::parse_task_id(id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            match client::send(pipe_name, &ControlRequest::Get { id: uid }, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Task { task, in_history }) => {
+                    render_task(task, in_history, *json);
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+        Commands::Start { id, wait: false } => {
+            let uid = match super::handler::parse_task_id(id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            match client::send(pipe_name, &ControlRequest::Start { id: uid }, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+        // `classify()` keeps `start --wait` out of `Routed` until it is sent
+        // to the daemon as a `Wait` request, so this arm is never reached;
+        // `route` refuses it before `send_and_render` is called.
+        Commands::Start { wait: true, .. } => {
+            debug_assert!(false, "start --wait must be RefuseWhileRunning until Wait is implemented");
+            eprintln!("this command is not yet routed to the daemon");
+            RouteDecision::Handled(error::ERROR)
+        }
+        Commands::Pause { id } => {
+            let uid = match super::handler::parse_task_id(id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            match client::send(pipe_name, &ControlRequest::Pause { id: uid }, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+        Commands::Remove { id } => {
+            let uid = match super::handler::parse_task_id(id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            match client::send(pipe_name, &ControlRequest::Remove { id: uid }, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+        Commands::StartAll { folder } => {
+            let req = ControlRequest::StartAll { folder: folder.clone() };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+        Commands::PauseAll { folder } => {
+            let req = ControlRequest::PauseAll { folder: folder.clone() };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+
         // No other command is mapped to a request yet: classify() only
         // marks the ones above as Routed/RequiresDaemon so far.
         _ => {
@@ -372,6 +496,62 @@ pub fn parse_header_arg(s: &str) -> anyhow::Result<(String, String)> {
         .map_err(|_| anyhow::anyhow!("invalid header: value contains bytes not allowed in an HTTP header value"))?;
 
     Ok((name.to_string(), value.to_string()))
+}
+
+/// Parses `list --status`'s comma-separated value into `DownloadStatus`es,
+/// using the lowercase serde names from `task.rs`. `None` or an empty string
+/// means no filter (every status). Shared by the standalone `list` handler
+/// and the daemon-routed one so both accept exactly the same spelling.
+pub fn parse_status_arg(s: Option<&str>) -> anyhow::Result<Vec<DownloadStatus>> {
+    let Some(s) = s else {
+        return Ok(Vec::new());
+    };
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            serde_json::from_value(serde_json::Value::String(s.to_ascii_lowercase()))
+                .map_err(|_| anyhow::anyhow!("unknown status '{s}'"))
+        })
+        .collect()
+}
+
+/// Replaces every header value with a placeholder before a task is printed.
+/// Header *names* stay visible (useful to confirm a `--header`/`--referrer`
+/// landed), but a value can itself be a secret (`Cookie`, `Authorization`, a
+/// signed URL) that must never reach stdout via `list`/`status`, daemon-routed
+/// or not.
+fn redact_task_headers(mut task: DownloadTask) -> DownloadTask {
+    for value in task.headers.values_mut() {
+        *value = "<redacted>".to_string();
+    }
+    task
+}
+
+/// Renders a `list` result: same filter output, same redaction, whether the
+/// tasks came from the daemon's `Tasks` response or straight from the local
+/// manager, so `list --json` never differs by mode.
+pub fn render_tasks(tasks: Vec<DownloadTask>, json: bool) {
+    let tasks: Vec<DownloadTask> = tasks.into_iter().map(redact_task_headers).collect();
+    println!("{}", output::format_downloads(&tasks, json));
+}
+
+/// Renders a `status`/`get` result. `in_history` only affects the
+/// human-readable form (a small trailing note); the JSON form always matches
+/// the standalone shape, which never had an `in_history` field.
+pub fn render_task(task: DownloadTask, in_history: bool, json: bool) {
+    let task = redact_task_headers(task);
+    if json {
+        match serde_json::to_string_pretty(&task) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("failed to format task: {e}"),
+        }
+    } else {
+        println!("{}", output::format_download(&task, true));
+        if in_history {
+            println!("(from history)");
+        }
+    }
 }
 
 /// Renders `add`'s result the same way whether it came from the daemon's
@@ -485,8 +665,8 @@ mod tests {
     #[test]
     fn classify_smoke() {
         assert_eq!(
-            classify(&Commands::List { json: false }),
-            RemoteClass::RefuseWhileRunning
+            classify(&Commands::List { json: false, status: None, folder: None }),
+            RemoteClass::Routed
         );
         assert_eq!(
             classify(&Commands::Logs { follow: false, level: None, lines: None }),
@@ -512,6 +692,36 @@ mod tests {
             }),
             RemoteClass::Routed
         );
+        assert_eq!(
+            classify(&Commands::Start { id: "x".to_string(), wait: false }),
+            RemoteClass::Routed
+        );
+        assert_eq!(
+            classify(&Commands::Start { id: "x".to_string(), wait: true }),
+            RemoteClass::RefuseWhileRunning
+        );
+    }
+
+    #[test]
+    fn parse_status_arg_accepts_known_names_and_rejects_unknown() {
+        assert_eq!(parse_status_arg(None).unwrap(), Vec::new());
+        assert_eq!(parse_status_arg(Some("")).unwrap(), Vec::new());
+        assert_eq!(
+            parse_status_arg(Some("pending, Error")).unwrap(),
+            vec![DownloadStatus::Pending, DownloadStatus::Error]
+        );
+        assert!(parse_status_arg(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn redact_task_headers_hides_values_but_keeps_names() {
+        let mut task = DownloadTask::new(
+            "https://example.com/f".to_string(),
+            std::path::PathBuf::from("f"),
+        );
+        task.headers.insert("Cookie".to_string(), "sid=SECRET".to_string());
+        let redacted = redact_task_headers(task);
+        assert_eq!(redacted.headers.get("Cookie").map(String::as_str), Some("<redacted>"));
     }
 
     #[test]

@@ -129,6 +129,14 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Filter by status, comma-separated (pending,downloading,paused,completed,error,deleted)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Filter by folder ID or display name
+        #[arg(long)]
+        folder: Option<String>,
     },
 
     /// Start a download

@@ -27,7 +27,7 @@ pub async fn handle_command(
         Commands::Add { url, folder, referrer, header, immediate, quiet, json } => {
             handle_add(url, folder, referrer, header, immediate, quiet, json, &state, &manager).await
         }
-        Commands::List { json } => handle_list(&manager, json).await,
+        Commands::List { json, status, folder } => handle_list(&state, &manager, json, status, folder).await,
         Commands::Start { id, wait } => handle_start(id, &state, &manager, wait).await,
         Commands::Pause { id } => handle_pause(id, &manager).await,
         Commands::Remove { id } => handle_remove(id, &manager).await,
@@ -40,7 +40,7 @@ pub async fn handle_command(
         Commands::Script { action } => handle_script(action, &state).await,
         Commands::Folder { action } => handle_folder(action, &state).await,
         Commands::StartAll { folder } => handle_start_all(&state, &manager, folder).await,
-        Commands::PauseAll { folder } => handle_pause_all(&manager, folder).await,
+        Commands::PauseAll { folder } => handle_pause_all(&state, &manager, folder).await,
         Commands::Clear { status, folder } => handle_clear(&manager, status, folder).await,
         Commands::BatchAdd { file, folder } => handle_batch_add(&state, &manager, file, folder).await,
         Commands::Priority { id, set } => handle_priority(&manager, id, set).await,
@@ -172,7 +172,7 @@ fn handle_daemon_standalone() -> Result<i32> {
 }
 
 /// Parse a task ID string, returning a uniform error on malformed input.
-fn parse_task_id(id_str: &str) -> Result<Uuid> {
+pub(crate) fn parse_task_id(id_str: &str) -> Result<Uuid> {
     Uuid::parse_str(id_str).map_err(|_| anyhow::anyhow!("Invalid UUID format"))
 }
 
@@ -185,11 +185,43 @@ pub(crate) fn is_valid_download_url(text: &str) -> bool {
     }
 }
 
-/// List all downloads
-async fn handle_list(manager: &DownloadManager, json: bool) -> Result<i32> {
+/// List all downloads, applying the same status/folder filters and header
+/// redaction whether or not a daemon is routing this request (see
+/// `remote::render_tasks`), so `list --json` looks the same either way.
+async fn handle_list(
+    state: &AppState,
+    manager: &DownloadManager,
+    json: bool,
+    status: Option<String>,
+    folder: Option<String>,
+) -> Result<i32> {
+    // Matches the routed path's `InvalidInput` -> exit 3 for the same two
+    // failures (`remote::send_and_render`'s `List` arm), instead of `?`
+    // propagating them to the generic exit 1 every other `Err` gets.
+    let statuses = match super::remote::parse_status_arg(status.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return Ok(error::INVALID_INPUT);
+        }
+    };
+    let resolved_folder = match &folder {
+        Some(f) => {
+            let config = state.config.read().await.clone();
+            match resolve_folder_id(&config, f) {
+                Some(id) => Some(id),
+                None => {
+                    eprintln!("Error: unknown folder");
+                    return Ok(error::INVALID_INPUT);
+                }
+            }
+        }
+        None => None,
+    };
+
     let tasks = manager.get_all_downloads().await;
-    let output = output::format_downloads(&tasks, json);
-    println!("{}", output);
+    let tasks = super::daemon_ops::filter_tasks(tasks, &statuses, resolved_folder.as_deref());
+    super::remote::render_tasks(tasks, json);
 
     Ok(error::SUCCESS)
 }
@@ -311,11 +343,7 @@ async fn handle_status(id_str: String, manager: &DownloadManager, json: bool) ->
     let task = manager.get_by_id(id).await
         .ok_or_else(|| anyhow::anyhow!("Download not found"))?;
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&task)?);
-    } else {
-        println!("{}", output::format_download(&task, true));
-    }
+    super::remote::render_task(task, false, json);
 
     Ok(error::SUCCESS)
 }
@@ -1366,19 +1394,42 @@ async fn handle_folder_delete(state: &AppState, id: String) -> Result<i32> {
 // Batch Operations
 // ========================================
 
+/// Resolves `start-all`/`pause-all`'s optional `--folder` (a UUID key or a
+/// display name, like `add`/`list`) to a folder key. `None` stays `None`
+/// (every folder); an unresolved name is the caller's job to reject.
+async fn resolve_optional_folder_standalone(
+    state: &AppState,
+    folder: &Option<String>,
+) -> Option<Option<String>> {
+    match folder {
+        Some(f) => {
+            let config = state.config.read().await.clone();
+            resolve_folder_id(&config, f).map(Some)
+        }
+        None => Some(None),
+    }
+}
+
 /// Start all downloads
 async fn handle_start_all(
     state: &AppState,
     manager: &DownloadManager,
     folder: Option<String>,
 ) -> Result<i32> {
+    // Resolved the same way `list --folder`/`add --folder` are, so a display
+    // name matches its tasks instead of matching nothing (a raw string
+    // compare against `task.folder_id` only ever matches the UUID key).
+    let Some(folder_id) = resolve_optional_folder_standalone(state, &folder).await else {
+        eprintln!("Error: unknown folder");
+        return Ok(error::INVALID_INPUT);
+    };
+
     let tasks = manager.get_all_downloads().await;
 
     let mut started_count = 0;
     for task in tasks {
-        // Filter by folder if specified
-        if let Some(ref folder_filter) = folder {
-            if task.folder_id != *folder_filter {
+        if let Some(ref f) = folder_id {
+            if task.folder_id != *f {
                 continue;
             }
         }
@@ -1400,16 +1451,21 @@ async fn handle_start_all(
 
 /// Pause all downloads
 async fn handle_pause_all(
+    state: &AppState,
     manager: &DownloadManager,
     folder: Option<String>,
 ) -> Result<i32> {
+    let Some(folder_id) = resolve_optional_folder_standalone(state, &folder).await else {
+        eprintln!("Error: unknown folder");
+        return Ok(error::INVALID_INPUT);
+    };
+
     let tasks = manager.get_all_downloads().await;
 
     let mut paused_count = 0;
     for task in tasks {
-        // Filter by folder if specified
-        if let Some(ref folder_filter) = folder {
-            if task.folder_id != *folder_filter {
+        if let Some(ref f) = folder_id {
+            if task.folder_id != *f {
                 continue;
             }
         }
