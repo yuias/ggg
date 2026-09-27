@@ -2118,9 +2118,14 @@ impl TuiApp {
         for id in target_ids {
             if let Some(task) = self.manager.get_by_id(id).await {
                 if reference_downloading {
-                    // Reference item is downloading → pause active downloads
+                    // Reference item is downloading → pause active downloads.
+                    // A busy claim (start still running its beforeRequest
+                    // script) is an expected outcome, not a reason to tear
+                    // down the TUI.
                     if task.status == DownloadStatus::Downloading {
-                        self.manager.pause_download(id).await?;
+                        if let Err(e) = self.manager.pause_download(id).await {
+                            tracing::warn!("Failed to pause download {}: {}", id, e);
+                        }
                     }
                 } else {
                     // Reference item is not downloading → start startable items

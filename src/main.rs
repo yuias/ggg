@@ -139,13 +139,15 @@ async fn main() -> Result<()> {
     let max_concurrent_per_folder = config.download.max_concurrent_per_folder.unwrap_or(max_concurrent);
     let parallel_folder_count = config.download.parallel_folder_count.unwrap_or(1);
 
-    let download_manager = DownloadManager::with_config(
+    let mut download_manager = DownloadManager::with_config(
         max_concurrent,
         max_concurrent_per_folder,
         parallel_folder_count,
         config.download.retry_count,
         config.download.retry_delay,
     );
+    download_manager
+        .set_claim_wait_budget(std::time::Duration::from_millis(config.download.claim_wait_ms));
 
     // Load queue from folder-based files
     if let Err(e) = download_manager.load_queue_from_folders().await {

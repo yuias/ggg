@@ -193,10 +193,23 @@ pub struct DownloadConfig {
     pub max_redirects: u32,
     #[serde(default)]
     pub referrer_policy: ReferrerPolicy,
+    /// How long `pause`/`remove`/`move` wait for a task's claim (usually a
+    /// start running its beforeRequest script) before giving up. Hand-edited
+    /// in settings.toml under `[download]`; not exposed in the settings UI.
+    #[serde(default = "default_claim_wait_ms")]
+    pub claim_wait_ms: u64,
 }
 
 fn default_max_redirects() -> u32 {
     5
+}
+
+/// Single source of truth for the claim-wait default, shared with
+/// `download::manager::CLAIM_WAIT_BUDGET` so the two never drift apart.
+pub const DEFAULT_CLAIM_WAIT_MS: u64 = 2000;
+
+fn default_claim_wait_ms() -> u64 {
+    DEFAULT_CLAIM_WAIT_MS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,6 +311,7 @@ impl Default for Config {
                 parallel_folder_count: None,
                 max_redirects: 5,
                 referrer_policy: ReferrerPolicy::default(),
+                claim_wait_ms: default_claim_wait_ms(),
             },
             network: NetworkConfig {
                 proxy_enabled: false,
@@ -544,6 +558,7 @@ impl Config {
                     parallel_folder_count: None,
                     max_redirects: 5,
                     referrer_policy: ReferrerPolicy::default(),
+                    claim_wait_ms: default_claim_wait_ms(),
                 },
                 network: NetworkConfig {
                     proxy_enabled: false,
@@ -989,6 +1004,7 @@ timeout = 60
                 parallel_folder_count: Some(2),
                 max_redirects: 10,
                 referrer_policy: ReferrerPolicy::default(),
+                claim_wait_ms: 2000,
             },
             network: NetworkConfig {
                 proxy_enabled: false,
@@ -1331,5 +1347,24 @@ max_redirects = 5
 "#;
         let config: DownloadConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.referrer_policy, ReferrerPolicy::default());
+    }
+
+    #[test]
+    fn claim_wait_ms_defaults_to_2000() {
+        let toml_str = r#"
+default_directory = "C:\\Downloads"
+max_concurrent = 3
+retry_count = 3
+retry_delay = 5
+user_agent = "Test/1.0"
+bandwidth_limit = 0
+max_redirects = 5
+"#;
+        let config: DownloadConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.claim_wait_ms, 2000);
+
+        let toml_with_value = format!("{toml_str}\nclaim_wait_ms = 500\n");
+        let config: DownloadConfig = toml::from_str(&toml_with_value).unwrap();
+        assert_eq!(config.claim_wait_ms, 500);
     }
 }

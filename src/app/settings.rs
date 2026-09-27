@@ -251,6 +251,7 @@ mod tests {
                 parallel_folder_count: Some(2),
                 max_redirects: 10,
                 referrer_policy: ReferrerPolicy::default(),
+                claim_wait_ms: 2000,
             },
             network: NetworkConfig {
                 proxy_enabled: false,

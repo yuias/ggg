@@ -115,6 +115,20 @@ impl StartOutcome {
 #[error("download {0} is busy (being started or modified); retry in a moment")]
 pub struct TaskBusy(pub Uuid);
 
+/// Claim ids plus a wake-up for waiters. Keeping both behind one `Arc` keeps
+/// `StartClaim::try_acquire(&manager.start_claims, id)` source-compatible.
+struct ClaimSet {
+    ids: Mutex<HashSet<Uuid>>,
+    released: tokio::sync::Notify,
+}
+
+/// How long pause/remove/move wait for another operation's claim (normally a
+/// start waiting on its beforeRequest script) before giving up. Default for
+/// `download.claim_wait_ms` in settings.toml; kept in sync with it through
+/// `crate::app::config::DEFAULT_CLAIM_WAIT_MS`.
+const CLAIM_WAIT_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(crate::app::config::DEFAULT_CLAIM_WAIT_MS);
+
 #[derive(Clone)]
 pub struct DownloadManager {
     /// Per-folder download queues
@@ -148,14 +162,18 @@ pub struct DownloadManager {
     event_tx: broadcast::Sender<DownloadEvent>,
 
     /// Ids with a `start_download` call currently in flight. See `StartClaim`.
-    start_claims: Arc<Mutex<HashSet<Uuid>>>,
+    start_claims: Arc<ClaimSet>,
+    /// How long `pause_download`/`remove_download`/`change_folder` wait for
+    /// another operation's claim before giving up as `TaskBusy`. Overridden
+    /// at startup from `download.claim_wait_ms` via `set_claim_wait_budget`.
+    claim_wait_budget: std::time::Duration,
 }
 
 /// RAII guard for an in-flight `start_download` call. Removes its id from the
 /// claim set on drop, so every return path out of `start_download` (`Ok` or
 /// `Err`) releases the claim without dedicated cleanup code.
 struct StartClaim {
-    set: Arc<Mutex<HashSet<Uuid>>>,
+    set: Arc<ClaimSet>,
     id: Uuid,
 }
 
@@ -163,8 +181,8 @@ impl StartClaim {
     /// `None` if `id` is already claimed by another in-flight call. Never
     /// held across an `.await`; the lock is released as soon as the set is
     /// updated.
-    fn try_acquire(set: &Arc<Mutex<HashSet<Uuid>>>, id: Uuid) -> Option<StartClaim> {
-        let mut claims = set.lock().unwrap_or_else(|e| e.into_inner());
+    fn try_acquire(set: &Arc<ClaimSet>, id: Uuid) -> Option<StartClaim> {
+        let mut claims = set.ids.lock().unwrap_or_else(|e| e.into_inner());
         if claims.insert(id) {
             Some(StartClaim { set: set.clone(), id })
         } else {
@@ -176,9 +194,11 @@ impl StartClaim {
 impl Drop for StartClaim {
     fn drop(&mut self) {
         self.set
+            .ids
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
+        self.set.released.notify_waiters();
     }
 }
 
@@ -254,7 +274,11 @@ impl DownloadManager {
             history: Arc::new(RwLock::new(DownloadHistory::new())),
             circuit_breaker: Arc::new(super::circuit_breaker::CircuitBreaker::new()),
             event_tx: broadcast::channel(EVENT_CHANNEL_CAPACITY).0,
-            start_claims: Arc::new(Mutex::new(HashSet::new())),
+            start_claims: Arc::new(ClaimSet {
+                ids: Mutex::new(HashSet::new()),
+                released: tokio::sync::Notify::new(),
+            }),
+            claim_wait_budget: CLAIM_WAIT_BUDGET,
         }
     }
 
@@ -1180,12 +1204,61 @@ impl DownloadManager {
         Ok(task)
     }
 
-    pub async fn pause_download(&self, id: Uuid) -> Result<()> {
-        // Abort the download task. Aborting drops the spawned future, so its
-        // own cleanup never runs — this function releases bookkeeping itself.
-        if let Some(entry) = self.active_downloads.write().await.remove(&id) {
-            entry.handle.abort();
+    /// Takes `id`'s claim, waiting up to `budget` for the current holder to
+    /// release it (a start's beforeRequest script, or another pause/remove/
+    /// move/header edit). `Err(TaskBusy)` if `budget` elapses first; nothing
+    /// is changed in that case.
+    async fn acquire_claim_waiting(
+        &self,
+        id: Uuid,
+        budget: std::time::Duration,
+    ) -> Result<StartClaim, TaskBusy> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let notified = self.start_claims.released.notified();
+            tokio::pin!(notified);
+            // Register before checking, so a release between the check and
+            // the await is not missed.
+            notified.as_mut().enable();
+            if let Some(claim) = StartClaim::try_acquire(&self.start_claims, id) {
+                return Ok(claim);
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Err(TaskBusy(id));
+            }
         }
+    }
+
+    /// Overrides how long `pause_download`/`remove_download`/`change_folder`
+    /// wait for another operation's claim (default `CLAIM_WAIT_BUDGET`).
+    /// Applied once at startup from `download.claim_wait_ms`; tests use a
+    /// short budget instead of waiting out the real default.
+    pub fn set_claim_wait_budget(&mut self, budget: std::time::Duration) {
+        self.claim_wait_budget = budget;
+    }
+
+    /// Removes and stops `id`'s download, waiting for it to actually end so
+    /// no late queue write from it can land after the caller's own write.
+    async fn stop_handle(&self, id: Uuid) {
+        let entry = self.active_downloads.write().await.remove(&id); // lock dropped here
+        if let Some(entry) = entry {
+            entry.handle.abort();
+            // Bounded: the completion path has a synchronous file rename.
+            if tokio::time::timeout(std::time::Duration::from_secs(5), entry.handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!("download {id} did not stop within 5s after abort");
+            }
+        }
+    }
+
+    /// Stops `id`'s live handle (including retry backoff) and marks it
+    /// `Paused`. A caller already holding the claim must call this, not
+    /// `pause_download`, which would wait on its own claim. A missing task
+    /// is a no-op.
+    async fn pause_claimed(&self, id: Uuid, _claim: &StartClaim) {
+        self.stop_handle(id).await;
 
         // Update status and counts
         if let Some(mut task) = self.get_by_id(id).await {
@@ -1200,7 +1273,17 @@ impl DownloadManager {
             self.deactivate_folder_if_empty(&folder_id).await;
             self.emit(DownloadEvent::Paused { task_id: id });
         }
+    }
 
+    /// Pauses `id`: stops its live handle (downloading or retry backoff) and
+    /// marks it `Paused`. Waits up to the claim-wait budget for another
+    /// operation holding `id`'s claim (typically a start still running its
+    /// beforeRequest script) before giving up with `TaskBusy`, in which case
+    /// nothing is changed. A missing task is `Ok` -- there is nothing to
+    /// pause.
+    pub async fn pause_download(&self, id: Uuid) -> Result<(), TaskBusy> {
+        let claim = self.acquire_claim_waiting(id, self.claim_wait_budget).await?;
+        self.pause_claimed(id, &claim).await;
         Ok(())
     }
 
@@ -1755,9 +1838,12 @@ impl DownloadManager {
         }
     }
 
-    /// True while some `start_download` call for `id` has not returned yet.
+    /// True while some operation holds `id`'s claim: a `start_download` call
+    /// still running its beforeRequest script, or a pause/remove/move/header
+    /// edit in progress.
     pub(crate) fn is_start_in_progress(&self, id: Uuid) -> bool {
         self.start_claims
+            .ids
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&id)
@@ -1787,6 +1873,7 @@ impl DownloadManager {
         any_live_handle
             || !self
                 .start_claims
+                .ids
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
@@ -2936,5 +3023,122 @@ mod tests {
         assert_eq!(resumed, 0, "a task with a live handle must not be counted as resumed");
 
         manager.abort_active_handle_for_test(id).await;
+    }
+
+    /// `pause_download` must wait out a concurrent `start_download`'s
+    /// beforeRequest script round trip instead of racing it, then win: the
+    /// download it just spawned is stopped and the task ends up `Paused`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pause_waits_for_in_flight_start_and_wins() {
+        let manager = DownloadManager::new();
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let (script_tx, script_rx) = mpsc::channel::<ScriptRequest>();
+        // Never join this thread: nothing else drains the channel after the
+        // test's assertions run, and the retry loop's own clone would keep
+        // it open, so joining would hang.
+        let _responder = std::thread::spawn(move || {
+            while let Ok(req) = script_rx.recv() {
+                if let ScriptRequest::BeforeRequest { ctx, response, .. } = req {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = response.send((ctx, Ok(())));
+                }
+            }
+        });
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        let manager_start = manager.clone();
+        let start_handle = tokio::spawn(async move {
+            manager_start.start_download(id, Some(script_tx), config).await
+        });
+
+        // Let `start_download` acquire the claim before racing it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !manager.is_start_in_progress(id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "start did not claim the id within 2s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let pause_result = manager.pause_download(id).await;
+        assert!(pause_result.is_ok(), "pause must wait out the claim and then succeed");
+
+        let start_outcome = start_handle.await.unwrap().expect("start must not error");
+        assert_eq!(start_outcome, StartOutcome::Started);
+
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(task.status, DownloadStatus::Paused);
+        assert_eq!(manager.run_state(id).await, RunState::Idle);
+        assert_eq!(manager.get_active_count().await, 0);
+    }
+
+    /// A pause that cannot take the claim within the budget must leave the
+    /// task untouched and report `TaskBusy`.
+    #[tokio::test]
+    async fn pause_returns_busy_after_budget() {
+        let mut manager = DownloadManager::new();
+        manager.set_claim_wait_budget(std::time::Duration::from_millis(100));
+
+        let task = DownloadTask::new("https://example.com/f".to_string(), "/tmp".into());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let claim = StartClaim::try_acquire(&manager.start_claims, id).expect("claim must be free");
+
+        let result = manager.pause_download(id).await;
+        match result {
+            Err(TaskBusy(busy_id)) => assert_eq!(busy_id, id),
+            other => panic!("expected TaskBusy, got {other:?}"),
+        }
+
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(task.status, DownloadStatus::Pending, "a busy pause must not change the task");
+
+        drop(claim);
+    }
+
+    /// A task in retry backoff (`Paused` with a live handle) is paused like
+    /// a downloading one: the handle is stopped and the status stays
+    /// `Paused`, but the handle -- and thus `RetryBackoff` -- is gone.
+    #[tokio::test]
+    async fn pause_stops_retry_backoff() {
+        let manager = DownloadManager::with_retry_settings(3, 60);
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            if manager.run_state(id).await == RunState::RetryBackoff {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "download did not reach RetryBackoff within 10s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        manager.pause_download(id).await.expect("pause must succeed");
+
+        assert_eq!(manager.run_state(id).await, RunState::Idle);
+        let task = manager.get_by_id(id).await.expect("task still exists");
+        assert_eq!(task.status, DownloadStatus::Paused);
+        assert_eq!(manager.get_active_count().await, 0);
     }
 }

@@ -17,7 +17,7 @@ use crate::app::state::AppState;
 use crate::download::enqueue::{
     build_task, enqueue, resolve_folder_id, resolve_target_folder, EnqueueOptions, EnqueueOutcome,
 };
-use crate::download::manager::{DownloadEvent, DownloadManager, StartOutcome};
+use crate::download::manager::{DownloadEvent, DownloadManager, StartOutcome, TaskBusy};
 use crate::download::task::{DownloadStatus, DownloadTask};
 use crate::ipc::control::protocol::{
     AddedTask, ControlErrorCode, ControlRequest, ControlResponse, DaemonStatus, HeaderEdit,
@@ -271,6 +271,15 @@ fn not_found(message: &str) -> ControlResponse {
     }
 }
 
+/// `TaskBusy` maps to `InvalidInput`: the id and the operation are both
+/// fine, another operation just holds the claim right now.
+fn task_busy_response(e: TaskBusy) -> ControlResponse {
+    ControlResponse::Error {
+        code: ControlErrorCode::InvalidInput,
+        message: e.to_string(),
+    }
+}
+
 fn unknown_folder() -> ControlResponse {
     ControlResponse::Error {
         code: ControlErrorCode::InvalidInput,
@@ -412,9 +421,11 @@ async fn dispatch_pause(id: Uuid, ctx: &DaemonContext) -> ControlResponse {
     // after we set it to `Paused`, silently losing this pause. Not fixed
     // here: closing it needs a lock held across both the check and the
     // pause, which would serialize every pause/remove behind every start.
-    let _ = ctx.manager.pause_download(id).await;
-    ControlResponse::Ok {
-        message: format!("Paused download: {}", task.filename),
+    match ctx.manager.pause_download(id).await {
+        Ok(()) => ControlResponse::Ok {
+            message: format!("Paused download: {}", task.filename),
+        },
+        Err(e) => task_busy_response(e),
     }
 }
 
