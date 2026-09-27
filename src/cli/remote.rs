@@ -16,6 +16,9 @@ use super::{
     ImportAction, ScriptAction, TestAction,
 };
 use super::error;
+// `protocol` is compiled on every target (see `src/ipc/control/mod.rs`), so
+// the `add` payload types are available to render standalone output too.
+use crate::ipc::control::protocol::{AddedTask, SkippedUrl};
 #[cfg(windows)]
 use crate::ipc::control::protocol::{ControlErrorCode, ControlRequest, ControlResponse};
 #[cfg(windows)]
@@ -51,11 +54,14 @@ pub enum RemoteClass {
 /// here until it is assigned a class.
 pub fn classify(cmd: &Commands) -> RemoteClass {
     match cmd {
+        // Goes through `ControlRequest::Add` / shared `enqueue`, same as the
+        // standalone path.
+        Commands::Add { .. } => RemoteClass::Routed,
+
         // Not yet wired to apply their writes through the daemon;
         // `RefuseWhileRunning` is the safe class until they are, since
         // running them standalone next to a live daemon would race its
         // writes to the same queue files.
-        Commands::Add { .. } => RemoteClass::RefuseWhileRunning,
         Commands::List { .. } => RemoteClass::RefuseWhileRunning,
         Commands::Start { .. } => RemoteClass::RefuseWhileRunning,
         Commands::Pause { .. } => RemoteClass::RefuseWhileRunning,
@@ -232,6 +238,34 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
     use crate::ipc::control::client;
 
     match cmd {
+        Commands::Add { url, folder, referrer, header, immediate, quiet, json } => {
+            let mut headers = Vec::with_capacity(header.len());
+            for h in header {
+                match parse_header_arg(h) {
+                    Ok(pair) => headers.push(pair),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return RouteDecision::Handled(error::INVALID_INPUT);
+                    }
+                }
+            }
+            // `url` travels unexpanded; the daemon expands range patterns
+            // itself so a single request can still report per-URL results.
+            let req = ControlRequest::Add {
+                url: url.clone(),
+                folder: folder.clone(),
+                referrer: referrer.as_ref().map(|r| r.0.clone()),
+                headers,
+                immediate: *immediate,
+            };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Added { added, skipped }) => {
+                    RouteDecision::Handled(render_added(&added, &skipped, *quiet, *json))
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
         Commands::Daemon { action: DaemonAction::Ping } => {
             match client::send(pipe_name, &ControlRequest::Ping, Some(REQUEST_TIMEOUT)).await {
                 Ok(ControlResponse::Pong { protocol, pid, .. }) => {
@@ -315,6 +349,84 @@ async fn stop_daemon(pipe_name: &str) -> RouteDecision {
     }
 }
 
+/// Splits a `--header` argument at its first `:`, trims both sides, and
+/// validates them as an HTTP header name/value (rejects CR/LF and other
+/// bytes `reqwest`'s header types refuse, which would otherwise let a
+/// crafted `--header` inject extra request headers). An empty value stays
+/// allowed; an empty name does not. Never echoes `s`, `name`, or `value`
+/// back in an error: the value may carry a secret (e.g. a `Cookie` or
+/// `Authorization` header) that must not land in stderr.
+pub fn parse_header_arg(s: &str) -> anyhow::Result<(String, String)> {
+    let (name, value) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid header: expected \"Name: value\""))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow::anyhow!("invalid header: empty name"));
+    }
+    let value = value.trim();
+
+    reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("invalid header: name is not a valid HTTP header name"))?;
+    reqwest::header::HeaderValue::from_str(value)
+        .map_err(|_| anyhow::anyhow!("invalid header: value contains bytes not allowed in an HTTP header value"))?;
+
+    Ok((name.to_string(), value.to_string()))
+}
+
+/// Renders `add`'s result the same way whether it came from the daemon's
+/// `Added` response or was assembled directly in standalone mode, and
+/// returns the exit code. `quiet` and `json` are mutually exclusive at the
+/// clap level. A per-task `start_error` is a warning, not a failure: the
+/// task is still queued, so it never changes the exit code. Neither the
+/// wire payload nor this renderer carries header values, only names, so a
+/// secret passed via `--header` never reaches stdout/stderr here.
+pub fn render_added(added: &[AddedTask], skipped: &[SkippedUrl], quiet: bool, json: bool) -> i32 {
+    if json {
+        #[derive(serde::Serialize)]
+        struct AddedPayload<'a> {
+            added: &'a [AddedTask],
+            skipped: &'a [SkippedUrl],
+        }
+        match serde_json::to_string_pretty(&AddedPayload { added, skipped }) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("failed to format add result: {e}"),
+        }
+    } else if quiet {
+        for task in added {
+            println!("{}", task.id);
+        }
+    } else {
+        for task in added {
+            println!("Added download: {} (ID: {})", task.url, task.id);
+        }
+    }
+
+    for task in added {
+        if let Some(err) = &task.start_error {
+            eprintln!("Warning: could not start {}: {}", task.url, err);
+        }
+    }
+    for skip in skipped {
+        if skip.reason == "duplicate" {
+            eprintln!("Skipped duplicate URL: {}", skip.url);
+        } else {
+            eprintln!("Skipping invalid URL: {}", skip.url);
+        }
+    }
+
+    if added.is_empty() {
+        let all_invalid = !skipped.is_empty() && skipped.iter().all(|s| s.reason == "invalid_url");
+        if all_invalid {
+            error::INVALID_INPUT
+        } else {
+            error::ERROR
+        }
+    } else {
+        error::SUCCESS
+    }
+}
+
 #[cfg(windows)]
 fn render_unexpected(resp: ControlResponse) -> RouteDecision {
     if let ControlResponse::Error { code, message } = resp {
@@ -388,5 +500,65 @@ mod tests {
             classify(&Commands::Daemon { action: DaemonAction::Ping }),
             RemoteClass::RequiresDaemon
         );
+        assert_eq!(
+            classify(&Commands::Add {
+                url: "https://example.com".to_string(),
+                folder: None,
+                referrer: None,
+                header: vec![],
+                immediate: false,
+                quiet: false,
+                json: false,
+            }),
+            RemoteClass::Routed
+        );
+    }
+
+    #[test]
+    fn parse_header_arg_splits_first_colon() {
+        assert_eq!(
+            parse_header_arg("X-A: b:c").unwrap(),
+            ("X-A".to_string(), "b:c".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_header_arg_rejects_empty_name() {
+        assert!(parse_header_arg(": value").is_err());
+        assert!(parse_header_arg("no-colon").is_err());
+    }
+
+    #[test]
+    fn parse_header_arg_allows_empty_value() {
+        assert_eq!(
+            parse_header_arg("X-Empty:").unwrap(),
+            ("X-Empty".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn parse_header_arg_rejects_crlf_in_value() {
+        let err = parse_header_arg("X-Test: bad\r\nX-Injected: 1")
+            .expect_err("CR/LF in a header value must be refused");
+        // The error must never carry the value back to the caller.
+        assert!(!err.to_string().contains("Injected"));
+    }
+
+    #[test]
+    fn parse_header_arg_rejects_invalid_name_chars() {
+        assert!(parse_header_arg("Bad Name: v").is_err());
+        assert!(parse_header_arg("Bad\r\nName: v").is_err());
+    }
+
+    #[test]
+    fn parse_header_arg_error_never_contains_value() {
+        let err = parse_header_arg("Cookie: sid=SUPER-SECRET-VALUE")
+            .err()
+            .map(|e| e.to_string());
+        // A well-formed header does not error at all; this only guards the
+        // case where validation does fail while a value is present.
+        if let Some(message) = err {
+            assert!(!message.contains("SUPER-SECRET-VALUE"));
+        }
     }
 }

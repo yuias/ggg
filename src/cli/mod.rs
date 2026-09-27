@@ -8,6 +8,64 @@ pub mod daemon_ops;
 pub mod remote;
 pub mod bridge;
 
+/// A `--header "Name: value"` argument. Holds the raw, unparsed/unvalidated
+/// string (that happens in `remote::parse_header_arg`); this type only
+/// exists so `{:?}` on the parsed `Cli` (used by the `-v` trace log in
+/// `main.rs`) never prints the value, which may be a secret such as a
+/// `Cookie` or `Authorization` header. The name is kept visible since it is
+/// useful for debugging and is not itself a secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HeaderArg(pub String);
+
+impl std::fmt::Debug for HeaderArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.split_once(':') {
+            Some((name, _)) => write!(f, "{}: <redacted>", name.trim()),
+            None => write!(f, "<redacted>"),
+        }
+    }
+}
+
+impl std::str::FromStr for HeaderArg {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(HeaderArg(s.to_string()))
+    }
+}
+
+impl std::ops::Deref for HeaderArg {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A `--referrer` argument. Same rationale as `HeaderArg`: a referrer URL
+/// can itself carry a secret (a token in the query string, for example), so
+/// `{:?}` never prints it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedactedArg(pub String);
+
+impl std::fmt::Debug for RedactedArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<redacted>")
+    }
+}
+
+impl std::str::FromStr for RedactedArg {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(RedactedArg(s.to_string()))
+    }
+}
+
+impl std::ops::Deref for RedactedArg {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// GGG - A classic-style download manager
 #[derive(Parser, Debug)]
 #[command(name = "ggg")]
@@ -41,6 +99,29 @@ pub enum Commands {
         /// Folder ID to assign (default, images, videos, audio, archives)
         #[arg(long)]
         folder: Option<String>,
+
+        /// Set the Referer header. Overrides any `Referer` header set via
+        /// --header, regardless of the order the flags were given in.
+        #[arg(long)]
+        referrer: Option<RedactedArg>,
+
+        /// Add a header as "Name: value" (repeatable). When the same name is
+        /// given more than once, case-insensitively, the last value wins.
+        #[arg(long = "header", value_name = "K:V")]
+        header: Vec<HeaderArg>,
+
+        /// Start the download right away instead of waiting on the folder's
+        /// auto-start setting (requires a running daemon)
+        #[arg(long)]
+        immediate: bool,
+
+        /// Print only the new task IDs, one per line
+        #[arg(short = 'q', long, group = "add_output")]
+        quiet: bool,
+
+        /// Print the result as JSON
+        #[arg(long, group = "add_output")]
+        json: bool,
     },
 
     /// List all downloads
@@ -490,6 +571,30 @@ pub enum BridgeAction {
 
     /// Show the currently installed bridge configuration
     Status,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `-v` logs the parsed `Cli` with `{:?}` (see `main.rs`); this proves a
+    // secret passed via `--header`/`--referrer` never reaches that line.
+    #[test]
+    fn debug_format_redacts_header_and_referrer_values() {
+        let cli = Cli::parse_from([
+            "ggg",
+            "add",
+            "https://example.com/f",
+            "--header",
+            "Cookie: sid=SECRET",
+            "--referrer",
+            "https://example.org/SECRET-PATH",
+        ]);
+        let formatted = format!("{cli:?}");
+        assert!(!formatted.contains("SECRET"), "formatted: {formatted}");
+        // The header name is still visible; only the value is hidden.
+        assert!(formatted.contains("Cookie"), "formatted: {formatted}");
+    }
 }
 
 /// Test utility actions

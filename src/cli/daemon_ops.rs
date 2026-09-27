@@ -14,10 +14,12 @@ use futures_util::future::BoxFuture;
 use tokio::sync::{Mutex, Notify};
 
 use crate::app::state::AppState;
+use crate::download::enqueue::{build_task, enqueue, resolve_target_folder, EnqueueOptions, EnqueueOutcome};
 use crate::download::manager::DownloadManager;
 use crate::download::task::DownloadStatus;
 use crate::ipc::control::protocol::{
-    ControlErrorCode, ControlRequest, ControlResponse, DaemonStatus, CONTROL_PROTOCOL_VERSION,
+    AddedTask, ControlErrorCode, ControlRequest, ControlResponse, DaemonStatus, SkippedUrl,
+    CONTROL_PROTOCOL_VERSION,
 };
 
 /// The daemon's control pipe binding, threaded from `main.rs`'s single-
@@ -100,11 +102,78 @@ pub async fn dispatch(req: ControlRequest, ctx: &DaemonContext) -> ControlRespon
         ControlRequest::Shutdown => ControlResponse::Ok {
             message: "shutting down".to_string(),
         },
+        ControlRequest::Add {
+            url,
+            folder,
+            referrer,
+            headers,
+            immediate,
+        } => dispatch_add(url, folder, referrer, headers, immediate, ctx).await,
         _ => ControlResponse::Error {
             code: ControlErrorCode::Unsupported,
             message: "not supported by this daemon yet".to_string(),
         },
     }
+}
+
+/// Expands `url`'s range patterns and queues each one, exactly as the
+/// standalone `add` handler does, so folder rules (`save_path`,
+/// `default_headers`, auto-start) apply the same way through the daemon.
+/// No extra lock: a concurrent auto-start sweep is made safe by the start
+/// claim (`DownloadManager::start_download`).
+async fn dispatch_add(
+    url: String,
+    folder: Option<String>,
+    referrer: Option<String>,
+    headers: Vec<(String, String)>,
+    immediate: bool,
+    ctx: &DaemonContext,
+) -> ControlResponse {
+    let config = ctx.state.config.read().await.clone();
+    let folder_id = match resolve_target_folder(&config, folder.as_deref()) {
+        Ok(id) => id,
+        Err(_) => {
+            return ControlResponse::Error {
+                code: ControlErrorCode::InvalidInput,
+                message: "unknown folder".to_string(),
+            };
+        }
+    };
+
+    let opts = EnqueueOptions { referrer, headers };
+    let mut added = Vec::new();
+    let mut skipped = Vec::new();
+
+    for u in crate::util::url_expansion::expand_url(&url) {
+        if !crate::cli::handler::is_valid_download_url(&u) {
+            skipped.push(SkippedUrl {
+                url: u,
+                reason: "invalid_url".to_string(),
+            });
+            continue;
+        }
+
+        let task = build_task(&u, &folder_id, &config, &opts);
+        match enqueue(&ctx.manager, &ctx.state, task, immediate, true).await {
+            EnqueueOutcome::Added {
+                id,
+                started,
+                start_error,
+            } => added.push(AddedTask {
+                id,
+                url: u,
+                folder_id: folder_id.clone(),
+                started,
+                start_error,
+            }),
+            EnqueueOutcome::Duplicate => skipped.push(SkippedUrl {
+                url: u,
+                reason: "duplicate".to_string(),
+            }),
+        }
+    }
+
+    ControlResponse::Added { added, skipped }
 }
 
 #[cfg(windows)]
@@ -216,6 +285,89 @@ mod tests {
         match resp {
             ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::Unsupported),
             other => panic!("expected Error{{Unsupported}}, got {other:?}"),
+        }
+    }
+
+    // `Config::default()`'s "default" folder has `auto_start_downloads =
+    // false`, so `immediate: false` here never spawns a real download.
+    #[tokio::test]
+    async fn dispatch_add_returns_ids_and_applies_referrer() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::Add {
+                url: "https://example.com/f.zip".to_string(),
+                folder: None,
+                referrer: Some("https://example.org/".to_string()),
+                headers: vec![("X-Test".to_string(), "1".to_string())],
+                immediate: false,
+            },
+            &ctx,
+        )
+        .await;
+
+        let added = match resp {
+            ControlResponse::Added { added, skipped } => {
+                assert!(skipped.is_empty());
+                added
+            }
+            other => panic!("expected Added, got {other:?}"),
+        };
+        assert_eq!(added.len(), 1);
+        assert!(!added[0].started);
+
+        let task = ctx
+            .manager
+            .get_by_id(added[0].id)
+            .await
+            .expect("task queued");
+        assert_eq!(
+            task.headers.get("Referer").map(String::as_str),
+            Some("https://example.org/")
+        );
+        assert_eq!(task.headers.get("X-Test").map(String::as_str), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_add_unknown_folder_is_invalid_input() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::Add {
+                url: "https://example.com/f.zip".to_string(),
+                folder: Some("no-such-folder".to_string()),
+                referrer: None,
+                headers: vec![],
+                immediate: false,
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::InvalidInput),
+            other => panic!("expected Error{{InvalidInput}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_add_skips_invalid_urls() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::Add {
+                url: "not a url".to_string(),
+                folder: None,
+                referrer: None,
+                headers: vec![],
+                immediate: false,
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Added { added, skipped } => {
+                assert!(added.is_empty());
+                assert_eq!(skipped.len(), 1);
+                assert_eq!(skipped[0].reason, "invalid_url");
+            }
+            other => panic!("expected Added, got {other:?}"),
         }
     }
 

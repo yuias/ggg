@@ -7,7 +7,10 @@ use crate::app::state::AppState;
 use crate::download::manager::DownloadManager;
 use crate::download::task::{DownloadTask, DownloadStatus};
 use crate::download::completion_log::CompletedEntry;
-use crate::download::enqueue::resolve_folder_id;
+use crate::download::enqueue::{
+    build_task, enqueue, resolve_folder_id, resolve_target_folder, EnqueueOptions, EnqueueOutcome,
+};
+use crate::ipc::control::protocol::{AddedTask, SkippedUrl};
 use crate::script::events::{BeforeRequestContext, HookEvent};
 use anyhow::Result;
 use std::path::PathBuf;
@@ -21,7 +24,9 @@ pub async fn handle_command(
     manager: DownloadManager,
 ) -> i32 {
     let result = match command {
-        Commands::Add { url, folder } => handle_add(url, folder, &state, &manager).await,
+        Commands::Add { url, folder, referrer, header, immediate, quiet, json } => {
+            handle_add(url, folder, referrer, header, immediate, quiet, json, &state, &manager).await
+        }
         Commands::List { json } => handle_list(&manager, json).await,
         Commands::Start { id, wait } => handle_start(id, &state, &manager, wait).await,
         Commands::Pause { id } => handle_pause(id, &manager).await,
@@ -67,48 +72,95 @@ pub async fn handle_command(
     }
 }
 
-/// Add a new download
+/// Add a new download. Shares `resolve_target_folder`/`build_task`/`enqueue`
+/// with the daemon's `Add` handler, so folder `save_path` and
+/// `default_headers` apply here too, not just when routed through a daemon.
 async fn handle_add(
     url: String,
     folder: Option<String>,
+    referrer: Option<super::RedactedArg>,
+    header: Vec<super::HeaderArg>,
+    immediate: bool,
+    quiet: bool,
+    json: bool,
     state: &AppState,
     manager: &DownloadManager,
 ) -> Result<i32> {
-    // Get default directory from config, then release the lock before the loop.
-    let save_path = {
-        let config = state.config.read().await;
-        config.download.default_directory.clone()
+    // The standalone process exits right after this command, so a download
+    // started here would be killed immediately; only a daemon can honor
+    // `--immediate`.
+    if immediate {
+        eprintln!("--immediate requires a running daemon");
+        return Ok(error::INVALID_INPUT);
+    }
+
+    let mut headers = Vec::with_capacity(header.len());
+    for h in &header {
+        match super::remote::parse_header_arg(h) {
+            Ok(pair) => headers.push(pair),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return Ok(error::INVALID_INPUT);
+            }
+        }
+    }
+
+    let config = state.config.read().await.clone();
+    let folder_id = match resolve_target_folder(&config, folder.as_deref()) {
+        Ok(id) => id,
+        Err(_) => {
+            eprintln!("Error: unknown folder");
+            return Ok(error::INVALID_INPUT);
+        }
+    };
+
+    let opts = EnqueueOptions {
+        referrer: referrer.map(|r| r.0),
+        headers,
     };
 
     // Expand range patterns like `[1-10]` into individual URLs so the CLI
     // matches the TUI's add behavior.
-    let urls = crate::util::url_expansion::expand_url(&url);
-
-    let mut added = 0;
-    for u in urls {
+    let mut added = Vec::new();
+    let mut skipped = Vec::new();
+    for u in crate::util::url_expansion::expand_url(&url) {
         // Reject empty / non-http(s)/ftp URLs up front instead of queueing
         // garbage that only fails later.
         if !is_valid_download_url(&u) {
-            eprintln!("Skipping invalid URL: {}", u);
+            skipped.push(SkippedUrl {
+                url: u,
+                reason: "invalid_url".to_string(),
+            });
             continue;
         }
 
-        let mut task = DownloadTask::new(u.clone(), save_path.clone());
-        if let Some(ref folder_id) = folder {
-            task.folder_id = folder_id.clone();
+        let task = build_task(&u, &folder_id, &config, &opts);
+        match enqueue(manager, state, task, false, false).await {
+            EnqueueOutcome::Added {
+                id,
+                started,
+                start_error,
+            } => added.push(AddedTask {
+                id,
+                url: u,
+                folder_id: folder_id.clone(),
+                started,
+                start_error,
+            }),
+            EnqueueOutcome::Duplicate => {
+                skipped.push(SkippedUrl {
+                    url: u,
+                    reason: "duplicate".to_string(),
+                })
+            }
         }
-
-        manager.add_download(task.clone()).await;
-        println!("Added download: {} (ID: {})", u, task.id);
-        added += 1;
     }
 
-    if added == 0 {
-        return Err(anyhow::anyhow!("No valid URLs to add"));
+    if !added.is_empty() {
+        manager.save_queue_to_folders().await?;
     }
 
-    manager.save_queue_to_folders().await?;
-    Ok(error::SUCCESS)
+    Ok(super::remote::render_added(&added, &skipped, quiet, json))
 }
 
 /// Standalone fallback for `daemon ping|status|stop`: these commands are
@@ -126,7 +178,7 @@ fn parse_task_id(id_str: &str) -> Result<Uuid> {
 
 /// Validate a download URL: must parse and use a scheme the HTTP client
 /// supports. Mirrors the TUI's `is_valid_download_url`.
-fn is_valid_download_url(text: &str) -> bool {
+pub(crate) fn is_valid_download_url(text: &str) -> bool {
     match url::Url::parse(text) {
         Ok(parsed) => matches!(parsed.scheme(), "http" | "https" | "ftp" | "ftps"),
         Err(_) => false,
