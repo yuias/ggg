@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     // only mean the previous process was interrupted. Recover it in every
     // mode, before routing, so the TUI and standalone CLI see it as startable
     // too.
-    download_manager.recover_interrupted().await;
+    let recovered = download_manager.recover_interrupted().await;
 
     // Route based on CLI arguments
     match cli.command {
@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
         None => {
             if cli.headless {
                 // Headless daemon mode
-                cli::daemon::run_daemon(download_manager).await?;
+                cli::daemon::run_daemon(state, download_manager, recovered, None).await?;
             } else {
                 // TUI mode (default)
                 run_tui(state, download_manager).await?;

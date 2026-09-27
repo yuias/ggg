@@ -1476,6 +1476,17 @@ impl DownloadManager {
         recovered
     }
 
+    /// True if a download handle exists for `id` and has not finished yet.
+    /// Because `active_downloads` entries are only removed by pause/remove
+    /// (see the leak noted on the struct), a finished handle can still be
+    /// present here; `is_finished()` filters those out.
+    pub async fn is_running(&self, id: Uuid) -> bool {
+        match self.active_downloads.read().await.get(&id) {
+            Some(handle) => !handle.is_finished(),
+            None => false,
+        }
+    }
+
     /// Get download by ID (searches all folder queues)
     pub async fn get_by_id(&self, id: Uuid) -> Option<DownloadTask> {
         let queues = self.folder_queues.read().await;
@@ -2256,5 +2267,13 @@ mod tests {
             .filter(|t| t.status == DownloadStatus::Paused)
             .count();
         assert_eq!(paused, 1);
+    }
+
+    #[tokio::test]
+    async fn is_running_false_for_unknown_id() {
+        let manager = DownloadManager::new();
+
+        let running = manager.is_running(Uuid::new_v4()).await;
+        assert!(!running);
     }
 }
