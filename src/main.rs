@@ -104,6 +104,12 @@ async fn main() -> Result<()> {
         tracing::warn!("Legacy queue.json detected. New queues are stored in config/{{folder_id}}/queue.toml");
     }
 
+    // No download handle can exist yet, so a persisted `Downloading` task can
+    // only mean the previous process was interrupted. Recover it in every
+    // mode, before routing, so the TUI and standalone CLI see it as startable
+    // too.
+    download_manager.recover_interrupted().await;
+
     // Route based on CLI arguments
     match cli.command {
         Some(command) => {

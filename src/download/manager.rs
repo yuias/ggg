@@ -1453,6 +1453,29 @@ impl DownloadManager {
         Ok(())
     }
 
+    /// Marks every persisted `Downloading` task as `Paused`. Called once at
+    /// process start, before any download handle can exist, so a persisted
+    /// `Downloading` status can only mean the previous process was
+    /// interrupted (crash or unclean shutdown).
+    pub async fn recover_interrupted(&self) -> Vec<Uuid> {
+        let queues: Vec<FolderQueue> = {
+            let guard = self.folder_queues.read().await;
+            guard.values().cloned().collect()
+        };
+
+        let mut recovered = Vec::new();
+        for queue in queues {
+            for mut task in queue.get_all().await {
+                if task.status == DownloadStatus::Downloading {
+                    recovered.push(task.id);
+                    task.status = DownloadStatus::Paused;
+                    queue.update(task).await;
+                }
+            }
+        }
+        recovered
+    }
+
     /// Get download by ID (searches all folder queues)
     pub async fn get_by_id(&self, id: Uuid) -> Option<DownloadTask> {
         let queues = self.folder_queues.read().await;
@@ -2206,5 +2229,32 @@ mod tests {
             .change_folder(id, "known".to_string(), Some(&config))
             .await
             .expect("a destination present in the config must be accepted");
+    }
+
+    #[tokio::test]
+    async fn recover_interrupted_marks_downloading_as_paused() {
+        let manager = DownloadManager::new();
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        task.status = DownloadStatus::Downloading;
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let recovered = manager.recover_interrupted().await;
+        assert_eq!(recovered, vec![id]);
+
+        let task = manager.get_by_id(id).await.expect("task still exists");
+        assert_eq!(task.status, DownloadStatus::Paused);
+
+        let counts = manager.get_folder_queue("folder1").await.expect("queue").get_counts().await;
+        assert_eq!(counts.downloading, 0);
+        let paused = manager
+            .get_all_downloads()
+            .await
+            .into_iter()
+            .filter(|t| t.status == DownloadStatus::Paused)
+            .count();
+        assert_eq!(paused, 1);
     }
 }
