@@ -424,11 +424,17 @@ impl Config {
             ));
         }
 
-        // Step 7: Auto-save after migration to persist new UUID keys
-        if migrated {
-            tracing::info!("Saving migrated folder configs with UUID keys");
+        // Step 7: Auto-save after migration, and after creating a fresh
+        // "default" folder, to persist the UUID key. Without this, a
+        // freshly created default folder's key lives only in memory: the
+        // next `load()` doesn't find it (no folder named "default" was ever
+        // saved with a key), so it invents another UUID, and so on. Every
+        // process start would then queue tasks under a different key, each
+        // with no persisted settings.
+        if migrated || !has_default {
+            tracing::info!("Saving folder configs after migration or default-folder creation");
             if let Err(e) = config.save() {
-                tracing::error!("Failed to save migrated config: {}", e);
+                tracing::error!("Failed to save folder configs: {}", e);
             }
         }
 
@@ -1165,6 +1171,46 @@ auto_start_downloads = false
         assert!(!folders.contains_key(".logs"));
         assert!(!folders.contains_key("scripts"));
         assert!(!folders.contains_key("empty_dir"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_persists_default_folder_key_across_loads() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().to_path_buf();
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        crate::util::paths::set_config_dir_override(Some(config_dir.clone()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        // First load: no folder exists yet, so `load()` invents a "default"
+        // folder key. With the fix this gets saved immediately, not only
+        // when `migrate_folder_keys` reports `migrated`.
+        let first = Config::load().unwrap();
+        let first_id = first
+            .folders
+            .iter()
+            .find(|(_, f)| f.name == "default")
+            .map(|(id, _)| id.clone())
+            .expect("a default folder is created on first load");
+
+        // Second load: the key must now be found on disk and reused, not
+        // regenerated, or every process start would scatter tasks into a
+        // fresh, settings-less folder directory.
+        let second = Config::load().unwrap();
+        let second_id = second
+            .folders
+            .iter()
+            .find(|(_, f)| f.name == "default")
+            .map(|(id, _)| id.clone())
+            .expect("a default folder is present on second load");
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert_eq!(first_id, second_id);
     }
 
     #[test]
