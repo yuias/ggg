@@ -325,7 +325,7 @@ async fn test_manager_pause_sets_status() {
 
 #[tokio::test]
 async fn test_manager_remove_active_aborts() {
-    let (_server, uri) = setup_mock_download_server().await;
+    let (_server, uri) = setup_slow_mock_download_server().await;
     let manager = DownloadManager::new();
     let temp_dir = tempfile::tempdir().unwrap();
 
@@ -337,18 +337,17 @@ async fn test_manager_remove_active_aborts() {
     let config = create_test_config();
     manager.start_download(task_id, None, config).await.unwrap();
 
-    sleep(Duration::from_millis(100)).await;
-
-    // Should have 1 active download
+    // The GET response is delayed well past this test's lifetime, so the
+    // download is still active here rather than having already completed.
     assert_eq!(manager.get_active_count().await, 1);
+    assert!(manager.is_running(task_id).await);
 
     // Remove should abort the active download
     manager.remove_download(task_id).await;
 
-    sleep(Duration::from_millis(50)).await;
-
-    // Active count should be 0
     assert_eq!(manager.get_active_count().await, 0);
+    assert!(!manager.is_running(task_id).await);
+    assert!(manager.get_by_id(task_id).await.is_none());
 }
 
 #[tokio::test]

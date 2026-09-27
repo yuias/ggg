@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wiremock::matchers::{method, path};
@@ -28,6 +29,38 @@ pub async fn setup_mock_download_server() -> (MockServer, String) {
                 .set_body_bytes(vec![0u8; 1024])
                 .append_header("Content-Length", "1024")
                 .append_header("Accept-Ranges", "bytes")
+        )
+        .mount(&server)
+        .await;
+
+    (server, uri)
+}
+
+/// Setup a mock HTTP server whose GET response never completes within a
+/// test's lifetime (HEAD stays fast), so a download started against it stays
+/// active until the caller aborts it.
+#[allow(dead_code)]
+pub async fn setup_slow_mock_download_server() -> (MockServer, String) {
+    let server = MockServer::start().await;
+    let uri = server.uri();
+
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("Content-Length", "1024")
+                .append_header("Accept-Ranges", "bytes")
+                .append_header("ETag", "\"test-etag\"")
+        )
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(vec![0u8; 1024])
+                .append_header("Content-Length", "1024")
+                .append_header("Accept-Ranges", "bytes")
+                .set_delay(Duration::from_secs(5))
         )
         .mount(&server)
         .await;

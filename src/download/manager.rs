@@ -10,6 +10,7 @@ use crate::script::message::ScriptRequest;
 use crate::script::sender;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio::task::JoinHandle;
@@ -65,13 +66,64 @@ pub enum EditHeadersError {
     Busy(Uuid, &'static str),
 }
 
+/// One running (or finished but not yet released) download.
+struct ActiveEntry {
+    handle: JoinHandle<()>,
+    /// Distinguishes this spawn from a later one for the same id, so a
+    /// finishing body never removes a newer entry.
+    generation: u64,
+    /// True while the retry loop sleeps between attempts.
+    in_backoff: Arc<AtomicBool>,
+}
+
+/// Point-in-time view of a task's live work in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    /// No claim and no live handle.
+    Idle,
+    /// Some operation (start, pause, remove, move, header edit) holds the claim.
+    Claimed,
+    /// Live handle, not in backoff (downloading or waiting for a permit).
+    Active,
+    /// Live handle sleeping between retry attempts; persisted status is Paused.
+    RetryBackoff,
+}
+
+/// Result of a `start_download` call that did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum StartOutcome {
+    /// This call spawned a new download.
+    Started,
+    /// Nothing done: a live handle exists (including retry backoff) or the
+    /// status is already Downloading.
+    AlreadyRunning,
+    /// Nothing done: another operation holds the task's claim (a concurrent
+    /// start, or a pause/remove/move/header edit).
+    Busy,
+}
+
+impl StartOutcome {
+    pub fn is_started(self) -> bool {
+        matches!(self, StartOutcome::Started)
+    }
+}
+
+/// Returned when a pause/remove/move could not take the task's claim within
+/// the wait budget. Nothing was changed.
+#[derive(Debug, thiserror::Error)]
+#[error("download {0} is busy (being started or modified); retry in a moment")]
+pub struct TaskBusy(pub Uuid);
+
 #[derive(Clone)]
 pub struct DownloadManager {
     /// Per-folder download queues
     folder_queues: Arc<RwLock<HashMap<String, FolderQueue>>>,
 
     http_client: Arc<HttpClient>,
-    active_downloads: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
+    active_downloads: Arc<RwLock<HashMap<Uuid, ActiveEntry>>>,
+    /// Source of `ActiveEntry::generation`. See `release_active_entry`.
+    next_generation: Arc<AtomicU64>,
 
     // Application-wide concurrent download limit
     max_concurrent: Arc<RwLock<usize>>,
@@ -191,6 +243,7 @@ impl DownloadManager {
             folder_queues: Arc::new(RwLock::new(HashMap::new())),
             http_client: Arc::new(HttpClient::new_or_fallback()),
             active_downloads: Arc::new(RwLock::new(HashMap::new())),
+            next_generation: Arc::new(AtomicU64::new(0)),
             max_concurrent: Arc::new(RwLock::new(max_concurrent)),
             global_semaphore: Arc::new(Semaphore::new(max_concurrent)),
             max_concurrent_per_folder: adjusted_folder_limit,
@@ -312,8 +365,8 @@ impl DownloadManager {
     pub async fn remove_download(&self, id: Uuid) -> Option<DownloadTask> {
         // Cancel active download if running. Aborting drops the spawned task
         // without running its cleanup, so the folder slot is released below.
-        if let Some(handle) = self.active_downloads.write().await.remove(&id) {
-            handle.abort();
+        if let Some(entry) = self.active_downloads.write().await.remove(&id) {
+            entry.handle.abort();
         }
 
         // Snapshot the folder queues (cheap Arc clones) and drop the outer lock
@@ -468,7 +521,11 @@ impl DownloadManager {
         let history = self.history.clone();
         let task_url = task.url.clone();
 
-        let handle = tokio::spawn(async move {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let in_backoff = Arc::new(AtomicBool::new(false));
+        // Clone before `in_backoff` is moved into `body`; the entry keeps this one.
+        let entry_in_backoff = in_backoff.clone();
+        let body = async move {
             // Acquire both global and folder semaphore permits. The semaphores
             // are never closed in normal operation, but handle the error path
             // gracefully instead of panicking the download task (which would
@@ -534,6 +591,7 @@ impl DownloadManager {
                             );
                             current_task.status = DownloadStatus::Paused;
                             current_task.log_info(format!("Retrying in {} seconds...", backoff_delay));
+                            in_backoff.store(true, Ordering::Relaxed);
                             queue.update(current_task.clone()).await;
 
                             // Wait before retry with exponential backoff
@@ -543,6 +601,7 @@ impl DownloadManager {
                             current_task.status = DownloadStatus::Downloading;
                             current_task.error_message = None;
                             queue.update(current_task.clone()).await;
+                            in_backoff.store(false, Ordering::Relaxed);
                         } else {
                             // Max retries exceeded, mark as error
                             current_task.status = DownloadStatus::Error;
@@ -594,9 +653,20 @@ impl DownloadManager {
             // decrement_downloading here would double-count and wrongly free a
             // sibling download's slot when several run in the same folder.
             manager_for_cleanup.deactivate_folder_if_empty(&folder_id).await;
-        });
+        };
 
-        self.active_downloads.write().await.insert(id, handle);
+        // Insert happens while holding the write lock, so the spawned body's
+        // release (which takes the same lock) cannot run before the entry
+        // exists, even if the body finishes immediately.
+        let releaser = self.clone();
+        let mut active = self.active_downloads.write().await;
+        let handle = tokio::spawn(async move {
+            body.await;
+            releaser.release_active_entry(id, generation).await;
+        });
+        active.insert(id, ActiveEntry { handle, generation, in_backoff: entry_in_backoff });
+        drop(active);
+
         self.emit(DownloadEvent::Started { task_id: id });
 
         Ok(())
@@ -1113,8 +1183,8 @@ impl DownloadManager {
     pub async fn pause_download(&self, id: Uuid) -> Result<()> {
         // Abort the download task. Aborting drops the spawned future, so its
         // own cleanup never runs — this function releases bookkeeping itself.
-        if let Some(handle) = self.active_downloads.write().await.remove(&id) {
-            handle.abort();
+        if let Some(entry) = self.active_downloads.write().await.remove(&id) {
+            entry.handle.abort();
         }
 
         // Update status and counts
@@ -1508,8 +1578,16 @@ impl DownloadManager {
         *current = max;
     }
 
+    /// Number of live handles (downloading, waiting for a permit, or in
+    /// retry backoff). A finished-but-not-yet-released entry (see
+    /// `release_active_entry`) does not count.
     pub async fn get_active_count(&self) -> usize {
-        self.active_downloads.read().await.len()
+        self.active_downloads
+            .read()
+            .await
+            .values()
+            .filter(|e| !e.handle.is_finished())
+            .count()
     }
 
     /// Save queue to file (legacy single-file format)
@@ -1582,14 +1660,60 @@ impl DownloadManager {
     }
 
     /// True if a download handle exists for `id` and has not finished yet.
-    /// Because `active_downloads` entries are only removed by pause/remove
-    /// (see the leak noted on the struct), a finished handle can still be
-    /// present here; `is_finished()` filters those out.
+    /// Release happens on a normal exit (`release_active_entry`) or when
+    /// pause/remove take the entry out of the map; `is_finished()` is kept as
+    /// a filter for the case a panic in the spawned body skips that release.
     pub async fn is_running(&self, id: Uuid) -> bool {
         match self.active_downloads.read().await.get(&id) {
-            Some(handle) => !handle.is_finished(),
+            Some(entry) => !entry.handle.is_finished(),
             None => false,
         }
+    }
+
+    /// Removes `id`'s entry from `active_downloads` if it still has the
+    /// generation this call spawned -- a pause/remove that already took the
+    /// entry out (and possibly let a later `start_download` insert a new one)
+    /// must not have its replacement deleted from under it.
+    async fn release_active_entry(&self, id: Uuid, generation: u64) {
+        let mut active = self.active_downloads.write().await;
+        if active.get(&id).is_some_and(|e| e.generation == generation) {
+            active.remove(&id);
+        }
+    }
+
+    /// Claim held -> `Claimed`; else a live handle -> `RetryBackoff` if
+    /// sleeping between retry attempts, else `Active`; else `Idle`.
+    pub async fn run_state(&self, id: Uuid) -> RunState {
+        if self.is_start_in_progress(id) {
+            return RunState::Claimed;
+        }
+        match self.active_downloads.read().await.get(&id) {
+            Some(entry) if !entry.handle.is_finished() => {
+                if entry.in_backoff.load(Ordering::Relaxed) {
+                    RunState::RetryBackoff
+                } else {
+                    RunState::Active
+                }
+            }
+            _ => RunState::Idle,
+        }
+    }
+
+    /// True if `id` has live work in this process: a claim held, a live
+    /// handle (including retry backoff), or a persisted status of
+    /// `Downloading` (a safety net for a stale status with no handle --
+    /// pausing such a task repairs it).
+    pub async fn is_in_flight(&self, id: Uuid) -> bool {
+        if self.run_state(id).await != RunState::Idle {
+            return true;
+        }
+        matches!(self.get_by_id(id).await, Some(task) if task.status == DownloadStatus::Downloading)
+    }
+
+    /// Same rule as `is_in_flight`, for a caller that already has the task in
+    /// hand (snapshot loops) and wants to avoid a second `get_by_id`.
+    async fn task_in_flight(&self, task: &DownloadTask) -> bool {
+        task.status == DownloadStatus::Downloading || self.run_state(task.id).await != RunState::Idle
     }
 
     /// Inserts a handle into `active_downloads` for `id` without going
@@ -1600,15 +1724,33 @@ impl DownloadManager {
     /// (`cli::daemon_ops`) otherwise has no way to construct.
     #[cfg(test)]
     pub(crate) async fn insert_active_handle_for_test(&self, id: Uuid, handle: JoinHandle<()>) {
-        self.active_downloads.write().await.insert(id, handle);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        self.active_downloads.write().await.insert(
+            id,
+            ActiveEntry {
+                handle,
+                generation,
+                in_backoff: Arc::new(AtomicBool::new(false)),
+            },
+        );
     }
 
     /// Aborts and drops a handle inserted by `insert_active_handle_for_test`,
     /// so a test doesn't leak a pending task for the life of the process.
     #[cfg(test)]
     pub(crate) async fn abort_active_handle_for_test(&self, id: Uuid) {
-        if let Some(handle) = self.active_downloads.write().await.remove(&id) {
-            handle.abort();
+        if let Some(entry) = self.active_downloads.write().await.remove(&id) {
+            entry.handle.abort();
+        }
+    }
+
+    /// Sets or clears the in-memory retry-backoff flag for `id`'s active
+    /// entry, for tests that need `run_state` to report `RetryBackoff`
+    /// without waiting out a real backoff sleep. No-op if `id` has no entry.
+    #[cfg(test)]
+    pub(crate) async fn mark_backoff_for_test(&self, id: Uuid, on: bool) {
+        if let Some(entry) = self.active_downloads.read().await.get(&id) {
+            entry.in_backoff.store(on, Ordering::Relaxed);
         }
     }
 
@@ -1631,9 +1773,22 @@ impl DownloadManager {
         None
     }
 
-    /// Check if there are any active downloads
+    /// True if any task has live work in this process: a live handle
+    /// (including retry backoff and permit waits) or a claim held (a start
+    /// or header edit in progress).
     pub async fn has_active_downloads(&self) -> bool {
-        !self.active_downloads.read().await.is_empty()
+        let any_live_handle = self
+            .active_downloads
+            .read()
+            .await
+            .values()
+            .any(|e| !e.handle.is_finished());
+        any_live_handle
+            || !self
+                .start_claims
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
     }
 
     /// Set priority for a download task
@@ -2410,6 +2565,115 @@ mod tests {
         assert!(!running);
     }
 
+    #[tokio::test]
+    async fn active_entry_released_after_failure() {
+        let manager = DownloadManager::with_retry_settings(1, 0);
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        manager
+            .start_download(id, None, config)
+            .await
+            .expect("start must succeed");
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let task = manager.get_by_id(id).await.expect("task exists");
+            if task.status == DownloadStatus::Error && manager.get_active_count().await == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "download did not reach Error with a released entry within 10s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        assert!(!manager.has_active_downloads().await);
+        assert_eq!(manager.run_state(id).await, RunState::Idle);
+    }
+
+    #[tokio::test]
+    async fn run_state_reports_retry_backoff() {
+        let manager = DownloadManager::with_retry_settings(3, 60);
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        manager
+            .start_download(id, None, config)
+            .await
+            .expect("start must succeed");
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            if manager.run_state(id).await == RunState::RetryBackoff {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "download did not reach RetryBackoff within 10s"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        let task = manager.get_by_id(id).await.expect("task exists");
+        assert_eq!(task.status, DownloadStatus::Paused);
+        assert!(manager.is_in_flight(id).await);
+
+        manager.abort_active_handle_for_test(id).await;
+    }
+
+    #[tokio::test]
+    async fn release_ignores_older_generation() {
+        let manager = DownloadManager::new();
+        let id = Uuid::new_v4();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+
+        // The real generation starts at 0 for a fresh manager; any other
+        // value simulates a release racing a newer spawn for the same id.
+        manager.release_active_entry(id, u64::MAX).await;
+
+        assert!(
+            manager.is_running(id).await,
+            "an entry with a non-matching generation must not be removed"
+        );
+
+        manager.abort_active_handle_for_test(id).await;
+    }
+
+    #[tokio::test]
+    async fn finished_handle_not_counted_active() {
+        let manager = DownloadManager::new();
+        let id = Uuid::new_v4();
+        let handle = tokio::spawn(async {});
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        manager.insert_active_handle_for_test(id, handle).await;
+
+        assert_eq!(manager.get_active_count().await, 0);
+        assert!(!manager.has_active_downloads().await);
+    }
+
+    #[tokio::test]
+    async fn run_state_claimed_while_claim_held() {
+        let manager = DownloadManager::new();
+        let id = Uuid::new_v4();
+        let claim = StartClaim::try_acquire(&manager.start_claims, id).expect("claim acquired");
+
+        assert_eq!(manager.run_state(id).await, RunState::Claimed);
+        assert!(manager.has_active_downloads().await);
+
+        drop(claim);
+    }
+
     /// Two concurrent `start_download` calls for the same id must collapse
     /// into a single start. Uses a multi-threaded runtime and separately
     /// spawned tasks so the two calls genuinely run in parallel.
@@ -2516,7 +2780,7 @@ mod tests {
         // Simulate a task still in retry backoff: status is `Paused` but a
         // handle is still alive in `active_downloads`.
         let handle = tokio::spawn(std::future::pending::<()>());
-        manager.active_downloads.write().await.insert(id, handle);
+        manager.insert_active_handle_for_test(id, handle).await;
 
         let mut events = manager.subscribe();
         let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
@@ -2527,7 +2791,7 @@ mod tests {
         let task = manager.get_by_id(id).await.expect("task exists");
         assert_eq!(task.status, DownloadStatus::Paused);
 
-        manager.active_downloads.write().await.remove(&id).unwrap().abort();
+        manager.abort_active_handle_for_test(id).await;
     }
 
     #[tokio::test]
