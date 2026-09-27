@@ -4,6 +4,7 @@ pub mod error;
 pub mod output;
 pub mod handler;
 pub mod daemon;
+pub mod daemon_ops;
 pub mod bridge;
 
 /// GGG - A classic-style download manager

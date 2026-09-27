@@ -1,12 +1,13 @@
 use crate::app::config::Config;
 use crate::app::state::AppState;
+use crate::cli::daemon_ops::{ControlBinding, DaemonContext};
 use crate::download::manager::{DownloadEvent, DownloadManager};
 use crate::script::message::ScriptRequest;
 use anyhow::Result;
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::signal;
-use tokio::sync::{broadcast, Notify, RwLock};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use uuid::Uuid;
 
 /// How often the auto-save task ticks, and re-runs the auto-start sweep so a
@@ -70,20 +71,57 @@ async fn resume_if_auto_start(
 
 /// Run in headless daemon mode.
 ///
-/// `control` is `None` on non-Windows targets, or when a control pipe binding
-/// isn't wired up yet; the daemon still runs downloads and scripts without a
-/// pipe to control it from.
+/// `control` is `None` on non-Windows targets, or when the control pipe
+/// couldn't be bound; the daemon still runs downloads and scripts without a
+/// pipe to control it from. When `Some`, `serve` is started as the very
+/// first thing below, before the auto-start sweep, so the gap between
+/// `bind` (in `main.rs`, before `Config::load`) and the pipe actually
+/// accepting connections stays as short as possible. The first instance is
+/// already listening during that gap, so a client that opens it there just
+/// waits for the `Ping` reply; it only sees `Unreachable` if the gap ends up
+/// longer than the client's 2 s ping timeout.
 pub async fn run_daemon(
     state: AppState,
     manager: DownloadManager,
     recovered: Vec<Uuid>,
-    control: Option<()>,
+    control: Option<ControlBinding>,
 ) -> Result<()> {
     tracing::info!("Starting daemon mode...");
     tracing::info!("Press Ctrl+C to stop");
 
     let config = state.config.clone();
     let script_sender = state.script_sender.clone();
+    let shutdown = Arc::new(Notify::new());
+    // Serializes every `save_queue_to_folders()` call: `DaemonContext`'s
+    // `after_response` (on detached per-connection tasks that outlive
+    // aborting the server), the auto-save below, and the final save. Two
+    // concurrent saves of the same folder race on `FolderQueue::save`'s
+    // fixed tmp-file rename.
+    let save_lock = Arc::new(Mutex::new(()));
+
+    #[cfg(windows)]
+    let pipe_name = control.as_ref().map(|bound| bound.name().to_string());
+    #[cfg(not(windows))]
+    let pipe_name: Option<String> = None;
+    let has_control = pipe_name.is_some();
+
+    let ctx = Arc::new(DaemonContext {
+        state,
+        manager: manager.clone(),
+        shutdown: shutdown.clone(),
+        started_at: Instant::now(),
+        pipe_name: pipe_name
+            .unwrap_or_else(crate::ipc::control::protocol::default_control_pipe_name),
+        save_lock: save_lock.clone(),
+    });
+
+    #[cfg(windows)]
+    let server_handle = control.map(|bound| crate::ipc::control::server::serve(bound, ctx.clone()));
+    #[cfg(not(windows))]
+    let server_handle: Option<tokio::task::JoinHandle<()>> = {
+        let _ = control;
+        None
+    };
 
     // Start tasks already pending in auto-start folders.
     auto_start_sweep(&config, &script_sender, &manager).await;
@@ -92,8 +130,6 @@ pub async fn run_daemon(
     for id in recovered {
         resume_if_auto_start(id, &config, &script_sender, &manager).await;
     }
-
-    let shutdown = Arc::new(Notify::new());
 
     // Auto-save and the event-triggered sweep share one task so that at most
     // one sweep runs at a time; this is a convenience, not the guard against
@@ -105,6 +141,7 @@ pub async fn run_daemon(
     let sweep_manager = manager.clone();
     let sweep_config = config.clone();
     let sweep_sender = script_sender.clone();
+    let sweep_save_lock = save_lock.clone();
     let background_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(AUTO_SAVE_INTERVAL);
         interval.tick().await; // first tick fires immediately; skip it
@@ -115,7 +152,11 @@ pub async fn run_daemon(
                 _ = interval.tick() => {
                     auto_start_sweep(&sweep_config, &sweep_sender, &sweep_manager).await;
 
-                    match sweep_manager.save_queue_to_folders().await {
+                    let save_result = {
+                        let _guard = sweep_save_lock.lock().await;
+                        sweep_manager.save_queue_to_folders().await
+                    };
+                    match save_result {
                         Ok(_) => tracing::debug!("Queue auto-saved to folder files"),
                         Err(e) => tracing::error!("Failed to auto-save queue: {}", e),
                     }
@@ -139,12 +180,17 @@ pub async fn run_daemon(
         }
     });
 
-    match control {
-        Some(()) => println!("ggg daemon running (pid {})", std::process::id()),
-        None => println!(
+    if has_control {
+        println!(
+            "ggg daemon running (pid {}, pipe {})",
+            std::process::id(),
+            ctx.pipe_name
+        );
+    } else {
+        println!(
             "ggg daemon running (pid {}, no control pipe)",
             std::process::id()
-        ),
+        );
     }
 
     tokio::select! {
@@ -159,6 +205,15 @@ pub async fn run_daemon(
         }
     }
 
+    // Shutdown via the control pipe (`daemon stop`) goes through the same
+    // path as Ctrl+C from here on: stop accepting new requests, abort and
+    // await the background sweep/save task so it can't race the final save
+    // below, then do the final save.
+    if let Some(h) = server_handle {
+        h.abort();
+        let _ = h.await;
+    }
+
     // Abort and await so an in-flight auto-save can't race the final save's
     // tmp-file write and rename below.
     background_handle.abort();
@@ -168,7 +223,13 @@ pub async fn run_daemon(
     // `recover_interrupted` turns them into `Paused`, so a crash and a
     // graceful stop resume the same way.
     tracing::info!("Saving queue to folder files...");
-    manager.save_queue_to_folders().await?;
+    {
+        // Waits out any save still in flight from a connection task that
+        // outlived `server_handle.abort()` above (aborting never interrupts
+        // `spawn_blocking` file IO), so this save is never racing that one.
+        let _guard = save_lock.lock().await;
+        manager.save_queue_to_folders().await?;
+    }
 
     tracing::info!("Daemon stopped");
 

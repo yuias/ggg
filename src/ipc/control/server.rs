@@ -94,6 +94,14 @@ pub fn serve(bound: BoundPipe, handler: Arc<dyn ControlHandler>) -> tokio::task:
 }
 
 async fn accept_loop(pipe_name: String, mut server: NamedPipeServer, handler: Arc<dyn ControlHandler>) {
+    // Tracking connection tasks here (instead of a bare `tokio::spawn`) means
+    // dropping this future -- which is what happens when `serve`'s returned
+    // handle is aborted -- also aborts every in-flight connection, instead of
+    // leaving them to run detached forever. This doesn't interrupt a save
+    // already inside `spawn_blocking` file IO (aborting a task never does),
+    // so it's a courtesy, not the guard against overlapping saves; that's
+    // `DaemonContext::save_lock`.
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         if let Err(e) = server.connect().await {
             tracing::error!("control pipe accept failed on {pipe_name}: {e}");
@@ -124,9 +132,12 @@ async fn accept_loop(pipe_name: String, mut server: NamedPipeServer, handler: Ar
         };
         let connected = std::mem::replace(&mut server, next);
         let h = handler.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             handle_connection(connected, h).await;
         });
+        // Reap finished connections so the set doesn't grow for the life of
+        // the daemon; this never blocks (no pending connection is awaited).
+        while connections.try_join_next().is_some() {}
     }
 }
 
