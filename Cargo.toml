@@ -5,13 +5,13 @@ resolver = "2"
 
 [package]
 name = "ggg"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 authors = ["yuinshielAs"]
 description = "Classic-style download manager"
 license = "MIT"
-repository = "https://github.com/yuiAs/ggg"
-homepage = "https://github.com/yuiAs/ggg"
+repository = "https://github.com/yuias/ggg"
+homepage = "https://github.com/yuias/ggg"
 
 [[bin]]
 name = "ggg"
