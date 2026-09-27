@@ -13,12 +13,9 @@ use uuid::Uuid;
 /// task that was refused a folder slot earlier gets another chance.
 const AUTO_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// `AppState` holds an `Arc<LocalizationManager>`, whose fluent-bundle
-/// internals use a non-`Sync` `RefCell`. That makes `AppState` itself
-/// non-`Send`, so it can never be captured by a `tokio::spawn`ed future.
-/// Sweeping and resuming only need the config and the script sender, both of
-/// which are `Send`, so those two fields are threaded through separately
-/// instead of the whole `AppState`.
+/// `AppState` is `Send + Sync`, but sweeping and resuming only need the
+/// config and the script sender, so those two fields are threaded through
+/// separately instead of the whole `AppState`.
 async fn auto_start_sweep(
     config: &Arc<RwLock<Config>>,
     script_sender: &Option<mpsc::Sender<ScriptRequest>>,

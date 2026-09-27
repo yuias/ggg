@@ -1,4 +1,5 @@
-use fluent::{FluentBundle, FluentResource};
+use fluent::FluentResource;
+use fluent_bundle::concurrent::FluentBundle;
 use fluent_bundle::FluentArgs;
 use rust_embed::RustEmbed;
 use std::path::Path;
@@ -83,7 +84,7 @@ impl LocalizationManager {
     /// can start even if no locale assets load at all, instead of panicking.
     pub fn fallback() -> Self {
         let lang_id: LanguageIdentifier = "en-US".parse().unwrap_or_default();
-        let mut bundle = FluentBundle::new(vec![lang_id]);
+        let mut bundle = FluentBundle::new_concurrent(vec![lang_id]);
         bundle.set_use_isolating(false);
         Self {
             bundle,
@@ -104,7 +105,7 @@ impl LocalizationManager {
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid locale ID '{}': {:?}", locale_id, e))?;
 
-        let mut bundle = FluentBundle::new(vec![lang_id]);
+        let mut bundle = FluentBundle::new_concurrent(vec![lang_id]);
         // Disable Unicode bidi isolation (FSI/PDI, U+2068/U+2069) around
         // interpolated arguments. Those control characters render as stray
         // glyphs in the CLI and the Win32 GUI's DrawTextW output.
