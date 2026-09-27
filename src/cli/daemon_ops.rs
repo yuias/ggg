@@ -140,10 +140,77 @@ pub async fn dispatch(req: ControlRequest, ctx: &DaemonContext) -> ControlRespon
         ControlRequest::StartAll { folder } => dispatch_start_all(folder, ctx).await,
         ControlRequest::PauseAll { folder } => dispatch_pause_all(folder, ctx).await,
         ControlRequest::Wait { id, timeout_secs } => dispatch_wait(id, timeout_secs, ctx).await,
+        ControlRequest::ReloadScripts => dispatch_reload_scripts(ctx).await,
+        ControlRequest::SetScriptEnabled { name, enabled } => {
+            dispatch_set_script_enabled(name, enabled, ctx).await
+        }
         _ => ControlResponse::Error {
             code: ControlErrorCode::Unsupported,
             message: "not supported by this daemon yet".to_string(),
         },
+    }
+}
+
+/// Reloads scripts from disk on the executor thread.
+///
+/// The executor is a single OS thread draining one channel in FIFO order, and
+/// `Reload` is just another message on that channel: any `BeforeRequest` (or
+/// other hook) request already queued ahead of it runs to completion, against
+/// the pre-reload handler set, before `Reload` is even picked up. Anything
+/// queued after `Reload` sees the reloaded handlers. Nothing in flight is
+/// ever dropped or answered twice, and no lock or generation counter is
+/// needed for this ordering guarantee. `reload_scripts()` waits on that
+/// channel without its own timeout, so a slow script queued ahead of the
+/// reload can make this call outlast the client's request timeout even
+/// though the daemon eventually still reloads.
+async fn dispatch_reload_scripts(ctx: &DaemonContext) -> ControlResponse {
+    if ctx.state.script_sender.is_none() {
+        return ControlResponse::Error {
+            code: ControlErrorCode::Unsupported,
+            message: "scripts are not enabled".to_string(),
+        };
+    }
+    match ctx.state.reload_scripts().await {
+        Ok(()) => ControlResponse::Ok {
+            message: "Scripts reloaded".to_string(),
+        },
+        // A bad script (or a bad script directory) must not take the daemon
+        // down: it stays up, and the client gets a clear, non-zero-exit error
+        // instead. Scripts that loaded fine before this reload (or earlier in
+        // the same reload) keep running, so the message says "with errors"
+        // rather than implying nothing is active.
+        Err(e) => ControlResponse::Error {
+            code: ControlErrorCode::Internal,
+            message: format!("scripts reloaded with errors; {e} (scripts that loaded successfully remain active)"),
+        },
+    }
+}
+
+/// Mirrors the standalone `script enable`/`disable` handling in
+/// `handler.rs`: verify the script file exists, flip its entry in
+/// `scripts.script_files`, then save. Holds the config write lock across both
+/// steps so a concurrent config write (there is currently no other one in the
+/// daemon, but a future one would share this lock) can't interleave with the
+/// read-modify-save and lose this change.
+async fn dispatch_set_script_enabled(name: String, enabled: bool, ctx: &DaemonContext) -> ControlResponse {
+    let mut config = ctx.state.config.write().await;
+
+    let script_path = config.scripts.directory.join(&name);
+    if !script_path.exists() {
+        return not_found(&format!("script not found: {name}"));
+    }
+
+    config.scripts.script_files.insert(name.clone(), enabled);
+    if let Err(e) = config.save() {
+        return ControlResponse::Error {
+            code: ControlErrorCode::Internal,
+            message: format!("failed to save config: {e}"),
+        };
+    }
+
+    let verb = if enabled { "Enabled" } else { "Disabled" };
+    ControlResponse::Ok {
+        message: format!("{verb} script: {name}"),
     }
 }
 
@@ -677,13 +744,53 @@ mod tests {
         assert!(notified.is_ok(), "shutdown was not notified");
     }
 
+    // `AppState::new` (via `test_context`) never starts the script executor
+    // thread, so `script_sender` is `None` here.
     #[tokio::test]
-    async fn dispatch_unhandled_is_unsupported() {
+    async fn dispatch_reload_without_scripts_is_unsupported() {
         let ctx = test_context(DownloadManager::new());
         let resp = dispatch(ControlRequest::ReloadScripts, &ctx).await;
         match resp {
             ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::Unsupported),
             other => panic!("expected Error{{Unsupported}}, got {other:?}"),
+        }
+    }
+
+    // `Modify` is not handled by the daemon yet, so it still falls through
+    // `dispatch`'s catch-all arm.
+    #[tokio::test]
+    async fn dispatch_unhandled_is_unsupported() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::Modify {
+                id: Uuid::new_v4(),
+                edit: crate::ipc::control::protocol::HeaderEdit::default(),
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::Unsupported),
+            other => panic!("expected Error{{Unsupported}}, got {other:?}"),
+        }
+    }
+
+    // Verifies the `NotFound` branch without touching the filesystem: no
+    // `.save()` is reached because the missing-script check runs first.
+    #[tokio::test]
+    async fn dispatch_set_script_enabled_missing_script_is_not_found() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::SetScriptEnabled {
+                name: "does-not-exist.js".to_string(),
+                enabled: true,
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::NotFound),
+            other => panic!("expected Error{{NotFound}}, got {other:?}"),
         }
     }
 

@@ -92,11 +92,9 @@ pub fn classify(cmd: &Commands) -> RemoteClass {
         Commands::Script { action } => match action {
             ScriptAction::List { .. } => RemoteClass::ReadOnly,
             ScriptAction::Test { .. } => RemoteClass::ReadOnly,
-            // Not yet wired to apply through the daemon; see the comment
-            // above `Commands::Add`.
-            ScriptAction::Reload => RemoteClass::RefuseWhileRunning,
-            ScriptAction::Enable { .. } => RemoteClass::RefuseWhileRunning,
-            ScriptAction::Disable { .. } => RemoteClass::RefuseWhileRunning,
+            ScriptAction::Reload => RemoteClass::Routed,
+            ScriptAction::Enable { .. } => RemoteClass::Routed,
+            ScriptAction::Disable { .. } => RemoteClass::Routed,
         },
         Commands::Folder { action } => match action {
             FolderAction::List { .. } => RemoteClass::ReadOnly,
@@ -406,6 +404,39 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
         }
         Commands::PauseAll { folder } => {
             let req = ControlRequest::PauseAll { folder: folder.clone() };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+
+        Commands::Script { action: ScriptAction::Reload } => {
+            match client::send(pipe_name, &ControlRequest::ReloadScripts, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+        Commands::Script { action: ScriptAction::Enable { name } } => {
+            let req = ControlRequest::SetScriptEnabled { name: name.clone(), enabled: true };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+        Commands::Script { action: ScriptAction::Disable { name } } => {
+            let req = ControlRequest::SetScriptEnabled { name: name.clone(), enabled: false };
             match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
                 Ok(ControlResponse::Ok { message }) => {
                     println!("{message}");

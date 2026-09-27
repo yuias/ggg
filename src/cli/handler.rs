@@ -1060,7 +1060,7 @@ async fn handle_script_enable(state: &AppState, name: String) -> Result<i32> {
     config.save()?;
 
     println!("Enabled script: {}", name);
-    println!("Note: Restart application or use 'ggg script reload' to apply changes");
+    println!("Saved. Takes effect the next time ggg starts.");
 
     Ok(error::SUCCESS)
 }
@@ -1080,7 +1080,7 @@ async fn handle_script_disable(state: &AppState, name: String) -> Result<i32> {
     config.save()?;
 
     println!("Disabled script: {}", name);
-    println!("Note: Restart application or use 'ggg script reload' to apply changes");
+    println!("Saved. Takes effect the next time ggg starts.");
 
     Ok(error::SUCCESS)
 }
@@ -1156,12 +1156,13 @@ async fn handle_script_test(
 }
 
 /// Reload all scripts
+///
+/// Only reached when no daemon is running: `script reload` is routed through
+/// the daemon (see `cli::remote::classify`) whenever one is, so this is the
+/// "there is nothing to reload" case, not the "not implemented" case.
 async fn handle_script_reload(_state: &AppState) -> Result<i32> {
-    println!("Script reload is only available in daemon mode");
-    println!("To reload scripts:");
-    println!("  1. Stop the current ggg process");
-    println!("  2. Start ggg again");
-    println!("\nAlternatively, use 'ggg --headless' for daemon mode with reload support");
+    println!("No ggg daemon is running; there is nothing to reload.");
+    println!("Start one with 'ggg --headless' to enable live script reload.");
 
     Ok(error::SUCCESS)
 }

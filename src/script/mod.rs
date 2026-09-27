@@ -73,20 +73,36 @@ impl ScriptManager {
     /// Load all scripts from scripts directory
     /// Loads all .js files regardless of config (filtering happens at execution time)
     /// Clears existing handlers before loading
+    ///
+    /// A single bad script never stops the others from loading: every file is
+    /// attempted, and any failures are logged individually. But the return
+    /// value still reports failure (aggregating every message) so a caller —
+    /// notably a daemon `script reload` — can tell the client something
+    /// needs fixing, instead of silently loading fewer handlers than expected.
     pub fn load_all_scripts(&mut self) -> ScriptResult<()> {
         // Clear existing handlers before reloading
         self.engine.clear_handlers();
 
         let scripts = self.loader.list_scripts()?;
 
+        let mut failures: Vec<String> = Vec::new();
         for script_path in scripts {
             if let Err(e) = self.engine.load_script(&script_path) {
                 tracing::error!("Failed to load script {:?}: {}", script_path, e);
+                failures.push(e.to_string());
                 // Continue loading other scripts even if one fails
             }
         }
 
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::script::error::ScriptError::InternalError(format!(
+                "{} script(s) failed to load: {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
     }
 
     /// Run pending V8 foreground tasks (see `ScriptEngine::pump_v8_tasks`)
@@ -424,9 +440,10 @@ mod tests {
         };
 
         let mut manager = ScriptManager::new(&config).unwrap();
-        // Load should succeed even with bad script
+        // The bad script is reported as a failure, but doesn't stop the good
+        // scripts from loading.
         let result = manager.load_all_scripts();
-        assert!(result.is_ok());
+        assert!(result.is_err());
 
         // Good scripts should still work
         let mut ctx = BeforeRequestContext {

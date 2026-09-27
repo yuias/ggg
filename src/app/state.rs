@@ -138,7 +138,10 @@ impl AppState {
                 response_rx
                     .recv()
                     .map_err(|e| anyhow::anyhow!("Failed to receive reload response: {}", e))?
-                    .map_err(|e| anyhow::anyhow!("Script reload failed: {}", e))?;
+                    // No extra prefix here: `ScriptError`'s own `Display` is
+                    // already the full detail, and the caller (`dispatch_reload_scripts`)
+                    // adds its own framing around it.
+                    ?;
 
                 Ok::<(), anyhow::Error>(())
             })
