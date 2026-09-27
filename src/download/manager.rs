@@ -1536,6 +1536,26 @@ impl DownloadManager {
         }
     }
 
+    /// Inserts a handle into `active_downloads` for `id` without going
+    /// through `start_download`, so a test can make `is_running(id)` true for
+    /// an id that is in no folder queue -- simulating the window between a
+    /// completing download's `queue.remove` and its `history.add` (see
+    /// `manager.rs`'s completion path), which a caller outside this module
+    /// (`cli::daemon_ops`) otherwise has no way to construct.
+    #[cfg(test)]
+    pub(crate) async fn insert_active_handle_for_test(&self, id: Uuid, handle: JoinHandle<()>) {
+        self.active_downloads.write().await.insert(id, handle);
+    }
+
+    /// Aborts and drops a handle inserted by `insert_active_handle_for_test`,
+    /// so a test doesn't leak a pending task for the life of the process.
+    #[cfg(test)]
+    pub(crate) async fn abort_active_handle_for_test(&self, id: Uuid) {
+        if let Some(handle) = self.active_downloads.write().await.remove(&id) {
+            handle.abort();
+        }
+    }
+
     /// True while some `start_download` call for `id` has not returned yet.
     pub(crate) fn is_start_in_progress(&self, id: Uuid) -> bool {
         self.start_claims

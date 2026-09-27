@@ -254,6 +254,21 @@ pub enum Commands {
         folder: Option<String>,
     },
 
+    /// Wait for a download to reach a final status; the exit code reports it
+    /// (0 completed, 2 removed, 6 failed, 7 paused, 8 timed out)
+    Wait {
+        /// Download ID (UUID)
+        id: String,
+
+        /// Give up waiting after this many seconds and exit with the timeout code
+        #[arg(long)]
+        timeout: Option<u64>,
+
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Clear downloads by status
     Clear {
         /// Comma-separated status list (completed,error,paused)

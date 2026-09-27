@@ -57,10 +57,13 @@ pub async fn handle_command(
             BridgeAction::Uninstall => bridge::handle_uninstall().await,
             BridgeAction::Status => bridge::handle_status().await,
         },
-        // `route` handles every `Daemon` action when a daemon is reachable;
-        // this arm is only reached by the probe-then-write race `route`'s
-        // doc comment accepts, or when no daemon is running at all.
+        // `route` handles every `Daemon`/`Wait` request when a daemon is
+        // reachable; these arms are only reached by the probe-then-write
+        // race `route`'s doc comment accepts, or when no daemon is running
+        // at all -- `wait` has no standalone meaning since nothing else
+        // would be running the download to wait on.
         Commands::Daemon { .. } => handle_daemon_standalone(),
+        Commands::Wait { .. } => handle_daemon_standalone(),
     };
 
     match result {

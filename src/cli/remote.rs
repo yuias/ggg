@@ -21,7 +21,7 @@ use super::output;
 // the `add` payload types are available to render standalone output too.
 use crate::ipc::control::protocol::{AddedTask, SkippedUrl};
 #[cfg(windows)]
-use crate::ipc::control::protocol::{ControlErrorCode, ControlRequest, ControlResponse};
+use crate::ipc::control::protocol::{ControlErrorCode, ControlRequest, ControlResponse, WaitOutcome};
 use crate::download::task::{DownloadStatus, DownloadTask};
 #[cfg(windows)]
 use std::time::Duration;
@@ -30,6 +30,11 @@ use std::time::Duration;
 /// `daemon stop`'s own `Shutdown` request are all cheap round trips.
 #[cfg(windows)]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Added on top of `wait`'s own `--timeout` for the client-side `send` bound,
+/// so the server-side timeout (which answers `Timeout` on its own) always
+/// has a chance to reply before the client gives up on the round trip.
+#[cfg(windows)]
+const WAIT_EXTRA_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `daemon stop` polls `probe` for the daemon to actually exit.
 #[cfg(windows)]
 const STOP_POLL_BUDGET: Duration = Duration::from_secs(10);
@@ -61,16 +66,8 @@ pub fn classify(cmd: &Commands) -> RemoteClass {
         Commands::Add { .. } => RemoteClass::Routed,
 
         Commands::List { .. } => RemoteClass::Routed,
-        // `--wait` isn't sent to the daemon as a `Wait` request yet, so a
-        // live daemon must refuse it rather than let a standalone `--wait`
-        // poll a queue the daemon also writes to.
-        Commands::Start { wait, .. } => {
-            if *wait {
-                RemoteClass::RefuseWhileRunning
-            } else {
-                RemoteClass::Routed
-            }
-        }
+        // `--wait` is sent as `Start` followed by a `Wait` request.
+        Commands::Start { .. } => RemoteClass::Routed,
         Commands::Pause { .. } => RemoteClass::Routed,
         Commands::Remove { .. } => RemoteClass::Routed,
         Commands::Status { .. } => RemoteClass::Routed,
@@ -136,6 +133,7 @@ pub fn classify(cmd: &Commands) -> RemoteClass {
                 RemoteClass::RequiresDaemon
             }
         },
+        Commands::Wait { .. } => RemoteClass::RequiresDaemon,
     }
 }
 
@@ -330,7 +328,7 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
                 Err(e) => render_send_error(&e),
             }
         }
-        Commands::Start { id, wait: false } => {
+        Commands::Start { id, wait } => {
             let uid = match super::handler::parse_task_id(id) {
                 Ok(u) => u,
                 Err(e) => {
@@ -339,21 +337,27 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
                 }
             };
             match client::send(pipe_name, &ControlRequest::Start { id: uid }, Some(REQUEST_TIMEOUT)).await {
-                Ok(ControlResponse::Ok { message }) => {
-                    println!("{message}");
-                    RouteDecision::Handled(error::SUCCESS)
-                }
-                Ok(other) => render_unexpected(other),
-                Err(e) => render_send_error(&e),
+                Ok(ControlResponse::Ok { message }) => println!("{message}"),
+                Ok(other) => return render_unexpected(other),
+                Err(e) => return render_send_error(&e),
+            }
+            if *wait {
+                // `start --wait` has no `--timeout` flag of its own; it waits
+                // without a client-side deadline, same as the standalone path.
+                send_wait(pipe_name, uid, None, false).await
+            } else {
+                RouteDecision::Handled(error::SUCCESS)
             }
         }
-        // `classify()` keeps `start --wait` out of `Routed` until it is sent
-        // to the daemon as a `Wait` request, so this arm is never reached;
-        // `route` refuses it before `send_and_render` is called.
-        Commands::Start { wait: true, .. } => {
-            debug_assert!(false, "start --wait must be RefuseWhileRunning until Wait is implemented");
-            eprintln!("this command is not yet routed to the daemon");
-            RouteDecision::Handled(error::ERROR)
+        Commands::Wait { id, timeout, json } => {
+            let uid = match super::handler::parse_task_id(id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            send_wait(pipe_name, uid, *timeout, *json).await
         }
         Commands::Pause { id } => {
             let uid = match super::handler::parse_task_id(id) {
@@ -422,6 +426,70 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
             eprintln!("this command is not yet routed to the daemon");
             RouteDecision::Handled(error::ERROR)
         }
+    }
+}
+
+/// Sends a `Wait` request and renders its outcome. `timeout_secs` is the
+/// server-side deadline (`ControlRequest::Wait`'s own field); the client's
+/// `send` bound is `timeout_secs + WAIT_EXTRA_TIMEOUT` when set, or
+/// unbounded when not, so the server's own `Timeout` answer always has room
+/// to arrive before the client gives up on the connection itself.
+#[cfg(windows)]
+async fn send_wait(pipe_name: &str, id: uuid::Uuid, timeout_secs: Option<u64>, json: bool) -> RouteDecision {
+    use crate::ipc::control::client;
+
+    let req = ControlRequest::Wait { id, timeout_secs };
+    // `saturating_add`: an enormous `--timeout` (up to `u64::MAX` seconds)
+    // must clamp to `Duration::MAX` instead of panicking on overflow.
+    let send_timeout = timeout_secs.map(|secs| Duration::from_secs(secs).saturating_add(WAIT_EXTRA_TIMEOUT));
+    match client::send(pipe_name, &req, send_timeout).await {
+        Ok(ControlResponse::Waited { outcome, task }) => {
+            render_waited(outcome, task, json);
+            RouteDecision::Handled(exit_code_for_wait(outcome))
+        }
+        Ok(other) => render_unexpected(other),
+        Err(e) => render_send_error(&e),
+    }
+}
+
+/// Renders a `Wait` outcome. The JSON form redacts header values the same
+/// way `render_task` does; a waited-on task can carry a `Cookie` or
+/// `Authorization` header just like any other.
+#[cfg(windows)]
+fn render_waited(outcome: WaitOutcome, task: Option<DownloadTask>, json: bool) {
+    if json {
+        #[derive(serde::Serialize)]
+        struct WaitedPayload {
+            outcome: WaitOutcome,
+            task: Option<DownloadTask>,
+        }
+        let payload = WaitedPayload {
+            outcome,
+            task: task.map(redact_task_headers),
+        };
+        match serde_json::to_string_pretty(&payload) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("failed to format wait result: {e}"),
+        }
+        return;
+    }
+    match outcome {
+        WaitOutcome::Completed => println!("Download completed"),
+        WaitOutcome::Failed => println!("Download failed"),
+        WaitOutcome::Paused => println!("Download paused"),
+        WaitOutcome::Removed => println!("Download removed"),
+        WaitOutcome::Timeout => println!("Timed out waiting for download"),
+    }
+}
+
+#[cfg(windows)]
+fn exit_code_for_wait(outcome: WaitOutcome) -> i32 {
+    match outcome {
+        WaitOutcome::Completed => error::SUCCESS,
+        WaitOutcome::Failed => error::TASK_FAILED,
+        WaitOutcome::Paused => error::TASK_PAUSED,
+        WaitOutcome::Removed => error::NOT_FOUND,
+        WaitOutcome::Timeout => error::TIMEOUT,
     }
 }
 
@@ -698,7 +766,11 @@ mod tests {
         );
         assert_eq!(
             classify(&Commands::Start { id: "x".to_string(), wait: true }),
-            RemoteClass::RefuseWhileRunning
+            RemoteClass::Routed
+        );
+        assert_eq!(
+            classify(&Commands::Wait { id: "x".to_string(), timeout: None, json: false }),
+            RemoteClass::RequiresDaemon
         );
     }
 

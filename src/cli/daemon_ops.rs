@@ -17,13 +17,18 @@ use crate::app::state::AppState;
 use crate::download::enqueue::{
     build_task, enqueue, resolve_folder_id, resolve_target_folder, EnqueueOptions, EnqueueOutcome,
 };
-use crate::download::manager::DownloadManager;
+use crate::download::manager::{DownloadEvent, DownloadManager};
 use crate::download::task::{DownloadStatus, DownloadTask};
 use crate::ipc::control::protocol::{
     AddedTask, ControlErrorCode, ControlRequest, ControlResponse, DaemonStatus, SkippedUrl,
-    CONTROL_PROTOCOL_VERSION,
+    WaitOutcome, CONTROL_PROTOCOL_VERSION,
 };
+use tokio::sync::broadcast;
 use uuid::Uuid;
+
+/// How often `dispatch_wait`'s poll loop re-checks state, covering a `Lagged`
+/// broadcast receiver and any event that arrived before the subscription.
+const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long `Pause`/`Remove` wait for a concurrent `start_download` call
 /// (the beforeRequest script round trip) to finish before giving up. The
@@ -134,6 +139,7 @@ pub async fn dispatch(req: ControlRequest, ctx: &DaemonContext) -> ControlRespon
         ControlRequest::Remove { id } => dispatch_remove(id, ctx).await,
         ControlRequest::StartAll { folder } => dispatch_start_all(folder, ctx).await,
         ControlRequest::PauseAll { folder } => dispatch_pause_all(folder, ctx).await,
+        ControlRequest::Wait { id, timeout_secs } => dispatch_wait(id, timeout_secs, ctx).await,
         _ => ControlResponse::Error {
             code: ControlErrorCode::Unsupported,
             message: "not supported by this daemon yet".to_string(),
@@ -370,6 +376,142 @@ async fn dispatch_pause_all(folder: Option<String>, ctx: &DaemonContext) -> Cont
     };
     ControlResponse::Ok {
         message: format!("Paused {paused} download(s)"),
+    }
+}
+
+/// Checks whether `id` has already reached a final state: a history entry
+/// always means `Completed`, even if the id also somehow lingers in a queue;
+/// missing from both means `Removed`; otherwise the live task's status
+/// decides. `None` means "keep waiting" -- a `Pending`/`Downloading` task, or
+/// a `Paused` task with a handle still alive (retry backoff, not a real
+/// pause).
+async fn check_wait_state(id: Uuid, manager: &DownloadManager) -> Option<ControlResponse> {
+    if let Some(task) = manager.get_history_item(id).await {
+        return Some(ControlResponse::Waited {
+            outcome: WaitOutcome::Completed,
+            task: Some(task),
+        });
+    }
+    let Some(task) = manager.get_by_id(id).await else {
+        // A completing download is removed from its folder queue, then
+        // awaits `queue.save()` (disk IO), and only then is added to history
+        // (`manager.rs`), so a queue miss right after a history miss can
+        // still be that gap, not an actual removal. Checking history again
+        // here narrows the window; `is_running` closes it: the handle stays
+        // in `active_downloads` until that same completion path removes it,
+        // so a live handle means the task is still finishing, never really
+        // removed. A real `remove_download` drops the handle before removing
+        // the task from the queue, so this check is never fooled by an
+        // actual removal.
+        if let Some(task) = manager.get_history_item(id).await {
+            return Some(ControlResponse::Waited {
+                outcome: WaitOutcome::Completed,
+                task: Some(task),
+            });
+        }
+        if manager.is_running(id).await {
+            return None;
+        }
+        return Some(ControlResponse::Waited {
+            outcome: WaitOutcome::Removed,
+            task: None,
+        });
+    };
+    match task.status {
+        DownloadStatus::Error => Some(ControlResponse::Waited {
+            outcome: WaitOutcome::Failed,
+            task: Some(task),
+        }),
+        // A start claimed after the task was paused (a sweep, or another
+        // client) is about to make it Downloading again; report it only
+        // once nothing -- a live handle or an in-flight start -- can still
+        // flip it back.
+        DownloadStatus::Paused
+            if !manager.is_running(id).await && !manager.is_start_in_progress(id) =>
+        {
+            Some(ControlResponse::Waited {
+                outcome: WaitOutcome::Paused,
+                task: Some(task),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Answers `Wait`. Subscribes before the first state check so a result that
+/// lands in the gap between subscribing and checking is never missed (it
+/// still shows up as a broadcast event that re-triggers the check). The
+/// per-connection task this runs on is what makes a long wait safe: the
+/// server spawns one task per pipe connection (`server.rs`'s accept loop), so
+/// this holds only its own connection open and never blocks another client.
+/// `timeout_secs = None` waits until the task reaches a final state or the
+/// connection itself is torn down (for example by a daemon shutdown aborting
+/// this task, which just closes the pipe -- the client sees that as a send
+/// error, not a hang).
+async fn dispatch_wait(id: Uuid, timeout_secs: Option<u64>, ctx: &DaemonContext) -> ControlResponse {
+    let mut rx = ctx.manager.subscribe();
+    if let Some(resp) = check_wait_state(id, &ctx.manager).await {
+        return resp;
+    }
+
+    let wait_loop = wait_for_final_state(id, &ctx.manager, &mut rx);
+    match timeout_secs {
+        Some(secs) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(secs), wait_loop).await {
+                Ok(resp) => resp,
+                Err(_) => ControlResponse::Waited {
+                    outcome: WaitOutcome::Timeout,
+                    task: None,
+                },
+            }
+        }
+        None => wait_loop.await,
+    }
+}
+
+/// The unbounded part of `dispatch_wait`: re-checks state on every event that
+/// mentions `id`, on `Lagged` (a missed event might have been the one that
+/// mattered), and also on a fixed 1 s interval, which catches any event this
+/// receiver never saw at all. The caller applies the optional deadline
+/// around this future.
+async fn wait_for_final_state(
+    id: Uuid,
+    manager: &DownloadManager,
+    rx: &mut broadcast::Receiver<DownloadEvent>,
+) -> ControlResponse {
+    let mut interval = tokio::time::interval(WAIT_POLL_INTERVAL);
+    interval.tick().await; // first tick fires immediately; skip it
+    // Once the channel closes, `rx.recv()` resolves immediately forever;
+    // the `if !rx_closed` guard turns that branch off so the loop falls back
+    // to the 1 s interval instead of spinning.
+    let mut rx_closed = false;
+    loop {
+        tokio::select! {
+            event = rx.recv(), if !rx_closed => {
+                let relevant = match &event {
+                    Ok(DownloadEvent::Completed { task_id })
+                    | Ok(DownloadEvent::Failed { task_id, .. })
+                    | Ok(DownloadEvent::Paused { task_id })
+                    | Ok(DownloadEvent::Removed { task_id }) => *task_id == id,
+                    Ok(_) => false,
+                    Err(broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        rx_closed = true;
+                        true
+                    }
+                };
+                if relevant {
+                    if let Some(resp) = check_wait_state(id, manager).await {
+                        return resp;
+                    }
+                }
+            }
+            _ = interval.tick() => {
+                if let Some(resp) = check_wait_state(id, manager).await {
+                    return resp;
+                }
+            }
+        }
     }
 }
 
@@ -840,5 +982,143 @@ mod tests {
             Err(ControlResponse::Error { code, .. }) => assert_eq!(code, ControlErrorCode::InvalidInput),
             other => panic!("expected a retryable Error{{InvalidInput}}, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn wait_history_item_returns_completed_immediately() {
+        let manager = DownloadManager::new();
+        let task = DownloadTask::new(
+            "https://example.com/done".to_string(),
+            std::path::PathBuf::from("done"),
+        );
+        let id = task.id;
+        manager.add_to_history(task).await;
+        let ctx = test_context(manager);
+
+        let resp = dispatch(ControlRequest::Wait { id, timeout_secs: Some(3) }, &ctx).await;
+        match resp {
+            ControlResponse::Waited { outcome, task } => {
+                assert_eq!(outcome, WaitOutcome::Completed);
+                assert_eq!(task.map(|t| t.id), Some(id));
+            }
+            other => panic!("expected Waited{{Completed}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_removed_task_returns_removed() {
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Pending);
+        let id = task.id;
+        manager.add_download(task).await;
+        let ctx = test_context(manager);
+
+        let waiter = tokio::spawn({
+            let manager = ctx.manager.clone();
+            async move { dispatch(ControlRequest::Wait { id, timeout_secs: Some(5) }, &test_context(manager)).await }
+        });
+
+        // Give the wait loop time to subscribe before the remove fires.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        ctx.manager.remove_download(id).await;
+
+        // A tight bound (well under the 1 s poll interval) proves the event
+        // branch, not the fallback poll, is what resolved this wait.
+        let resp = tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+            .await
+            .expect("wait must return promptly after the remove event")
+            .expect("wait task must not panic");
+        match resp {
+            ControlResponse::Waited { outcome, task } => {
+                assert_eq!(outcome, WaitOutcome::Removed);
+                assert!(task.is_none());
+            }
+            other => panic!("expected Waited{{Removed}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_manual_pause_returns_paused() {
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Pending);
+        let id = task.id;
+        manager.add_download(task).await;
+        let ctx = test_context(manager);
+
+        let waiter = tokio::spawn({
+            let manager = ctx.manager.clone();
+            async move { dispatch(ControlRequest::Wait { id, timeout_secs: Some(5) }, &test_context(manager)).await }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = ctx.manager.pause_download(id).await;
+
+        // A tight bound (well under the 1 s poll interval) proves the event
+        // branch, not the fallback poll, is what resolved this wait.
+        let resp = tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+            .await
+            .expect("wait must return promptly after the pause event")
+            .expect("wait task must not panic");
+        match resp {
+            ControlResponse::Waited { outcome, task } => {
+                assert_eq!(outcome, WaitOutcome::Paused);
+                assert_eq!(task.map(|t| t.status), Some(DownloadStatus::Paused));
+            }
+            other => panic!("expected Waited{{Paused}}, got {other:?}"),
+        }
+    }
+
+    /// A `Pending` task that nobody starts must not be mistaken for a final
+    /// state; `Wait` keeps polling until `timeout_secs` elapses.
+    #[tokio::test]
+    async fn wait_timeout() {
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Pending);
+        let id = task.id;
+        manager.add_download(task).await;
+        let ctx = test_context(manager);
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            dispatch(ControlRequest::Wait { id, timeout_secs: Some(1) }, &ctx),
+        )
+        .await
+        .expect("dispatch must return once the server-side timeout elapses");
+        match resp {
+            ControlResponse::Waited { outcome, task } => {
+                assert_eq!(outcome, WaitOutcome::Timeout);
+                assert!(task.is_none());
+            }
+            other => panic!("expected Waited{{Timeout}}, got {other:?}"),
+        }
+    }
+
+    /// A handle can outlive its task's presence in every folder queue (the
+    /// completion path removes the task from its queue, then awaits
+    /// `queue.save()`, and only then adds it to history and drops the
+    /// handle). `id` here is never added to any queue or history at all, so
+    /// this simulates that in-between state directly: `Wait` must not read
+    /// "missing everywhere" as `Removed` while a handle is still live.
+    #[tokio::test]
+    async fn wait_running_handle_with_no_queue_entry_is_not_removed() {
+        let manager = DownloadManager::new();
+        let id = Uuid::new_v4();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            dispatch(ControlRequest::Wait { id, timeout_secs: Some(1) }, &test_context(manager.clone())),
+        )
+        .await
+        .expect("dispatch must return once the server-side timeout elapses");
+        match resp {
+            ControlResponse::Waited { outcome, .. } => {
+                assert_eq!(outcome, WaitOutcome::Timeout, "a live handle must not be reported as Removed");
+            }
+            other => panic!("expected Waited{{Timeout}}, got {other:?}"),
+        }
+
+        manager.abort_active_handle_for_test(id).await;
     }
 }
