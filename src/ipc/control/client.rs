@@ -1,13 +1,17 @@
 //! Client side of the daemon control pipe: `probe`, used by `bind` itself
 //! to tell a live daemon apart from a stale pipe name, and later by CLI
 //! routing to decide remote vs. standalone. `send` (request/response for
-//! real commands) is added together with CLI routing.
+//! real commands) is added together with CLI routing, and must run the same
+//! `owner::verify_server_owner` check as `probe` does here: right after
+//! opening the pipe and before its first write, returning
+//! `Err(anyhow!(owner::OWNER_MISMATCH_MSG))` on mismatch so `route` exits 5.
 
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 
+use super::owner::{self, OWNER_MISMATCH_MSG};
 use super::protocol::{ControlRequest, ControlResponse, CONTROL_PROTOCOL_VERSION};
 
 /// `ERROR_PIPE_BUSY`: every instance is currently connected to another client.
@@ -45,6 +49,11 @@ pub async fn probe(pipe_name: &str) -> DaemonProbe {
             Err(e) => return DaemonProbe::Unreachable(format!("failed to open pipe: {e}")),
         }
     };
+
+    if let Err(detail) = owner::verify_server_owner(&client) {
+        tracing::warn!("control pipe {pipe_name} failed server owner check: {detail}");
+        return DaemonProbe::Unreachable(OWNER_MISMATCH_MSG.to_string());
+    }
 
     match tokio::time::timeout(PING_TIMEOUT, ping(client)).await {
         Ok(Ok(ControlResponse::Pong { protocol, pid, .. })) => {

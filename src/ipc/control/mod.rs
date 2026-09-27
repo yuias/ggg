@@ -9,3 +9,5 @@ pub mod protocol;
 pub mod server;
 #[cfg(windows)]
 pub mod client;
+#[cfg(windows)]
+pub mod owner;

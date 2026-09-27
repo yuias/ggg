@@ -14,6 +14,7 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use ggg::ipc::control::client::{self, DaemonProbe};
+use ggg::ipc::control::owner;
 use ggg::ipc::control::protocol::{
     ControlErrorCode, ControlRequest, ControlResponse, CONTROL_PROTOCOL_VERSION,
 };
@@ -212,4 +213,31 @@ async fn bind_reports_already_running_for_non_responding_holder() {
         BindError::AlreadyRunning { pid: None } => {}
         other => panic!("expected AlreadyRunning{{pid: None}}, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn server_owner_check_passes_for_same_user() {
+    let pipe_name = unique_pipe_name();
+    let bound = server::bind(&pipe_name).await.expect("bind");
+    let handler = TestHandler::new();
+    let _serve = server::serve(bound, handler.clone());
+
+    let client = tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            match ClientOptions::new().open(&pipe_name) {
+                Ok(c) => break c,
+                Err(e) if e.raw_os_error() == Some(231) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("failed to open {pipe_name}: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("open timed out");
+
+    // Both ends of this pipe are this same test process, so the owner check
+    // must pass: the server process and the current process are the same
+    // token user.
+    owner::verify_server_owner(&client).expect("server owner check should pass for same user");
 }
