@@ -1,5 +1,6 @@
 pub mod circuit_breaker;
 pub mod completion_log;
+pub mod enqueue;
 pub mod folder_queue;
 pub mod history;
 pub mod http_client;

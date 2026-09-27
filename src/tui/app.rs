@@ -2,6 +2,7 @@ use super::events::TuiEvent;
 use super::state::{DetailsPosition, FocusPane, TuiState, UiMode};
 use crate::app::keybindings::KeyAction;
 use crate::app::state::AppState;
+use crate::download::enqueue::{enqueue, EnqueueOutcome};
 use crate::download::manager::DownloadManager;
 use crate::download::task::DownloadStatus;
 use anyhow::Result;
@@ -2680,46 +2681,17 @@ impl TuiApp {
     /// Add download task and auto-start if folder setting enabled
     async fn add_download_with_auto_start(&mut self, task: crate::download::task::DownloadTask) -> Result<()> {
         let folder_id = task.folder_id.clone();
-        let task_id = task.id;
 
-        // Check folder settings for duplicate prevention and auto-start
-        let (prevent_duplicate, should_auto_start) = {
-            let config = self.state.app_state.config.read().await;
-            let folder = config.folders.get(&folder_id);
-            (
-                folder.map(|f| f.prevent_duplicate_url).unwrap_or(false),
-                folder.map(|f| f.auto_start_downloads).unwrap_or(false),
-            )
-        };
-
-        // Add download to queue (with optional duplicate check)
-        if prevent_duplicate {
-            if !self.manager.add_download_if_unique(task).await {
-                tracing::info!(
-                    "Skipped duplicate URL in folder '{}'",
-                    folder_id
-                );
-                return Ok(());
-            }
-        } else {
-            self.manager.add_download(task).await;
-        }
-
-        // Auto-start if enabled
-        if should_auto_start {
-            match self
-                .manager
-                .start_download(
-                    task_id,
-                    self.state.app_state.script_sender.clone(),
-                    self.state.app_state.config.clone(),
-                )
-                .await
-            {
-                Ok(()) => tracing::debug!("Auto-started download in folder '{}'", folder_id),
-                // The task stays queued as Pending; refusing to start it must
-                // not abort the whole add.
-                Err(e) => tracing::warn!("Auto-start failed in folder '{}': {}", folder_id, e),
+        match enqueue(&self.manager, &self.state.app_state, task, false, true).await {
+            EnqueueOutcome::Duplicate => return Ok(()),
+            EnqueueOutcome::Added { started, start_error, .. } => {
+                if started {
+                    tracing::debug!("Auto-started download in folder '{}'", folder_id);
+                } else if let Some(e) = start_error {
+                    // The task stays queued as Pending; refusing to start it must
+                    // not abort the whole add.
+                    tracing::warn!("Auto-start failed in folder '{}': {}", folder_id, e);
+                }
             }
         }
 

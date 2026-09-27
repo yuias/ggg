@@ -7,6 +7,7 @@ use crate::app::state::AppState;
 use crate::download::manager::DownloadManager;
 use crate::download::task::{DownloadTask, DownloadStatus};
 use crate::download::completion_log::CompletedEntry;
+use crate::download::enqueue::resolve_folder_id;
 use crate::script::events::{BeforeRequestContext, HookEvent};
 use anyhow::Result;
 use std::path::PathBuf;
@@ -1168,16 +1169,6 @@ async fn handle_folder_create(
     println!("  Auto-Start: {}", auto_start);
 
     Ok(error::SUCCESS)
-}
-
-/// Resolve folder identifier: accepts either UUID key or display name
-fn resolve_folder_id(config: &Config, id: &str) -> Option<String> {
-    // Try direct key match first (UUID)
-    if config.folders.contains_key(id) {
-        return Some(id.to_string());
-    }
-    // Fallback: search by display name
-    config.find_folder_id_by_name(id)
 }
 
 /// Show folder settings

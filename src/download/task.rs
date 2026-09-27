@@ -240,6 +240,30 @@ impl DownloadTask {
         let seconds = self.eta_seconds()?;
         Some(format_duration(seconds))
     }
+
+    /// Replace any existing key equal ignoring ASCII case, then insert `name`
+    /// as given (so a later lookup sees the caller's exact casing).
+    pub fn set_header(&mut self, name: &str, value: &str) {
+        self.remove_header(name);
+        self.headers.insert(name.to_string(), value.to_string());
+    }
+
+    /// Remove a header matching `name` case-insensitively. Returns whether a
+    /// header was removed.
+    pub fn remove_header(&mut self, name: &str) -> bool {
+        let existing_key = self
+            .headers
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(name))
+            .cloned();
+        match existing_key {
+            Some(key) => {
+                self.headers.remove(&key);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// Format duration in seconds to human-readable string
@@ -280,5 +304,31 @@ mod filename_tests {
         // URL ending in '/' yields an empty segment -> fallback.
         assert_eq!(filename_from_url("https://host/path/"), "download");
         assert_eq!(filename_from_url("https://host/"), "download");
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::{DownloadTask, PathBuf};
+
+    #[test]
+    fn set_header_replaces_case_insensitive() {
+        let mut task = DownloadTask::new("https://host/f".to_string(), PathBuf::from("."));
+        task.headers.insert("referer".to_string(), "https://old/".to_string());
+        task.set_header("Referer", "https://new/");
+
+        assert_eq!(task.headers.get("Referer").map(String::as_str), Some("https://new/"));
+        assert!(!task.headers.contains_key("referer"));
+        assert_eq!(task.headers.len(), 1);
+    }
+
+    #[test]
+    fn remove_header_case_insensitive() {
+        let mut task = DownloadTask::new("https://host/f".to_string(), PathBuf::from("."));
+        task.headers.insert("X-Test".to_string(), "1".to_string());
+
+        assert!(task.remove_header("x-test"));
+        assert!(task.headers.is_empty());
+        assert!(!task.remove_header("x-test"));
     }
 }
