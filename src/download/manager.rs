@@ -395,29 +395,29 @@ impl DownloadManager {
 
     /// Starts a download for `id`. Concurrent calls for the same id collapse
     /// into a single start: only the first caller to claim `id` proceeds, and
-    /// the rest return `Ok(())` immediately without touching the task. A call
-    /// for a task whose download handle is still running (for example during
-    /// retry backoff, where the status is `Paused` but a handle is still
-    /// alive) is also an `Ok(())` no-op.
+    /// the rest return `Ok(Busy)` immediately without touching the task. A
+    /// call for a task whose download handle is still running (for example
+    /// during retry backoff, where the status is `Paused` but a handle is
+    /// still alive) is `Ok(AlreadyRunning)`.
     pub async fn start_download(
         &self,
         id: Uuid,
         script_sender: Option<mpsc::Sender<ScriptRequest>>,
         config: Arc<tokio::sync::RwLock<crate::app::config::Config>>,
-    ) -> Result<()> {
+    ) -> Result<StartOutcome> {
         let Some(_claim) = StartClaim::try_acquire(&self.start_claims, id) else {
-            return Ok(());
+            return Ok(StartOutcome::Busy);
         };
 
         if self.is_running(id).await {
-            return Ok(());
+            return Ok(StartOutcome::AlreadyRunning);
         }
 
         let mut task = self.get_by_id(id).await
             .ok_or_else(|| anyhow::anyhow!("Task not found"))?;
 
         if task.status == DownloadStatus::Downloading {
-            return Ok(()); // Already downloading
+            return Ok(StartOutcome::AlreadyRunning);
         }
 
         // Check circuit breaker for the domain
@@ -669,7 +669,7 @@ impl DownloadManager {
 
         self.emit(DownloadEvent::Started { task_id: id });
 
-        Ok(())
+        Ok(StartOutcome::Started)
     }
 
     /// Encode Basic authentication credentials
@@ -1214,10 +1214,11 @@ impl DownloadManager {
     /// `change_folder`) can land between this call's own check and apply.
     ///
     /// A `start_download` call for `id` that arrives while this call holds
-    /// the claim returns `Ok(())` without starting -- the same collapse two
-    /// concurrent `start_download` calls already get. The window is only a
-    /// few in-memory lock operations, not the beforeRequest script round
-    /// trip `start_download` itself awaits while holding its own claim.
+    /// the claim returns `Ok(StartOutcome::Busy)` without starting -- the
+    /// same collapse two concurrent `start_download` calls already get. The
+    /// window is only a few in-memory lock operations, not the beforeRequest
+    /// script round trip `start_download` itself awaits while holding its
+    /// own claim.
     pub async fn edit_task_headers(
         &self,
         id: Uuid,
@@ -1438,7 +1439,7 @@ impl DownloadManager {
         
         let mut resumed = 0;
         for id in resumable {
-            if self.start_download(id, script_sender.clone(), config.clone()).await.is_ok() {
+            if matches!(self.start_download(id, script_sender.clone(), config.clone()).await, Ok(StartOutcome::Started)) {
                 resumed += 1;
             }
         }
@@ -1928,7 +1929,7 @@ impl DownloadManager {
         let mut started = 0;
 
         for task in pending_tasks {
-            if self.start_download(task.id, script_sender.clone(), config.clone()).await.is_ok() {
+            if matches!(self.start_download(task.id, script_sender.clone(), config.clone()).await, Ok(StartOutcome::Started)) {
                 started += 1;
             }
         }
@@ -1977,7 +1978,7 @@ impl DownloadManager {
 
         let mut started = 0;
         for id in pending {
-            if self.start_download(id, script_sender.clone(), config.clone()).await.is_ok() {
+            if matches!(self.start_download(id, script_sender.clone(), config.clone()).await, Ok(StartOutcome::Started)) {
                 started += 1;
             }
         }
@@ -2574,10 +2575,13 @@ mod tests {
         manager.add_download(task).await;
 
         let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
-        manager
-            .start_download(id, None, config)
-            .await
-            .expect("start must succeed");
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
 
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
         loop {
@@ -2605,10 +2609,13 @@ mod tests {
         manager.add_download(task).await;
 
         let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
-        manager
-            .start_download(id, None, config)
-            .await
-            .expect("start must succeed");
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
 
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
         loop {
@@ -2714,8 +2721,13 @@ mod tests {
         let handle_b = tokio::spawn(async move { manager_b.start_download(id, Some(tx_b), config_b).await });
 
         let (r1, r2) = tokio::join!(handle_a, handle_b);
-        assert!(r1.unwrap().is_ok());
-        assert!(r2.unwrap().is_ok());
+        let outcome_a = r1.unwrap().expect("start must not error");
+        let outcome_b = r2.unwrap().expect("start must not error");
+        let started_outcomes = [outcome_a, outcome_b].into_iter().filter(|o| o.is_started()).count();
+        assert_eq!(
+            started_outcomes, 1,
+            "exactly one of the two concurrent starts must be Started, got {outcome_a:?} and {outcome_b:?}"
+        );
 
         // Both `start_download` calls have returned, so every `BeforeRequest`
         // they could send has already been counted and answered; the count is
@@ -2757,7 +2769,10 @@ mod tests {
         manager.add_download(task).await;
 
         let result = manager.start_download(id, None, config).await;
-        assert!(result.is_ok(), "a released claim must allow a later start to proceed");
+        assert_eq!(
+            result.unwrap(), StartOutcome::Started,
+            "a released claim must allow a later start to proceed"
+        );
 
         let task = manager.get_by_id(id).await.expect("task exists");
         assert_eq!(task.status, DownloadStatus::Downloading);
@@ -2785,7 +2800,7 @@ mod tests {
         let mut events = manager.subscribe();
         let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
         let result = manager.start_download(id, None, config).await;
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), StartOutcome::AlreadyRunning);
         assert!(events.try_recv().is_err(), "no Started event must be emitted");
 
         let task = manager.get_by_id(id).await.expect("task exists");
@@ -2884,9 +2899,9 @@ mod tests {
 
         let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
         let start_result = manager.start_download(id, None, config).await;
-        assert!(
-            start_result.is_ok(),
-            "a concurrent start must collapse into a no-op, not error: {start_result:?}"
+        assert_eq!(
+            start_result.unwrap(), StartOutcome::Busy,
+            "a concurrent start must collapse into a no-op, not error"
         );
 
         release_tx.send(()).expect("edit closure must still be waiting");
@@ -2899,5 +2914,27 @@ mod tests {
             Some("https://a.example/"),
             "the edit must not be overwritten by the collapsed start"
         );
+    }
+
+    /// A task in retry backoff (`Paused` with a live handle) must not be
+    /// double-counted by `resume_all`: `start_download` reports it as
+    /// `AlreadyRunning`, not `Started`.
+    #[tokio::test]
+    async fn resume_all_does_not_count_running_task() {
+        let manager = DownloadManager::new();
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        task.status = DownloadStatus::Paused;
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        let resumed = manager.resume_all(None, config).await;
+        assert_eq!(resumed, 0, "a task with a live handle must not be counted as resumed");
+
+        manager.abort_active_handle_for_test(id).await;
     }
 }

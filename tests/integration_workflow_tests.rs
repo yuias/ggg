@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use ggg::download::manager::StartOutcome;
 use ggg::download::task::DownloadStatus;
 use tokio::time::{sleep, timeout, Duration};
 
@@ -40,7 +41,10 @@ async fn test_full_download_workflow() {
     assert_eq!(added_task.url, url);
 
     // Step 2: Start download
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     // Verify download started (may have already completed)
     if let Some(started_task) = manager.get_by_id(task_id).await {
@@ -126,7 +130,10 @@ async fn test_pause_resume_workflow() {
     let task_id = task.id;
 
     manager.add_download(task).await;
-    manager.start_download(task_id, None, config.clone()).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config.clone()).await.unwrap(),
+        StartOutcome::Started
+    );
 
     // Wait for download to start
     sleep(Duration::from_millis(100)).await;
@@ -193,7 +200,7 @@ async fn test_pause_resume_workflow() {
 
     // Step 3: Resume download (start again) if it was paused
     if paused_task.status == DownloadStatus::Paused {
-        manager.start_download(task_id, None, config).await.unwrap();
+        let _ = manager.start_download(task_id, None, config).await.unwrap();
 
         // Verify resumed
         let resumed_task = manager.get_by_id(task_id).await.unwrap();
@@ -250,7 +257,10 @@ async fn test_error_handling_workflow() {
     manager.add_download(task).await;
 
     // Step 2: Start download
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     // Step 3: Wait for error status
     let result = timeout(Duration::from_secs(5), async {
@@ -299,7 +309,10 @@ async fn test_concurrent_downloads_workflow() {
 
     // Step 2: Start all downloads
     for task_id in &task_ids {
-        manager.start_download(*task_id, None, config.clone()).await.unwrap();
+        assert_eq!(
+            manager.start_download(*task_id, None, config.clone()).await.unwrap(),
+            StartOutcome::Started
+        );
     }
 
     // Wait for downloads to start
@@ -453,7 +466,10 @@ async fn test_resume_partial_download_workflow() {
     manager.add_download(task).await;
 
     // Step 3: Start download (should resume from 2048 bytes)
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     // Step 4: Wait for completion (check file size or task removal)
     // Note: Mock server doesn't support Range requests, so download will be full re-download

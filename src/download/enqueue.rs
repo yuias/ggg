@@ -116,7 +116,10 @@ pub async fn enqueue(
             .start_download(id, state.script_sender.clone(), state.config.clone())
             .await
         {
-            Ok(()) => started = true,
+            // `AlreadyRunning`/`Busy` for a task added a moment ago means the
+            // auto-start sweep is already starting it, so this still counts
+            // as started.
+            Ok(_) => started = true,
             // A start failure must never abort an add; the task just stays queued.
             // Callers report `start_error` themselves, so log at debug here to
             // avoid double-logging the same failure.

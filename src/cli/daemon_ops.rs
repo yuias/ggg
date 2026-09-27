@@ -17,7 +17,7 @@ use crate::app::state::AppState;
 use crate::download::enqueue::{
     build_task, enqueue, resolve_folder_id, resolve_target_folder, EnqueueOptions, EnqueueOutcome,
 };
-use crate::download::manager::{DownloadEvent, DownloadManager};
+use crate::download::manager::{DownloadEvent, DownloadManager, StartOutcome};
 use crate::download::task::{DownloadStatus, DownloadTask};
 use crate::ipc::control::protocol::{
     AddedTask, ControlErrorCode, ControlRequest, ControlResponse, DaemonStatus, HeaderEdit,
@@ -339,31 +339,26 @@ async fn dispatch_get(id: Uuid, ctx: &DaemonContext) -> ControlResponse {
     not_found("Download not found")
 }
 
-/// Starts a single task. Distinguishes "this call actually started it" from
-/// "it was already downloading, or another caller's start already claimed
-/// it" so the reply does not falsely claim a fresh start; the manager's
-/// `StartClaim` can still collapse a genuinely concurrent call into this
-/// one's no-op after the check below, which is the accepted race documented
-/// on `start_download`.
+/// Starts a single task and reports `start_download`'s `StartOutcome`:
+/// started, already running (including retry backoff), or busy (another
+/// operation holds the claim).
 async fn dispatch_start(id: Uuid, ctx: &DaemonContext) -> ControlResponse {
     let Some(task) = ctx.manager.get_by_id(id).await else {
         return not_found("Download not found");
     };
-    let already_in_flight = task.status == DownloadStatus::Downloading
-        || ctx.manager.is_start_in_progress(id)
-        || ctx.manager.is_running(id).await;
-    if already_in_flight {
-        return ControlResponse::Ok {
-            message: format!("Download already running: {}", task.filename),
-        };
-    }
     match ctx
         .manager
         .start_download(id, ctx.state.script_sender.clone(), ctx.state.config.clone())
         .await
     {
-        Ok(()) => ControlResponse::Ok {
+        Ok(StartOutcome::Started) => ControlResponse::Ok {
             message: format!("Started download: {}", task.filename),
+        },
+        Ok(StartOutcome::AlreadyRunning) => ControlResponse::Ok {
+            message: format!("Download already running: {}", task.filename),
+        },
+        Ok(StartOutcome::Busy) => ControlResponse::Ok {
+            message: format!("Download is busy (being started or modified): {}", task.filename),
         },
         Err(e) => ControlResponse::Error {
             code: ControlErrorCode::Internal,
@@ -439,11 +434,10 @@ async fn dispatch_remove(id: Uuid, ctx: &DaemonContext) -> ControlResponse {
 }
 
 /// Starts every `Pending`/`Paused` task in scope (all folders, or one
-/// resolved folder), skipping a task that is already starting or running.
-/// Does not use `DownloadManager::start_folder_tasks`/`start_all_tasks`: those
-/// count a start collapsed into another caller's in-flight start as started
-/// (an accepted side effect for their existing callers), which would make
-/// this response overstate how many downloads this call actually started.
+/// resolved folder). Does not use
+/// `DownloadManager::start_folder_tasks`/`start_all_tasks`: those only
+/// attempt `Pending` tasks, while daemon `start-all` also attempts `Paused`
+/// ones, matching the standalone `start --all` command's status filter.
 async fn start_scope(ctx: &DaemonContext, folder_id: Option<&str>) -> usize {
     let tasks = ctx.manager.get_all_downloads().await;
     let mut started = 0;
@@ -456,15 +450,13 @@ async fn start_scope(ctx: &DaemonContext, folder_id: Option<&str>) -> usize {
         if !matches!(task.status, DownloadStatus::Pending | DownloadStatus::Paused) {
             continue;
         }
-        if ctx.manager.is_start_in_progress(task.id) || ctx.manager.is_running(task.id).await {
-            continue;
-        }
         match ctx
             .manager
             .start_download(task.id, ctx.state.script_sender.clone(), ctx.state.config.clone())
             .await
         {
-            Ok(()) => started += 1,
+            Ok(StartOutcome::Started) => started += 1,
+            Ok(_) => {}
             Err(e) => tracing::warn!("Failed to start {}: {}", task.filename, e),
         }
     }
@@ -1400,6 +1392,29 @@ mod tests {
                 assert!(message.contains("pause the download first"), "message: {message}");
             }
             other => panic!("expected Error{{InvalidInput}}, got {other:?}"),
+        }
+
+        ctx.manager.abort_active_handle_for_test(id).await;
+    }
+
+    /// A task in retry backoff (`Paused` status, live handle still running)
+    /// must not be reported as freshly started.
+    #[tokio::test]
+    async fn dispatch_start_running_task_not_reported_started() {
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Paused);
+        let id = task.id;
+        manager.add_download(task).await;
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+        let ctx = test_context(manager);
+
+        let resp = dispatch(ControlRequest::Start { id }, &ctx).await;
+        match resp {
+            ControlResponse::Ok { message } => {
+                assert!(message.contains("already running"), "message: {message}");
+            }
+            other => panic!("expected Ok{{already running}}, got {other:?}"),
         }
 
         ctx.manager.abort_active_handle_for_test(id).await;

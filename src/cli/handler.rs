@@ -4,7 +4,7 @@ use super::{BridgeAction, Commands, ConfigAction, DebugAction, ScriptAction, Fol
 use super::bridge;
 use crate::app::config::{Config, FolderConfig};
 use crate::app::state::AppState;
-use crate::download::manager::{DownloadManager, EditHeadersError};
+use crate::download::manager::{DownloadManager, EditHeadersError, StartOutcome};
 use crate::download::task::{DownloadTask, DownloadStatus};
 use crate::download::completion_log::CompletedEntry;
 use crate::download::enqueue::{
@@ -246,10 +246,14 @@ async fn handle_start(
         .ok_or_else(|| anyhow::anyhow!("Download not found"))?;
 
     // Start download with script support
-    manager.start_download(id, state.script_sender.clone(), state.config.clone()).await?;
+    let outcome = manager.start_download(id, state.script_sender.clone(), state.config.clone()).await?;
     manager.save_queue_to_folders().await?;
 
-    println!("Started download: {}", task.filename);
+    match outcome {
+        StartOutcome::Started => println!("Started download: {}", task.filename),
+        StartOutcome::AlreadyRunning => println!("Download already running: {}", task.filename),
+        StartOutcome::Busy => println!("Download is busy (being started or modified): {}", task.filename),
+    }
 
     if wait {
         // Wait for download to complete and show progress
@@ -1444,7 +1448,8 @@ async fn handle_start_all(
         // Only start pending or paused tasks
         if matches!(task.status, DownloadStatus::Pending | DownloadStatus::Paused) {
             match manager.start_download(task.id, state.script_sender.clone(), state.config.clone()).await {
-                Ok(_) => started_count += 1,
+                Ok(StartOutcome::Started) => started_count += 1,
+                Ok(_) => {}
                 Err(e) => tracing::warn!("Failed to start {}: {}", task.filename, e),
             }
         }

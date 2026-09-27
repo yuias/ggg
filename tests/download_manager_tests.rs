@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use ggg::download::manager::DownloadManager;
+use ggg::download::manager::{DownloadManager, StartOutcome};
 use ggg::download::task::DownloadStatus;
 use tokio::time::{sleep, Duration};
 
@@ -234,7 +234,10 @@ async fn test_manager_start_sets_status() {
 
     // Start download
     let config = create_test_config();
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     // Status should change to Downloading
     let task = manager.get_by_id(task_id).await.unwrap();
@@ -259,7 +262,10 @@ async fn test_manager_start_sets_timestamp() {
 
     // Start download
     let config = create_test_config();
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     // Should have started_at timestamp
     let task = manager.get_by_id(task_id).await.unwrap();
@@ -278,7 +284,10 @@ async fn test_manager_pause_download() {
 
     manager.add_download(task).await;
     let config = create_test_config();
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     // Wait a bit for download to start
     sleep(Duration::from_millis(100)).await;
@@ -309,7 +318,10 @@ async fn test_manager_pause_sets_status() {
 
     manager.add_download(task).await;
     let config = create_test_config();
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     sleep(Duration::from_millis(100)).await;
 
@@ -335,7 +347,10 @@ async fn test_manager_remove_active_aborts() {
 
     manager.add_download(task).await;
     let config = create_test_config();
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     // The GET response is delayed well past this test's lifetime, so the
     // download is still active here rather than having already completed.
@@ -362,7 +377,10 @@ async fn test_manager_completion_updates_task() {
 
     manager.add_download(task).await;
     let config = create_test_config();
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     // Wait for download to complete (small file, should be quick)
     for _ in 0..50 {
@@ -406,7 +424,10 @@ async fn test_manager_concurrent_limit() {
 
         manager.add_download(task).await;
         let config = create_test_config();
-        manager.start_download(task_id, None, config).await.unwrap();
+        assert_eq!(
+            manager.start_download(task_id, None, config).await.unwrap(),
+            StartOutcome::Started
+        );
     }
 
     // Wait for downloads to start
@@ -447,7 +468,10 @@ async fn test_manager_get_active_count() {
 
     manager.add_download(task).await;
     let config = create_test_config();
-    manager.start_download(task_id, None, config).await.unwrap();
+    assert_eq!(
+        manager.start_download(task_id, None, config).await.unwrap(),
+        StartOutcome::Started
+    );
 
     sleep(Duration::from_millis(100)).await;
 
