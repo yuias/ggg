@@ -189,6 +189,25 @@ impl FolderQueue {
         }
     }
 
+    /// Finds `id`, rejects a `Downloading` task, applies `f`, and returns a
+    /// clone of the updated task -- all under one `tasks.write()` lock, so
+    /// no concurrent mutation of the same task (a pause, a priority change,
+    /// ...) can land between the check and the apply. `None` covers both
+    /// "not in this queue" and "rejected, still Downloading"; the caller
+    /// (`DownloadManager::edit_task_headers`) already rules the latter out
+    /// before calling this, via the start claim and `is_running`. Only
+    /// headers change here, so unlike `update` the counts need no
+    /// bookkeeping.
+    pub async fn modify<F: FnOnce(&mut DownloadTask)>(&self, id: Uuid, f: F) -> Option<DownloadTask> {
+        let mut tasks = self.tasks.write().await;
+        let pos = tasks.iter().position(|t| t.id == id)?;
+        if tasks[pos].status == DownloadStatus::Downloading {
+            return None;
+        }
+        f(&mut tasks[pos]);
+        Some(tasks[pos].clone())
+    }
+
     /// Get current task counts
     pub async fn get_counts(&self) -> FolderTaskCounts {
         let counts = self.counts.read().await;

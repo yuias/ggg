@@ -4,7 +4,7 @@ use super::{BridgeAction, Commands, ConfigAction, DebugAction, ScriptAction, Fol
 use super::bridge;
 use crate::app::config::{Config, FolderConfig};
 use crate::app::state::AppState;
-use crate::download::manager::DownloadManager;
+use crate::download::manager::{DownloadManager, EditHeadersError};
 use crate::download::task::{DownloadTask, DownloadStatus};
 use crate::download::completion_log::CompletedEntry;
 use crate::download::enqueue::{
@@ -44,6 +44,9 @@ pub async fn handle_command(
         Commands::Clear { status, folder } => handle_clear(&manager, status, folder).await,
         Commands::BatchAdd { file, folder } => handle_batch_add(&state, &manager, file, folder).await,
         Commands::Priority { id, set } => handle_priority(&manager, id, set).await,
+        Commands::Modify { id, referrer, clear_referrer, header, remove_header } => {
+            handle_modify(&manager, id, referrer, clear_referrer, header, remove_header).await
+        }
         Commands::Move { id, to_top, to_bottom, before, folder } => {
             handle_move(&manager, &state, id, to_top, to_bottom, before, folder).await
         }
@@ -1595,6 +1598,59 @@ async fn handle_batch_add(
 
     println!("Added {} download(s) from {}", added_count, file);
     Ok(error::SUCCESS)
+}
+
+/// Change a queued download's referrer/headers. Works the same standalone
+/// as when routed through the daemon (`remote::send_and_render`'s `Modify`
+/// arm): both apply the edit through `DownloadManager::edit_task_headers`
+/// and the shared `daemon_ops::apply_header_edit`, so the task ends up in
+/// the same state either way.
+async fn handle_modify(
+    manager: &DownloadManager,
+    id_str: String,
+    referrer: Option<super::RedactedArg>,
+    clear_referrer: bool,
+    header: Vec<super::HeaderArg>,
+    remove_header: Vec<String>,
+) -> Result<i32> {
+    let id = parse_task_id(&id_str)?;
+
+    let mut set_headers = Vec::with_capacity(header.len());
+    for h in &header {
+        match super::remote::parse_header_arg(h) {
+            Ok(pair) => set_headers.push(pair),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return Ok(error::INVALID_INPUT);
+            }
+        }
+    }
+
+    let edit = crate::ipc::control::protocol::HeaderEdit {
+        referrer: referrer.map(|r| r.0),
+        clear_referrer,
+        set_headers,
+        remove_headers: remove_header,
+    };
+
+    match manager
+        .edit_task_headers(id, move |task| super::daemon_ops::apply_header_edit(task, &edit))
+        .await
+    {
+        Ok(task) => {
+            manager.save_queue_to_folders().await?;
+            super::remote::render_modified(task);
+            Ok(error::SUCCESS)
+        }
+        Err(EditHeadersError::NotFound) => {
+            eprintln!("Error: Download not found");
+            Ok(error::NOT_FOUND)
+        }
+        Err(e @ EditHeadersError::Busy(..)) => {
+            eprintln!("Error: {e}");
+            Ok(error::INVALID_INPUT)
+        }
+    }
 }
 
 // ========================================

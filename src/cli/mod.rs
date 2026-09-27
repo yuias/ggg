@@ -290,6 +290,34 @@ pub enum Commands {
         folder: Option<String>,
     },
 
+    /// Change a queued download's referrer/headers
+    #[command(group(
+        clap::ArgGroup::new("modify_edit").multiple(true).required(true)
+    ))]
+    Modify {
+        /// Download ID (UUID)
+        id: String,
+
+        /// Set the Referer header. Overrides any `Referer` header set via
+        /// --header, regardless of the order the flags were given in.
+        #[arg(long, group = "modify_edit")]
+        referrer: Option<RedactedArg>,
+
+        /// Remove the Referer header
+        #[arg(long, group = "modify_edit", conflicts_with = "referrer")]
+        clear_referrer: bool,
+
+        /// Add or replace a header as "Name: value" (repeatable,
+        /// case-insensitive replace)
+        #[arg(long = "header", value_name = "K:V", group = "modify_edit")]
+        header: Vec<HeaderArg>,
+
+        /// Remove a header by name, case-insensitive (repeatable); removals
+        /// are applied last, after --referrer/--header/--clear-referrer
+        #[arg(long = "remove-header", value_name = "K", group = "modify_edit")]
+        remove_header: Vec<String>,
+    },
+
     /// Set download priority
     Priority {
         /// Download ID (UUID)

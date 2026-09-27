@@ -21,7 +21,9 @@ use super::output;
 // the `add` payload types are available to render standalone output too.
 use crate::ipc::control::protocol::{AddedTask, SkippedUrl};
 #[cfg(windows)]
-use crate::ipc::control::protocol::{ControlErrorCode, ControlRequest, ControlResponse, WaitOutcome};
+use crate::ipc::control::protocol::{
+    ControlErrorCode, ControlRequest, ControlResponse, HeaderEdit, WaitOutcome,
+};
 use crate::download::task::{DownloadStatus, DownloadTask};
 #[cfg(windows)]
 use std::time::Duration;
@@ -73,6 +75,7 @@ pub fn classify(cmd: &Commands) -> RemoteClass {
         Commands::Status { .. } => RemoteClass::Routed,
         Commands::StartAll { .. } => RemoteClass::Routed,
         Commands::PauseAll { .. } => RemoteClass::Routed,
+        Commands::Modify { .. } => RemoteClass::Routed,
 
         Commands::Config { action } => match action {
             ConfigAction::Get { .. } => RemoteClass::ReadOnly,
@@ -414,6 +417,41 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
             }
         }
 
+        Commands::Modify { id, referrer, clear_referrer, header, remove_header } => {
+            let uid = match super::handler::parse_task_id(id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            let mut set_headers = Vec::with_capacity(header.len());
+            for h in header {
+                match parse_header_arg(h) {
+                    Ok(pair) => set_headers.push(pair),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return RouteDecision::Handled(error::INVALID_INPUT);
+                    }
+                }
+            }
+            let edit = HeaderEdit {
+                referrer: referrer.as_ref().map(|r| r.0.clone()),
+                clear_referrer: *clear_referrer,
+                set_headers,
+                remove_headers: remove_header.clone(),
+            };
+            let req = ControlRequest::Modify { id: uid, edit };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Task { task, .. }) => {
+                    render_modified(task);
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+
         Commands::Script { action: ScriptAction::Reload } => {
             match client::send(pipe_name, &ControlRequest::ReloadScripts, Some(REQUEST_TIMEOUT)).await {
                 Ok(ControlResponse::Ok { message }) => {
@@ -649,6 +687,24 @@ pub fn render_task(task: DownloadTask, in_history: bool, json: bool) {
         println!("{}", output::format_download(&task, true));
         if in_history {
             println!("(from history)");
+        }
+    }
+}
+
+/// Renders `modify`'s result: the only thing `modify` can change is
+/// headers, so this prints those (redacted, like every other task render)
+/// instead of the full `format_download` block.
+pub fn render_modified(task: DownloadTask) {
+    let task = redact_task_headers(task);
+    println!("Modified download: {} (ID: {})", task.filename, task.id);
+    if task.headers.is_empty() {
+        println!("Headers: (none)");
+    } else {
+        println!("Headers:");
+        let mut names: Vec<&String> = task.headers.keys().collect();
+        names.sort();
+        for name in names {
+            println!("  {}: {}", name, task.headers[name]);
         }
     }
 }

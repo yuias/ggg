@@ -53,6 +53,18 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Re-exported from folder_queue for backward compatibility
 pub use super::folder_queue::FolderTaskCounts;
 
+/// Failure modes for [`DownloadManager::edit_task_headers`].
+#[derive(Debug, thiserror::Error)]
+pub enum EditHeadersError {
+    #[error("Download not found")]
+    NotFound,
+    /// `&'static str` is the reason folded into the message ("starting" or
+    /// "downloading"); both map to exit 3 ("pause the download first") at
+    /// the CLI layer.
+    #[error("download {0} is {1}; pause the download first")]
+    Busy(Uuid, &'static str),
+}
+
 #[derive(Clone)]
 pub struct DownloadManager {
     /// Per-folder download queues
@@ -1120,6 +1132,50 @@ impl DownloadManager {
         }
 
         Ok(())
+    }
+
+    /// Applies a header edit to a queued task. Takes the same start claim
+    /// `start_download` uses -- for the whole call, not just a point-in-time
+    /// check -- and finds+checks+applies the edit under one `FolderQueue`
+    /// write lock (`FolderQueue::modify`). Together these close the races a
+    /// separate read-then-write would have: a concurrent `start_download`
+    /// can't take the claim mid-edit and write back its own pre-edit
+    /// snapshot, and no other same-task mutation (a pause, `set_priority`,
+    /// `change_folder`) can land between this call's own check and apply.
+    ///
+    /// A `start_download` call for `id` that arrives while this call holds
+    /// the claim returns `Ok(())` without starting -- the same collapse two
+    /// concurrent `start_download` calls already get. The window is only a
+    /// few in-memory lock operations, not the beforeRequest script round
+    /// trip `start_download` itself awaits while holding its own claim.
+    pub async fn edit_task_headers(
+        &self,
+        id: Uuid,
+        edit: impl FnOnce(&mut DownloadTask) + Send,
+    ) -> Result<DownloadTask, EditHeadersError> {
+        let Some(_claim) = StartClaim::try_acquire(&self.start_claims, id) else {
+            return Err(EditHeadersError::Busy(id, "starting"));
+        };
+        // Covers a genuinely `Downloading` task and one in retry backoff
+        // (status `Paused`, handle still alive, no claim held): either would
+        // otherwise overwrite this edit once it settles or writes back.
+        if self.is_running(id).await {
+            return Err(EditHeadersError::Busy(id, "downloading"));
+        }
+
+        // Locate the queue fresh, the way `get_by_id` does, instead of
+        // trusting a `folder_id` read earlier in this call: a concurrent
+        // `change_folder` could have moved the task since.
+        let queues: Vec<FolderQueue> = {
+            let guard = self.folder_queues.read().await;
+            guard.values().cloned().collect()
+        };
+        for queue in &queues {
+            if queue.get_by_id(id).await.is_some() {
+                return queue.modify(id, edit).await.ok_or(EditHeadersError::NotFound);
+            }
+        }
+        Err(EditHeadersError::NotFound)
     }
 
     /// Move a task to another folder queue, adopting the destination folder's
@@ -2472,5 +2528,112 @@ mod tests {
         assert_eq!(task.status, DownloadStatus::Paused);
 
         manager.active_downloads.write().await.remove(&id).unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn edit_task_headers_rejects_downloading() {
+        let manager = DownloadManager::new();
+        let mut task = DownloadTask::new("https://example.com/f".to_string(), "/tmp".into());
+        task.status = DownloadStatus::Downloading;
+        let id = task.id;
+        manager.add_download(task).await;
+        // `edit_task_headers` rejects via `is_running`, which checks the
+        // handle map, not just the persisted status -- so a real live
+        // handle is needed to exercise that path, not just the status field.
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+
+        let result = manager
+            .edit_task_headers(id, |task| task.set_header("Referer", "https://a.example/"))
+            .await;
+        match result {
+            Err(EditHeadersError::Busy(busy_id, _)) => assert_eq!(busy_id, id),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert!(
+            !task.headers.contains_key("Referer"),
+            "a rejected edit must not be applied"
+        );
+
+        manager.abort_active_handle_for_test(id).await;
+    }
+
+    /// Holds a `StartClaim` directly (this test lives in the same module, so
+    /// it can reach the private type) rather than driving a real
+    /// `start_download` call, since only the claim itself -- not the script
+    /// round trip -- matters here.
+    #[tokio::test]
+    async fn edit_task_headers_rejects_while_start_in_progress() {
+        let manager = DownloadManager::new();
+        let task = DownloadTask::new("https://example.com/f".to_string(), "/tmp".into());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let _claim = StartClaim::try_acquire(&manager.start_claims, id).expect("claim must be free");
+        assert!(manager.is_start_in_progress(id));
+
+        let result = manager
+            .edit_task_headers(id, |task| task.set_header("Referer", "https://a.example/"))
+            .await;
+        assert!(result.is_err(), "a task with a start in progress must refuse the edit");
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert!(
+            !task.headers.contains_key("Referer"),
+            "a rejected edit must not be applied"
+        );
+    }
+
+    /// `edit_task_headers` holds the start claim for its whole call, so a
+    /// concurrent `start_download` must collapse into a no-op instead of
+    /// reading the pre-edit task and writing it back over the edit. Blocks
+    /// the edit closure on a plain (non-tokio) channel so the claim stays
+    /// held while `start_download` is attempted from a second worker
+    /// thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn edit_task_headers_blocks_concurrent_start_until_done() {
+        let manager = DownloadManager::new();
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let manager_edit = manager.clone();
+        let edit_handle = tokio::spawn(async move {
+            manager_edit
+                .edit_task_headers(id, move |task| {
+                    // Block synchronously (not `.await`: this closure runs
+                    // inside `FolderQueue::modify`'s write-lock scope,
+                    // which is not an async fn) until the test signals it
+                    // to proceed, keeping the claim held while a concurrent
+                    // `start_download` is attempted below.
+                    let _ = release_rx.recv();
+                    task.set_header("Referer", "https://a.example/");
+                })
+                .await
+        });
+
+        // Give `edit_task_headers` time to acquire the claim before racing it.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(manager.is_start_in_progress(id), "edit must hold the claim by now");
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        let start_result = manager.start_download(id, None, config).await;
+        assert!(
+            start_result.is_ok(),
+            "a concurrent start must collapse into a no-op, not error: {start_result:?}"
+        );
+
+        release_tx.send(()).expect("edit closure must still be waiting");
+        let edit_result = edit_handle.await.expect("edit task must not panic");
+        assert!(edit_result.is_ok(), "edit must succeed: {edit_result:?}");
+
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(
+            task.headers.get("Referer").map(String::as_str),
+            Some("https://a.example/"),
+            "the edit must not be overwritten by the collapsed start"
+        );
     }
 }

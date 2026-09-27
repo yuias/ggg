@@ -20,8 +20,8 @@ use crate::download::enqueue::{
 use crate::download::manager::{DownloadEvent, DownloadManager};
 use crate::download::task::{DownloadStatus, DownloadTask};
 use crate::ipc::control::protocol::{
-    AddedTask, ControlErrorCode, ControlRequest, ControlResponse, DaemonStatus, SkippedUrl,
-    WaitOutcome, CONTROL_PROTOCOL_VERSION,
+    AddedTask, ControlErrorCode, ControlRequest, ControlResponse, DaemonStatus, HeaderEdit,
+    SkippedUrl, WaitOutcome, CONTROL_PROTOCOL_VERSION,
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -144,6 +144,7 @@ pub async fn dispatch(req: ControlRequest, ctx: &DaemonContext) -> ControlRespon
         ControlRequest::SetScriptEnabled { name, enabled } => {
             dispatch_set_script_enabled(name, enabled, ctx).await
         }
+        ControlRequest::Modify { id, edit } => dispatch_modify(id, edit, ctx).await,
         _ => ControlResponse::Error {
             code: ControlErrorCode::Unsupported,
             message: "not supported by this daemon yet".to_string(),
@@ -212,6 +213,52 @@ async fn dispatch_set_script_enabled(name: String, enabled: bool, ctx: &DaemonCo
     ControlResponse::Ok {
         message: format!("{verb} script: {name}"),
     }
+}
+
+/// Applies a `Modify` edit to a task's headers, in the same order `add`
+/// applies its own header/referrer overrides (`enqueue::build_task`):
+/// `set_headers` first, so `--referrer` wins over a `Referer` passed
+/// through `--header`. `remove_headers` runs last of all, after
+/// `clear_referrer`/`referrer`, so an explicit `--remove-header` always
+/// wins, even over a name this same edit just set. Shared by the daemon's
+/// `Modify` handler and the standalone `modify` command so both mutate a
+/// task the same way.
+pub(crate) fn apply_header_edit(task: &mut DownloadTask, edit: &HeaderEdit) {
+    for (name, value) in &edit.set_headers {
+        task.set_header(name, value);
+    }
+    if edit.clear_referrer {
+        task.remove_header("Referer");
+    }
+    if let Some(referrer) = &edit.referrer {
+        task.set_header("Referer", referrer);
+    }
+    for name in &edit.remove_headers {
+        task.remove_header(name);
+    }
+}
+
+async fn dispatch_modify(id: Uuid, edit: HeaderEdit, ctx: &DaemonContext) -> ControlResponse {
+    match ctx
+        .manager
+        .edit_task_headers(id, move |task| apply_header_edit(task, &edit))
+        .await
+    {
+        Ok(task) => ControlResponse::Task { task, in_history: false },
+        Err(e) => modify_error_response(e),
+    }
+}
+
+/// Maps `edit_task_headers`'s typed error to a `ControlResponse`: `NotFound`
+/// stays `NotFound` (exit 2), `Busy` maps to `InvalidInput` (exit 3, "pause
+/// the download first", per the Command surface).
+fn modify_error_response(e: crate::download::manager::EditHeadersError) -> ControlResponse {
+    use crate::download::manager::EditHeadersError;
+    let code = match &e {
+        EditHeadersError::NotFound => ControlErrorCode::NotFound,
+        EditHeadersError::Busy(..) => ControlErrorCode::InvalidInput,
+    };
+    ControlResponse::Error { code, message: e.to_string() }
 }
 
 fn not_found(message: &str) -> ControlResponse {
@@ -756,15 +803,15 @@ mod tests {
         }
     }
 
-    // `Modify` is not handled by the daemon yet, so it still falls through
-    // `dispatch`'s catch-all arm.
+    // `Move` is not handled by the daemon yet, so it still falls
+    // through `dispatch`'s catch-all arm.
     #[tokio::test]
     async fn dispatch_unhandled_is_unsupported() {
         let ctx = test_context(DownloadManager::new());
         let resp = dispatch(
-            ControlRequest::Modify {
+            ControlRequest::Move {
                 id: Uuid::new_v4(),
-                edit: crate::ipc::control::protocol::HeaderEdit::default(),
+                op: crate::ipc::control::protocol::MoveOp::ToTop,
             },
             &ctx,
         )
@@ -1227,5 +1274,131 @@ mod tests {
         }
 
         manager.abort_active_handle_for_test(id).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_modify_sets_and_clears_referrer() {
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Pending);
+        let id = task.id;
+        manager.add_download(task).await;
+        let ctx = test_context(manager);
+
+        let set_resp = dispatch(
+            ControlRequest::Modify {
+                id,
+                edit: crate::ipc::control::protocol::HeaderEdit {
+                    referrer: Some("https://a.example/".to_string()),
+                    ..Default::default()
+                },
+            },
+            &ctx,
+        )
+        .await;
+        match set_resp {
+            ControlResponse::Task { task, .. } => {
+                assert_eq!(task.headers.get("Referer").map(String::as_str), Some("https://a.example/"));
+            }
+            other => panic!("expected Task, got {other:?}"),
+        }
+
+        let clear_resp = dispatch(
+            ControlRequest::Modify {
+                id,
+                edit: crate::ipc::control::protocol::HeaderEdit {
+                    clear_referrer: true,
+                    ..Default::default()
+                },
+            },
+            &ctx,
+        )
+        .await;
+        match clear_resp {
+            ControlResponse::Task { task, .. } => {
+                assert!(!task.headers.contains_key("Referer"));
+            }
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn modify_remove_header_case_insensitive() {
+        let manager = DownloadManager::new();
+        let mut task = task_with_status(DownloadStatus::Pending);
+        task.headers.insert("X-Test".to_string(), "1".to_string());
+        let id = task.id;
+        manager.add_download(task).await;
+        let ctx = test_context(manager);
+
+        let resp = dispatch(
+            ControlRequest::Modify {
+                id,
+                edit: crate::ipc::control::protocol::HeaderEdit {
+                    remove_headers: vec!["x-test".to_string()],
+                    ..Default::default()
+                },
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Task { task, .. } => {
+                assert!(!task.headers.contains_key("X-Test"), "removal must be case-insensitive");
+            }
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_modify_unknown_id_is_not_found() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::Modify {
+                id: Uuid::new_v4(),
+                edit: crate::ipc::control::protocol::HeaderEdit::default(),
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::NotFound),
+            other => panic!("expected Error{{NotFound}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_modify_downloading_is_invalid_input() {
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Downloading);
+        let id = task.id;
+        manager.add_download(task).await;
+        // `edit_task_headers` rejects via `is_running`, which checks the
+        // handle map, not just the persisted status -- so a real live
+        // handle is needed here, the same way `wait_running_handle_with_
+        // no_queue_entry_is_not_removed` sets one up above.
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+        let ctx = test_context(manager);
+
+        let resp = dispatch(
+            ControlRequest::Modify {
+                id,
+                edit: crate::ipc::control::protocol::HeaderEdit {
+                    clear_referrer: true,
+                    ..Default::default()
+                },
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Error { code, message } => {
+                assert_eq!(code, ControlErrorCode::InvalidInput);
+                assert!(message.contains("pause the download first"), "message: {message}");
+            }
+            other => panic!("expected Error{{InvalidInput}}, got {other:?}"),
+        }
+
+        ctx.manager.abort_active_handle_for_test(id).await;
     }
 }
