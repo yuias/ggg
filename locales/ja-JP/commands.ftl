@@ -6,6 +6,7 @@ cmd-error-invalid-config = 無効な設定フォーマット
 cmd-error-scripts-disabled = スクリプトが有効になっていない
 cmd-error-start-download = ダウンロード開始に失敗: { $error }
 cmd-error-pause-download = ダウンロード一時停止に失敗: { $error }
+cmd-error-remove-download = ダウンロード削除に失敗: { $error }
 cmd-error-change-folder = フォルダ変更に失敗: { $error }
 cmd-error-validation-failed = バリデーションエラー: { $error }
 cmd-error-save-config = 設定の保存に失敗: { $error }

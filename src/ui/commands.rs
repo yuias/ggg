@@ -64,6 +64,7 @@ pub enum CommandError {
     ReloadActiveDownloads,
     StartDownload { error: String },
     PauseDownload { error: String },
+    RemoveDownload { error: String },
     ChangeFolder { error: String },
     ValidationFailed { error: String },
     SaveConfig { error: String },
@@ -87,6 +88,7 @@ impl std::fmt::Display for CommandError {
             }
             CommandError::StartDownload { error } => write!(f, "Failed to start download: {error}"),
             CommandError::PauseDownload { error } => write!(f, "Failed to pause download: {error}"),
+            CommandError::RemoveDownload { error } => write!(f, "Failed to remove download: {error}"),
             CommandError::ChangeFolder { error } => write!(f, "Failed to change folder: {error}"),
             CommandError::ValidationFailed { error } => write!(f, "Validation failed: {error}"),
             CommandError::SaveConfig { error } => write!(f, "Failed to save configuration: {error}"),
@@ -172,8 +174,12 @@ pub async fn handle_command(
         }
         Command::RemoveDownload { id } => {
             if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
-                download_manager.remove_download(uuid).await;
-                CommandResponse::ok()
+                match download_manager.remove_download(uuid).await {
+                    Ok(_) => CommandResponse::ok(),
+                    Err(e) => CommandResponse::Error(CommandError::RemoveDownload {
+                        error: e.to_string(),
+                    }),
+                }
             } else {
                 CommandResponse::Error(CommandError::InvalidUuid)
             }

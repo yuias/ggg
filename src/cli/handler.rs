@@ -336,8 +336,14 @@ async fn handle_remove(
 ) -> Result<i32> {
     let id = parse_task_id(&id_str)?;
 
-    let task = manager.remove_download(id).await
-        .ok_or_else(|| anyhow::anyhow!("Download not found"))?;
+    let task = match manager.remove_download(id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => return Err(anyhow::anyhow!("Download not found")),
+        Err(e) => {
+            println!("{e}");
+            return Ok(error::INVALID_INPUT);
+        }
+    };
 
     manager.save_queue_to_folders().await?;
 
@@ -1547,8 +1553,10 @@ async fn handle_clear(
         });
 
         if should_remove {
-            if manager.remove_download(task.id).await.is_some() {
-                removed_count += 1;
+            match manager.remove_download(task.id).await {
+                Ok(Some(_)) => removed_count += 1,
+                Ok(None) => {}
+                Err(e) => tracing::warn!("Failed to remove {}: {}", task.filename, e),
             }
         }
     }
@@ -1884,7 +1892,9 @@ async fn handle_test_reset_queue(manager: &DownloadManager) -> Result<i32> {
     let count = tasks.len();
 
     for task in tasks {
-        manager.remove_download(task.id).await;
+        if let Err(e) = manager.remove_download(task.id).await {
+            tracing::warn!("Failed to remove {}: {}", task.filename, e);
+        }
     }
 
     manager.save_queue_to_folders().await?;

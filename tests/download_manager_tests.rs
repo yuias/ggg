@@ -100,7 +100,7 @@ async fn test_manager_remove_download() {
     manager.add_download(task).await;
     assert_eq!(manager.get_all_downloads().await.len(), 1);
 
-    let removed = manager.remove_download(task_id).await;
+    let removed = manager.remove_download(task_id).await.expect("claim not held");
     assert!(removed.is_some());
     assert_eq!(removed.unwrap().id, task_id);
 
@@ -358,7 +358,7 @@ async fn test_manager_remove_active_aborts() {
     assert!(manager.is_running(task_id).await);
 
     // Remove should abort the active download
-    manager.remove_download(task_id).await;
+    manager.remove_download(task_id).await.expect("claim not held");
 
     assert_eq!(manager.get_active_count().await, 0);
     assert!(!manager.is_running(task_id).await);

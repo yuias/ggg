@@ -30,21 +30,6 @@ use uuid::Uuid;
 /// broadcast receiver and any event that arrived before the subscription.
 const WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How long `Pause`/`Remove` wait for a concurrent `start_download` call
-/// (the beforeRequest script round trip) to finish before giving up. The
-/// claim only spans that round trip, so a short wait makes the common case
-/// -- a user pausing a task that a script just started -- succeed instead of
-/// forcing them to retry by hand; the bound keeps a stuck script from
-/// hanging the request indefinitely. `start_download` reads the task before
-/// the script round trip and writes it back after (`manager.rs`), so a
-/// pause/remove that lands in that window can still be overwritten by the
-/// eventual write-back; waiting out the claim narrows that window but does
-/// not close it, since a claim that clears one poll tick after our deadline
-/// still loses the race (see `wait_for_start_claim_clear`, and the comment
-/// on `dispatch_pause` for the remaining gap after the wait succeeds).
-const START_CLAIM_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
-const START_CLAIM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
-
 /// The daemon's control pipe binding, threaded from `main.rs`'s single-
 /// instance `bind` into `run_daemon`. `BoundPipe` on Windows; an empty enum
 /// elsewhere, so `Option<ControlBinding>` is always `None` on non-Windows
@@ -376,51 +361,10 @@ async fn dispatch_start(id: Uuid, ctx: &DaemonContext) -> ControlResponse {
     }
 }
 
-/// Waits for `id`'s start claim (if any) to clear, so `Pause`/`Remove` never
-/// race `start_download`'s post-script write-back (see the doc comment on
-/// `START_CLAIM_WAIT_BUDGET` above). `budget` is a parameter (rather than
-/// always `START_CLAIM_WAIT_BUDGET`) so a test can exercise the timeout
-/// branch without waiting out the real, multi-second budget.
-async fn wait_for_start_claim_clear(
-    manager: &DownloadManager,
-    id: Uuid,
-    budget: std::time::Duration,
-) -> Result<(), ControlResponse> {
-    let deadline = tokio::time::Instant::now() + budget;
-    while manager.is_start_in_progress(id) {
-        if tokio::time::Instant::now() >= deadline {
-            // Not a malformed request -- the id and the operation are both
-            // fine, the start just hasn't finished yet. `InvalidInput` is
-            // reused because the protocol has no dedicated "retryable"
-            // error code (out of scope here); the message says so plainly
-            // so the caller does not read this as bad input.
-            return Err(ControlResponse::Error {
-                code: ControlErrorCode::InvalidInput,
-                message: format!(
-                    "download {id} is still starting (beforeRequest script running); retry in a moment"
-                ),
-            });
-        }
-        tokio::time::sleep(START_CLAIM_POLL_INTERVAL).await;
-    }
-    Ok(())
-}
-
 async fn dispatch_pause(id: Uuid, ctx: &DaemonContext) -> ControlResponse {
     let Some(task) = ctx.manager.get_by_id(id).await else {
         return not_found("Download not found");
     };
-    if let Err(resp) = wait_for_start_claim_clear(&ctx.manager, id, START_CLAIM_WAIT_BUDGET).await {
-        return resp;
-    }
-    // The wait above only proves no start was in progress at that instant.
-    // Nothing stops another caller (a concurrent `Start`, or the daemon's
-    // own auto-start sweep) from acquiring a fresh claim for `id` right
-    // after the wait returns and before `pause_download` runs below; that
-    // caller's `start_download` can then set the task back to `Downloading`
-    // after we set it to `Paused`, silently losing this pause. Not fixed
-    // here: closing it needs a lock held across both the check and the
-    // pause, which would serialize every pause/remove behind every start.
     match ctx.manager.pause_download(id).await {
         Ok(()) => ControlResponse::Ok {
             message: format!("Paused download: {}", task.filename),
@@ -430,17 +374,12 @@ async fn dispatch_pause(id: Uuid, ctx: &DaemonContext) -> ControlResponse {
 }
 
 async fn dispatch_remove(id: Uuid, ctx: &DaemonContext) -> ControlResponse {
-    if let Err(resp) = wait_for_start_claim_clear(&ctx.manager, id, START_CLAIM_WAIT_BUDGET).await {
-        return resp;
-    }
-    // Same residual window as `dispatch_pause` above: a start claimed
-    // between the wait and this call can still spawn a download for a task
-    // this removes right after.
     match ctx.manager.remove_download(id).await {
-        Some(task) => ControlResponse::Ok {
+        Ok(Some(task)) => ControlResponse::Ok {
             message: format!("Removed download: {}", task.filename),
         },
-        None => not_found("Download not found"),
+        Ok(None) => not_found("Download not found"),
+        Err(e) => task_busy_response(e),
     }
 }
 
@@ -1088,8 +1027,14 @@ mod tests {
         });
 
         // Let `start_download` acquire the claim before racing it.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(manager.is_start_in_progress(id), "start must have claimed the id by now");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !manager.is_start_in_progress(id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "start did not claim the id within 2s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
 
         let ctx = test_context(manager);
         let resp = dispatch(ControlRequest::Pause { id }, &ctx).await;
@@ -1102,19 +1047,20 @@ mod tests {
         assert_eq!(task.status, DownloadStatus::Paused);
     }
 
-    /// `wait_for_start_claim_clear` must give up and report a retryable
-    /// error once its budget is exhausted, rather than hang the connection
-    /// behind an arbitrarily slow script.
+    /// `Pause` must give up and report a retryable error once the claim-wait
+    /// budget is exhausted, rather than hang the connection behind an
+    /// arbitrarily slow script.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn wait_for_start_claim_clear_times_out_while_start_in_progress() {
+    async fn dispatch_pause_busy_while_start_in_progress() {
         use crate::script::message::ScriptRequest;
         use std::sync::mpsc;
 
-        let manager = DownloadManager::new();
+        let mut manager = DownloadManager::new();
         let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
         task.folder_id = "folder1".to_string();
         let id = task.id;
         manager.add_download(task).await;
+        manager.set_claim_wait_budget(std::time::Duration::from_millis(50));
 
         let (script_tx, script_rx) = mpsc::channel::<ScriptRequest>();
         let responder = std::thread::spawn(move || {
@@ -1133,14 +1079,20 @@ mod tests {
             let _ = manager_clone.start_download(id, Some(script_tx), config).await;
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(manager.is_start_in_progress(id), "start must have claimed the id by now");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !manager.is_start_in_progress(id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "start did not claim the id within 2s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
 
-        let result =
-            wait_for_start_claim_clear(&manager, id, std::time::Duration::from_millis(50)).await;
-        match result {
-            Err(ControlResponse::Error { code, .. }) => assert_eq!(code, ControlErrorCode::InvalidInput),
-            other => panic!("expected a retryable Error{{InvalidInput}}, got {other:?}"),
+        let ctx = test_context(manager);
+        let resp = dispatch(ControlRequest::Pause { id }, &ctx).await;
+        match resp {
+            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::InvalidInput),
+            other => panic!("expected Error{{InvalidInput}}, got {other:?}"),
         }
     }
 
@@ -1180,7 +1132,7 @@ mod tests {
 
         // Give the wait loop time to subscribe before the remove fires.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        ctx.manager.remove_download(id).await;
+        let _ = ctx.manager.remove_download(id).await;
 
         // A tight bound (well under the 1 s poll interval) proves the event
         // branch, not the fallback poll, is what resolved this wait.

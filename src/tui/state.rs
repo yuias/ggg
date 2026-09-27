@@ -432,6 +432,11 @@ pub struct TuiState {
     /// Validation/error message to display (None = no error)
     pub validation_error: Option<String>,
 
+    /// Transient status message shown in the Normal-mode status bar (e.g. a
+    /// busy-count notice after a delete/pause hits a `TaskBusy` claim).
+    /// `None` = nothing to show.
+    pub status_message: Option<String>,
+
     /// Rendering optimization: flag to indicate if UI needs redraw
     pub needs_redraw: bool,
 
@@ -527,6 +532,7 @@ impl TuiState {
             is_editing_app_setting: false,
             renaming_folder_id: None,
             validation_error: None,
+            status_message: None,
             needs_redraw: true,  // Initial render needed
             script_files_index: 0,
             app_scripts_expanded: false,

@@ -29,6 +29,7 @@ status-normal-actions-download = ⏯ s:Toggle | ✓ Space:Select | ➕ a:Add | �
 status-normal-actions-folder = ▶ s:Start All | ➕ a:Add | 📋 m:Menu
 status-normal-actions-details = ⏯ s:Toggle | 📋 m:Menu
 status-normal-undo = Ctrl+Z: Undo({$count})
+status-normal-busy = ⚠ {$count}件処理中、もう一度試してください
 status-normal-right = 🔄 F:Folder | ❓ ?:Help | ❌ q:Quit
 
 # Status bar - Other modes

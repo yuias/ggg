@@ -24,6 +24,10 @@ pub(crate) fn localize_command_error(state: &AppState, err: &CommandError) -> St
             "cmd-error-pause-download",
             Some(&fluent_args!["error" => error.clone()]),
         ),
+        CommandError::RemoveDownload { error } => state.t_with_args(
+            "cmd-error-remove-download",
+            Some(&fluent_args!["error" => error.clone()]),
+        ),
         CommandError::ChangeFolder { error } => state.t_with_args(
             "cmd-error-change-folder",
             Some(&fluent_args!["error" => error.clone()]),

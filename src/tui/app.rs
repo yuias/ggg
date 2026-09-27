@@ -592,6 +592,10 @@ impl TuiApp {
     /// Handle normal mode keys
     /// Uses configurable keybindings from config
     async fn handle_normal_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
+        // A busy notice describes the previous action only; the action handled
+        // below sets it again if it hits a busy task too.
+        self.state.status_message = None;
+
         // Resolve key to action using configurable keybindings
         let action = self.state.keybinding_resolver.resolve(key, mods);
 
@@ -2077,14 +2081,24 @@ impl TuiApp {
             }
             FolderContextMenuAction::DeleteAll => {
                 // Delete all downloads in the current folder
+                let mut busy_count = 0;
                 if let Some(folder_id) = self.state.selected_folder_id_from_tree() {
                     if let Some(tasks) = self.state.folder_downloads.get(folder_id) {
                         let ids: Vec<_> = tasks.iter().map(|t| t.id).collect();
                         for id in ids {
-                            self.manager.remove_download(id).await;
+                            if let Err(e) = self.manager.remove_download(id).await {
+                                tracing::warn!("Failed to remove download {}: {}", id, e);
+                                busy_count += 1;
+                            }
                         }
                     }
                 }
+                self.state.status_message = if busy_count > 0 {
+                    let args = fluent::fluent_args! { "count" => busy_count };
+                    Some(self.state.t_with_args("status-normal-busy", Some(&args)))
+                } else {
+                    None
+                };
                 self.state.ui_mode = UiMode::Normal;
             }
             FolderContextMenuAction::ClearHistory => {
@@ -2115,6 +2129,7 @@ impl TuiApp {
             return Ok(());
         }
 
+        let mut busy_count = 0;
         for id in target_ids {
             if let Some(task) = self.manager.get_by_id(id).await {
                 if reference_downloading {
@@ -2125,6 +2140,7 @@ impl TuiApp {
                     if task.status == DownloadStatus::Downloading {
                         if let Err(e) = self.manager.pause_download(id).await {
                             tracing::warn!("Failed to pause download {}: {}", id, e);
+                            busy_count += 1;
                         }
                     }
                 } else {
@@ -2143,6 +2159,12 @@ impl TuiApp {
                 }
             }
         }
+        self.state.status_message = if busy_count > 0 {
+            let args = fluent::fluent_args! { "count" => busy_count };
+            Some(self.state.t_with_args("status-normal-busy", Some(&args)))
+        } else {
+            None
+        };
         self.save_queue().await?;
         Ok(())
     }
@@ -2155,14 +2177,27 @@ impl TuiApp {
         if !ids_to_delete.is_empty() {
             // Collect the deleted tasks as one batch so undo restores them all.
             let mut batch = Vec::new();
+            let mut busy_count = 0;
             for id in ids_to_delete {
-                if let Some(mut task) = self.manager.get_by_id(id).await {
-                    task.status = DownloadStatus::Deleted;
-                    self.manager.add_to_history(task.clone()).await;
-                    batch.push(task);
+                match self.manager.remove_download(id).await {
+                    Ok(Some(mut task)) => {
+                        task.status = DownloadStatus::Deleted;
+                        self.manager.add_to_history(task.clone()).await;
+                        batch.push(task);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("Failed to remove download {}: {}", id, e);
+                        busy_count += 1;
+                    }
                 }
-                self.manager.remove_download(id).await;
             }
+            self.state.status_message = if busy_count > 0 {
+                let args = fluent::fluent_args! { "count" => busy_count };
+                Some(self.state.t_with_args("status-normal-busy", Some(&args)))
+            } else {
+                None
+            };
             if !batch.is_empty() {
                 self.state.delete_history.push(batch);
             }

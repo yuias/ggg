@@ -632,6 +632,13 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
                 String::new()
             };
 
+            let status_hint = app
+                .state
+                .status_message
+                .as_ref()
+                .map(|msg| format!(" | {msg}"))
+                .unwrap_or_default();
+
             let current_folder_name = app.state.current_folder_name();
             let args = fluent_args! {
                 "folder" => current_folder_name.as_str(),
@@ -643,10 +650,11 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
                 FocusPane::DetailsPanel => "status-normal-actions-details",
             };
             let left = format!(
-                "{} | {}{} | {}",
+                "{} | {}{}{} | {}",
                 t_args("status-normal-folder", Some(&args)),
                 t(actions_key),
                 undo_hint,
+                status_hint,
                 t("status-normal-right")
             );
             // Version displayed on the right for main screen

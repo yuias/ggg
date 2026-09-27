@@ -386,12 +386,12 @@ impl DownloadManager {
         }
     }
 
-    pub async fn remove_download(&self, id: Uuid) -> Option<DownloadTask> {
-        // Cancel active download if running. Aborting drops the spawned task
-        // without running its cleanup, so the folder slot is released below.
-        if let Some(entry) = self.active_downloads.write().await.remove(&id) {
-            entry.handle.abort();
-        }
+    /// Removes `id`: stops its live handle (downloading or retry backoff)
+    /// and removes it from its folder queue. A caller already holding the
+    /// claim must call this, not `remove_download`, which would wait on its
+    /// own claim. A missing task returns `None`.
+    async fn remove_claimed(&self, id: Uuid, _claim: &StartClaim) -> Option<DownloadTask> {
+        self.stop_handle(id).await;
 
         // Snapshot the folder queues (cheap Arc clones) and drop the outer lock
         // before awaiting on individual queues, so a concurrent writer to
@@ -415,6 +415,16 @@ impl DownloadManager {
             self.emit(DownloadEvent::Removed { task_id: id });
         }
         removed
+    }
+
+    /// Waits up to the claim-wait budget for another operation holding
+    /// `id`'s claim (typically a start still running its beforeRequest
+    /// script) before giving up with `TaskBusy`, in which case nothing is
+    /// changed. Otherwise removes the task as `remove_claimed` does; see
+    /// that method for what removal itself covers.
+    pub async fn remove_download(&self, id: Uuid) -> Result<Option<DownloadTask>, TaskBusy> {
+        let claim = self.acquire_claim_waiting(id, self.claim_wait_budget).await?;
+        Ok(self.remove_claimed(id, &claim).await)
     }
 
     /// Starts a download for `id`. Concurrent calls for the same id collapse
@@ -2150,7 +2160,7 @@ mod tests {
             other => panic!("expected Added event, got {other:?}"),
         }
 
-        manager.remove_download(id).await;
+        manager.remove_download(id).await.expect("claim not held");
         match rx.try_recv() {
             Ok(DownloadEvent::Removed { task_id }) => assert_eq!(task_id, id),
             other => panic!("expected Removed event, got {other:?}"),
@@ -2404,8 +2414,8 @@ mod tests {
         let fake_id = Uuid::new_v4();
         let result = manager.remove_download(fake_id).await;
 
-        // Should return None for non-existent task
-        assert!(result.is_none());
+        // Should return Ok(None) for non-existent task
+        assert!(matches!(result, Ok(None)));
     }
 
     #[tokio::test]
@@ -3069,8 +3079,14 @@ mod tests {
         });
 
         // Give `edit_task_headers` time to acquire the claim before racing it.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(manager.is_start_in_progress(id), "edit must hold the claim by now");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !manager.is_start_in_progress(id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "edit did not claim the id within 2s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
 
         let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
         let start_result = manager.start_download(id, None, config).await;
@@ -3228,5 +3244,87 @@ mod tests {
         let task = manager.get_by_id(id).await.expect("task still exists");
         assert_eq!(task.status, DownloadStatus::Paused);
         assert_eq!(manager.get_active_count().await, 0);
+    }
+
+    /// `remove_download` must wait out a concurrent `start_download`'s
+    /// beforeRequest script round trip instead of racing it, then win: the
+    /// download it just spawned is stopped and the task is gone, with no
+    /// orphan handle left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_waits_for_in_flight_start() {
+        let manager = DownloadManager::new();
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let (script_tx, script_rx) = mpsc::channel::<ScriptRequest>();
+        // Never join this thread: nothing else drains the channel after the
+        // test's assertions run, and the retry loop's own clone would keep
+        // it open, so joining would hang.
+        let _responder = std::thread::spawn(move || {
+            while let Ok(req) = script_rx.recv() {
+                if let ScriptRequest::BeforeRequest { ctx, response, .. } = req {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = response.send((ctx, Ok(())));
+                }
+            }
+        });
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        let manager_start = manager.clone();
+        let start_handle = tokio::spawn(async move {
+            manager_start.start_download(id, Some(script_tx), config).await
+        });
+
+        // Let `start_download` acquire the claim before racing it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !manager.is_start_in_progress(id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "start did not claim the id within 2s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let remove_result = manager.remove_download(id).await;
+        match remove_result {
+            Ok(Some(_)) => {}
+            other => panic!("expected Ok(Some(_)), got {other:?}"),
+        }
+
+        let start_outcome = start_handle.await.unwrap().expect("start must not error");
+        assert_eq!(start_outcome, StartOutcome::Started);
+
+        assert!(manager.get_by_id(id).await.is_none(), "task must be gone");
+        assert_eq!(manager.run_state(id).await, RunState::Idle);
+        assert_eq!(manager.get_active_count().await, 0);
+    }
+
+    /// A remove that cannot take the claim within the budget must leave the
+    /// task untouched and report `TaskBusy`.
+    #[tokio::test]
+    async fn remove_returns_busy_after_budget() {
+        let mut manager = DownloadManager::new();
+        manager.set_claim_wait_budget(std::time::Duration::from_millis(100));
+
+        let task = DownloadTask::new("https://example.com/f".to_string(), "/tmp".into());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let claim = StartClaim::try_acquire(&manager.start_claims, id).expect("claim must be free");
+
+        let result = manager.remove_download(id).await;
+        match result {
+            Err(TaskBusy(busy_id)) => assert_eq!(busy_id, id),
+            other => panic!("expected TaskBusy, got {other:?}"),
+        }
+
+        assert!(
+            manager.get_by_id(id).await.is_some(),
+            "a busy remove must not change the task"
+        );
+
+        drop(claim);
     }
 }

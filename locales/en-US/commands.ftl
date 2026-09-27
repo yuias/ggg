@@ -6,6 +6,7 @@ cmd-error-invalid-config = Invalid config format
 cmd-error-scripts-disabled = Scripts are not enabled
 cmd-error-start-download = Failed to start download: { $error }
 cmd-error-pause-download = Failed to pause download: { $error }
+cmd-error-remove-download = Failed to remove download: { $error }
 cmd-error-change-folder = Failed to change folder: { $error }
 cmd-error-validation-failed = Validation failed: { $error }
 cmd-error-save-config = Failed to save config: { $error }
