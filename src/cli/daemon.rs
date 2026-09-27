@@ -95,12 +95,13 @@ pub async fn run_daemon(
 
     let shutdown = Arc::new(Notify::new());
 
-    // Auto-save and the event-triggered sweep share one task, selecting
-    // between the tick and the event receiver, so at most one sweep runs at
-    // a time. `start_download` only flips a task to `Downloading` after
-    // awaiting the beforeRequest script round-trip, so two sweeps running
-    // concurrently in separate tasks could both see the same task as
-    // `Pending` and start it twice.
+    // Auto-save and the event-triggered sweep share one task so that at most
+    // one sweep runs at a time; this is a convenience, not the guard against
+    // double starts. `start_download` holds an in-memory claim per id across
+    // the whole call, including the beforeRequest script round-trip, so pipe
+    // handlers can call `start_download` / `start_folder_tasks` /
+    // `start_all_tasks` directly, concurrently with this sweep, without a
+    // daemon-level lock.
     let sweep_manager = manager.clone();
     let sweep_config = config.clone();
     let sweep_sender = script_sender.clone();
