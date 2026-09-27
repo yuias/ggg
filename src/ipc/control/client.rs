@@ -1,10 +1,10 @@
-//! Client side of the daemon control pipe: `probe`, used by `bind` itself
-//! to tell a live daemon apart from a stale pipe name, and later by CLI
-//! routing to decide remote vs. standalone. `send` (request/response for
-//! real commands) is added together with CLI routing, and must run the same
-//! `owner::verify_server_owner` check as `probe` does here: right after
-//! opening the pipe and before its first write, returning
-//! `Err(anyhow!(owner::OWNER_MISMATCH_MSG))` on mismatch so `route` exits 5.
+//! Client side of the daemon control pipe: `probe`, used by `bind` itself to
+//! tell a live daemon apart from a stale pipe name and by CLI routing to
+//! decide remote vs. standalone, and `send`, used by CLI routing to carry out
+//! a routed request. `send` runs the same `owner::verify_server_owner` check
+//! as `probe` does here: right after opening the pipe and before its first
+//! write, returning `Err(anyhow!(owner::OWNER_MISMATCH_MSG))` on mismatch so
+//! `route` exits 5.
 
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,9 @@ const PIPE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 /// A `Pong` reply is tiny; this only guards against a misbehaving peer.
 const MAX_PROBE_RESPONSE_BYTES: u64 = 64 * 1024;
+/// Caps a single `send` response line; larger than the probe cap because a
+/// `Tasks`/`List` response can carry many `DownloadTask`s.
+const MAX_SEND_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonProbe {
@@ -90,4 +93,76 @@ async fn ping(mut client: NamedPipeClient) -> std::io::Result<ControlResponse> {
         ));
     }
     serde_json::from_str(String::from_utf8_lossy(&buf).trim()).map_err(std::io::Error::other)
+}
+
+/// Opens a fresh connection, verifies the server-owner check, sends one
+/// request line, and reads one response line. Every call opens its own
+/// connection: the accept loop always keeps a spare instance available
+/// (`server.rs`), so there is no benefit to holding a connection open across
+/// CLI commands, and it keeps this function stateless. `timeout = None`
+/// waits without a limit; routing decides how long to wait per request.
+pub async fn send(
+    pipe_name: &str,
+    req: &ControlRequest,
+    timeout: Option<Duration>,
+) -> anyhow::Result<ControlResponse> {
+    let client = open_for_send(pipe_name).await?;
+
+    if let Err(detail) = owner::verify_server_owner(&client) {
+        tracing::warn!("control pipe {pipe_name} failed server owner check: {detail}");
+        return Err(anyhow::anyhow!(OWNER_MISMATCH_MSG));
+    }
+
+    let round_trip = send_request(client, req);
+    match timeout {
+        Some(d) => tokio::time::timeout(d, round_trip)
+            .await
+            .map_err(|_| anyhow::anyhow!("control pipe request timed out"))?,
+        None => round_trip.await,
+    }
+}
+
+async fn open_for_send(pipe_name: &str) -> anyhow::Result<NamedPipeClient> {
+    let deadline = Instant::now() + PIPE_BUSY_RETRY_BUDGET;
+    loop {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(c) => return Ok(c),
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                if Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!("control pipe busy"));
+                }
+                tokio::time::sleep(PIPE_BUSY_RETRY_INTERVAL).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("failed to open control pipe: {e}")),
+        }
+    }
+}
+
+async fn send_request(
+    mut client: NamedPipeClient,
+    req: &ControlRequest,
+) -> anyhow::Result<ControlResponse> {
+    let mut line = serde_json::to_string(req)?;
+    line.push('\n');
+    client.write_all(line.as_bytes()).await?;
+    client.flush().await?;
+
+    let mut reader = BufReader::new(client);
+    let mut buf = Vec::new();
+    let n = (&mut reader)
+        .take(MAX_SEND_RESPONSE_BYTES)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if n == 0 {
+        return Err(anyhow::anyhow!("control pipe closed before responding"));
+    }
+    if !buf.ends_with(b"\n") {
+        return if n as u64 == MAX_SEND_RESPONSE_BYTES {
+            Err(anyhow::anyhow!("daemon response exceeds 16 MiB"))
+        } else {
+            Err(anyhow::anyhow!("control pipe closed mid-response"))
+        };
+    }
+    let resp: ControlResponse = serde_json::from_str(String::from_utf8_lossy(&buf).trim())?;
+    Ok(resp)
 }

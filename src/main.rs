@@ -67,13 +67,29 @@ async fn main() -> Result<()> {
         ggg::util::paths::set_config_dir_override(Some(config_dir.clone()));
     }
 
+    // Computed once: routing needs it for every subcommand, and a headless
+    // start below needs it again for the single-instance bind.
+    let pipe_name = ggg::ipc::control::protocol::default_control_pipe_name();
+
+    // Route before anything else touches the config or the queue files, so a
+    // routed command's daemon round trip never pays for a load it doesn't
+    // need, and a refused command never gets a chance to write standalone.
+    if let Some(ref command) = cli.command {
+        match ggg::cli::remote::route(command, &pipe_name).await {
+            ggg::cli::remote::RouteDecision::Handled(code) => {
+                drop(log_guard);
+                std::process::exit(code);
+            }
+            ggg::cli::remote::RouteDecision::Standalone => {}
+        }
+    }
+
     // Bind the single-instance control pipe before loading the queue, so a
     // second `--headless` for the same config directory fails before it can
     // read or write any queue files.
     #[cfg(windows)]
     let control_binding: Option<ggg::cli::daemon_ops::ControlBinding> =
         if cli.command.is_none() && cli.headless {
-            let pipe_name = ggg::ipc::control::protocol::default_control_pipe_name();
             match ggg::ipc::control::server::bind(&pipe_name).await {
                 Ok(bound) => Some(bound),
                 Err(ggg::ipc::control::server::BindError::AlreadyRunning { pid }) => {

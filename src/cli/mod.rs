@@ -5,6 +5,7 @@ pub mod output;
 pub mod handler;
 pub mod daemon;
 pub mod daemon_ops;
+pub mod remote;
 pub mod bridge;
 
 /// GGG - A classic-style download manager
@@ -247,6 +248,30 @@ pub enum Commands {
         #[command(subcommand)]
         action: BridgeAction,
     },
+
+    /// Control a running daemon for this config directory
+    Daemon {
+        /// Daemon action
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+}
+
+/// Daemon control actions, sent over the control pipe.
+#[derive(Subcommand, Debug)]
+pub enum DaemonAction {
+    /// Check whether a daemon is running for this config directory
+    Ping,
+
+    /// Show daemon status (pid, uptime, queue counts)
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Ask a running daemon to shut down
+    Stop,
 }
 
 /// Configuration actions

@@ -52,6 +52,10 @@ pub async fn handle_command(
             BridgeAction::Uninstall => bridge::handle_uninstall().await,
             BridgeAction::Status => bridge::handle_status().await,
         },
+        // `route` handles every `Daemon` action when a daemon is reachable;
+        // this arm is only reached by the probe-then-write race `route`'s
+        // doc comment accepts, or when no daemon is running at all.
+        Commands::Daemon { .. } => handle_daemon_standalone(),
     };
 
     match result {
@@ -105,6 +109,14 @@ async fn handle_add(
 
     manager.save_queue_to_folders().await?;
     Ok(error::SUCCESS)
+}
+
+/// Standalone fallback for `daemon ping|status|stop`: these commands are
+/// only meaningful against a running daemon, so there is nothing to do here
+/// beyond reporting that none is reachable.
+fn handle_daemon_standalone() -> Result<i32> {
+    eprintln!("no ggg daemon running");
+    Ok(error::DAEMON_UNREACHABLE)
 }
 
 /// Parse a task ID string, returning a uniform error on malformed input.
