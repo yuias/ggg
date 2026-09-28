@@ -962,6 +962,14 @@ mod tests {
             }),
             RemoteClass::Routed
         );
+        assert_eq!(
+            classify(&Commands::Config {
+                action: ConfigAction::Get {
+                    key: "download.max_concurrent".to_string(),
+                },
+            }),
+            RemoteClass::ReadOnly
+        );
     }
 
     #[test]
