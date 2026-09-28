@@ -854,6 +854,12 @@ async fn handle_debug_task(id_str: String, manager: &DownloadManager, json: bool
         .ok_or_else(|| anyhow::anyhow!("Task not found"))?;
 
     if json {
+        let mut task = task.clone();
+        for (name, value) in task.headers.iter_mut() {
+            if crate::util::redact::is_sensitive_header(name) {
+                *value = crate::util::redact::REDACTED.to_string();
+            }
+        }
         println!("{}", serde_json::to_string_pretty(&task)?);
     } else {
         println!("Task Details\n");
@@ -888,7 +894,7 @@ async fn handle_debug_task(id_str: String, manager: &DownloadManager, json: bool
         if !task.headers.is_empty() {
             println!("\nHeaders:");
             for (key, value) in &task.headers {
-                println!("  {}: {}", key, value);
+                println!("  {}: {}", key, crate::util::redact::display_header_value(key, value));
             }
         }
     }
@@ -1171,7 +1177,7 @@ async fn handle_script_test(
             if !ctx.headers.is_empty() {
                 println!("  Headers:");
                 for (key, value) in &ctx.headers {
-                    println!("    {}: {}", key, value);
+                    println!("    {}: {}", key, crate::util::redact::display_header_value(key, value));
                 }
             }
         }
