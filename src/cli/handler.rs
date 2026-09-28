@@ -26,8 +26,8 @@ pub async fn handle_command(
     manager: DownloadManager,
 ) -> i32 {
     let result = match command {
-        Commands::Add { url, folder, referrer, header, immediate, quiet, json } => {
-            handle_add(url, folder, referrer, header, immediate, quiet, json, &state, &manager).await
+        Commands::Add { url, folder, referrer, header, immediate, quiet, json, no_expand } => {
+            handle_add(url, folder, referrer, header, immediate, quiet, json, no_expand, &state, &manager).await
         }
         Commands::List { json, status, folder } => handle_list(&state, &manager, json, status, folder).await,
         Commands::Start { id, wait } => handle_start(id, &state, &manager, wait).await,
@@ -44,7 +44,9 @@ pub async fn handle_command(
         Commands::StartAll { folder } => handle_start_all(&state, &manager, folder).await,
         Commands::PauseAll { folder } => handle_pause_all(&state, &manager, folder).await,
         Commands::Clear { status, folder } => handle_clear(&manager, status, folder).await,
-        Commands::BatchAdd { file, folder } => handle_batch_add(&state, &manager, file, folder).await,
+        Commands::BatchAdd { file, folder, no_expand } => {
+            handle_batch_add(&state, &manager, file, folder, no_expand).await
+        }
         Commands::Priority { id, set } => handle_priority(&manager, id, set).await,
         Commands::Modify { id, referrer, clear_referrer, header, remove_header } => {
             handle_modify(&manager, id, referrer, clear_referrer, header, remove_header).await
@@ -91,6 +93,7 @@ async fn handle_add(
     immediate: bool,
     quiet: bool,
     json: bool,
+    no_expand: bool,
     state: &AppState,
     manager: &DownloadManager,
 ) -> Result<i32> {
@@ -128,10 +131,16 @@ async fn handle_add(
     };
 
     // Expand range patterns like `[1-10]` into individual URLs so the CLI
-    // matches the TUI's add behavior.
+    // matches the TUI's add behavior, unless the caller asked for the URL
+    // literally (e.g. a real URL that contains `[...]`).
     let mut added = Vec::new();
     let mut skipped = Vec::new();
-    for u in crate::util::url_expansion::expand_url(&url) {
+    let expanded_urls = if no_expand {
+        vec![url]
+    } else {
+        crate::util::url_expansion::expand_url(&url)
+    };
+    for u in expanded_urls {
         // Reject empty / non-http(s)/ftp URLs up front instead of queueing
         // garbage that only fails later.
         if !is_valid_download_url(&u) {
@@ -1558,15 +1567,16 @@ async fn handle_clear(
 
 /// Enqueue path for `batch-add`, mirroring `handle_add`'s loop so folder
 /// rules and duplicate handling match: resolves the target folder once, then
-/// for each input line expands `[1-10]`-style range patterns, validates,
-/// builds, and enqueues every resulting URL through the same
-/// `build_task`/`enqueue` calls the daemon's `Add` handler uses. `Err(())`
-/// means an unknown folder.
+/// for each input line expands `[1-10]`-style range patterns (unless
+/// `no_expand` is set), validates, builds, and enqueues every resulting URL
+/// through the same `build_task`/`enqueue` calls the daemon's `Add` handler
+/// uses. `Err(())` means an unknown folder.
 async fn enqueue_urls(
     state: &AppState,
     manager: &DownloadManager,
     urls: &[String],
     folder: Option<&str>,
+    no_expand: bool,
 ) -> Result<(Vec<AddedTask>, Vec<SkippedUrl>), ()> {
     let config = state.config.read().await.clone();
     let folder_id = resolve_target_folder(&config, folder).map_err(|_| ())?;
@@ -1575,7 +1585,12 @@ async fn enqueue_urls(
     let mut added = Vec::new();
     let mut skipped = Vec::new();
     for line in urls {
-        for u in crate::util::url_expansion::expand_url(line) {
+        let expanded: Vec<String> = if no_expand {
+            vec![line.clone()]
+        } else {
+            crate::util::url_expansion::expand_url(line)
+        };
+        for u in expanded {
             if !is_valid_download_url(&u) {
                 skipped.push(SkippedUrl {
                     url: u,
@@ -1614,6 +1629,7 @@ async fn handle_batch_add(
     manager: &DownloadManager,
     file: String,
     folder: Option<String>,
+    no_expand: bool,
 ) -> Result<i32> {
     let file_path = PathBuf::from(&file);
 
@@ -1632,7 +1648,7 @@ async fn handle_batch_add(
         return Ok(error::SUCCESS);
     }
 
-    let (added, skipped) = match enqueue_urls(state, manager, &urls, folder.as_deref()).await {
+    let (added, skipped) = match enqueue_urls(state, manager, &urls, folder.as_deref(), no_expand).await {
         Ok(result) => result,
         Err(()) => {
             eprintln!("Error: unknown folder");
@@ -2005,7 +2021,7 @@ mod tests {
         let manager = DownloadManager::new();
 
         let urls = vec!["https://example.com/f.zip".to_string()];
-        let (added, skipped) = enqueue_urls(&state, &manager, &urls, Some(folder_id.as_str()))
+        let (added, skipped) = enqueue_urls(&state, &manager, &urls, Some(folder_id.as_str()), false)
             .await
             .expect("known folder");
 
@@ -2027,7 +2043,7 @@ mod tests {
             "https://example.com/f.zip".to_string(),
             "https://example.com/f.zip".to_string(),
         ];
-        let (added, skipped) = enqueue_urls(&state, &manager, &urls, Some(folder_id.as_str()))
+        let (added, skipped) = enqueue_urls(&state, &manager, &urls, Some(folder_id.as_str()), false)
             .await
             .expect("known folder");
 
@@ -2044,9 +2060,59 @@ mod tests {
         let manager = DownloadManager::new();
 
         let urls = vec!["https://example.com/f.zip".to_string()];
-        let result = enqueue_urls(&state, &manager, &urls, Some("no-such-folder")).await;
+        let result = enqueue_urls(&state, &manager, &urls, Some("no-such-folder"), false).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_no_expand_keeps_brackets_literal() {
+        let (config, folder_id) = config_with_folder("downloads", false);
+        let state = AppState::new(config);
+        let manager = DownloadManager::new();
+
+        let urls = vec!["https://example.com/f[1-3].zip".to_string()];
+        let (added, skipped) = enqueue_urls(&state, &manager, &urls, Some(folder_id.as_str()), true)
+            .await
+            .expect("known folder");
+
+        assert!(skipped.is_empty());
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].url, "https://example.com/f[1-3].zip");
+    }
+
+    // `handle_add` saves the queue to disk when a task is added, so this
+    // needs an isolated config directory like the daemon-side save tests.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn standalone_add_no_expand_keeps_brackets_literal() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+
+        let state = AppState::new(Config::default());
+        let manager = DownloadManager::new();
+
+        let code = handle_add(
+            "https://example.com/f[1-3].zip".to_string(),
+            None,
+            None,
+            vec![],
+            false,
+            false,
+            false,
+            true,
+            &state,
+            &manager,
+        )
+        .await
+        .expect("handle_add succeeds");
+
+        assert_eq!(code, error::SUCCESS);
+        let tasks = manager.get_all_downloads().await;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].url, "https://example.com/f[1-3].zip");
+
+        crate::util::paths::set_config_dir_override(None);
     }
 
     /// A task in retry backoff (live handle, persisted status `Paused`) must

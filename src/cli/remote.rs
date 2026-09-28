@@ -244,7 +244,7 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
     use crate::ipc::control::client;
 
     match cmd {
-        Commands::Add { url, folder, referrer, header, immediate, quiet, json } => {
+        Commands::Add { url, folder, referrer, header, immediate, quiet, json, no_expand } => {
             let mut headers = Vec::with_capacity(header.len());
             for h in header {
                 match parse_header_arg(h) {
@@ -263,6 +263,7 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
                 referrer: referrer.as_ref().map(|r| r.0.clone()),
                 headers,
                 immediate: *immediate,
+                no_expand: *no_expand,
             };
             match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
                 Ok(ControlResponse::Added { added, skipped }) => {
@@ -926,6 +927,7 @@ mod tests {
                 immediate: false,
                 quiet: false,
                 json: false,
+                no_expand: false,
             }),
             RemoteClass::Routed
         );

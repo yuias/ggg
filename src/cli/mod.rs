@@ -126,6 +126,10 @@ pub enum Commands {
         /// Print the result as JSON
         #[arg(long, group = "add_output")]
         json: bool,
+
+        /// Treat [n-m] in URLs literally instead of expanding it
+        #[arg(long)]
+        no_expand: bool,
     },
 
     /// List all downloads
@@ -313,6 +317,10 @@ pub enum Commands {
         /// Folder ID to assign
         #[arg(long)]
         folder: Option<String>,
+
+        /// Treat [n-m] in URLs literally instead of expanding it
+        #[arg(long)]
+        no_expand: bool,
     },
 
     /// Change a queued download's referrer/headers

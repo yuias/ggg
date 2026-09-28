@@ -128,7 +128,8 @@ pub async fn dispatch(req: ControlRequest, ctx: &DaemonContext) -> ControlRespon
             referrer,
             headers,
             immediate,
-        } => dispatch_add(url, folder, referrer, headers, immediate, ctx).await,
+            no_expand,
+        } => dispatch_add(url, folder, referrer, headers, immediate, no_expand, ctx).await,
         ControlRequest::List { statuses, folder } => dispatch_list(statuses, folder, ctx).await,
         ControlRequest::Get { id } => dispatch_get(id, ctx).await,
         ControlRequest::Start { id } => dispatch_start(id, ctx).await,
@@ -732,6 +733,7 @@ async fn dispatch_add(
     referrer: Option<String>,
     headers: Vec<(String, String)>,
     immediate: bool,
+    no_expand: bool,
     ctx: &DaemonContext,
 ) -> ControlResponse {
     let config = ctx.state.config.read().await.clone();
@@ -749,7 +751,12 @@ async fn dispatch_add(
     let mut added = Vec::new();
     let mut skipped = Vec::new();
 
-    for u in crate::util::url_expansion::expand_url(&url) {
+    let expanded = if no_expand {
+        vec![url]
+    } else {
+        crate::util::url_expansion::expand_url(&url)
+    };
+    for u in expanded {
         if !crate::cli::handler::is_valid_download_url(&u) {
             skipped.push(SkippedUrl {
                 url: u,
@@ -957,6 +964,7 @@ mod tests {
                 referrer: Some("https://example.org/".to_string()),
                 headers: vec![("X-Test".to_string(), "1".to_string())],
                 immediate: false,
+                no_expand: false,
             },
             &ctx,
         )
@@ -994,6 +1002,7 @@ mod tests {
                 referrer: None,
                 headers: vec![],
                 immediate: false,
+                no_expand: false,
             },
             &ctx,
         )
@@ -1014,6 +1023,7 @@ mod tests {
                 referrer: None,
                 headers: vec![],
                 immediate: false,
+                no_expand: false,
             },
             &ctx,
         )
@@ -1023,6 +1033,31 @@ mod tests {
                 assert!(added.is_empty());
                 assert_eq!(skipped.len(), 1);
                 assert_eq!(skipped[0].reason, "invalid_url");
+            }
+            other => panic!("expected Added, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_add_no_expand_keeps_brackets_literal() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::Add {
+                url: "https://example.com/f[1-3].zip".to_string(),
+                folder: None,
+                referrer: None,
+                headers: vec![],
+                immediate: false,
+                no_expand: true,
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Added { added, skipped } => {
+                assert!(skipped.is_empty());
+                assert_eq!(added.len(), 1);
+                assert_eq!(added[0].url, "https://example.com/f[1-3].zip");
             }
             other => panic!("expected Added, got {other:?}"),
         }

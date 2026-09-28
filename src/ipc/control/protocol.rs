@@ -100,6 +100,11 @@ pub enum ControlRequest {
         referrer: Option<String>,
         headers: Vec<(String, String)>,
         immediate: bool,
+        /// Treat `[n-m]` in `url` literally instead of expanding it.
+        /// `#[serde(default)]` so a request from an older client, which
+        /// never sent this field, still deserializes (as `false`).
+        #[serde(default)]
+        no_expand: bool,
     },
     List {
         statuses: Vec<DownloadStatus>,
@@ -305,10 +310,23 @@ mod tests {
             referrer: Some("https://example.org/".to_string()),
             headers: vec![("X-Test".to_string(), "1".to_string())],
             immediate: true,
+            no_expand: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ControlRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    /// An older client's request never sent `no_expand`; `#[serde(default)]`
+    /// must still let it deserialize, defaulting to `false`.
+    #[test]
+    fn add_request_without_no_expand_defaults_to_false() {
+        let json = r#"{"type":"add","url":"https://example.com/file","folder":null,"referrer":null,"headers":[],"immediate":false}"#;
+        let req: ControlRequest = serde_json::from_str(json).unwrap();
+        match req {
+            ControlRequest::Add { no_expand, .. } => assert!(!no_expand),
+            other => panic!("expected Add, got {other:?}"),
+        }
     }
 
     fn all_request_variants() -> Vec<ControlRequest> {
@@ -322,6 +340,7 @@ mod tests {
                 referrer: None,
                 headers: vec![],
                 immediate: false,
+                no_expand: false,
             },
             ControlRequest::List {
                 statuses: vec![DownloadStatus::Pending, DownloadStatus::Error],
@@ -532,6 +551,7 @@ mod tests {
             referrer: None,
             headers: vec![],
             immediate: false,
+            no_expand: false,
         }
         .is_mutating());
         assert!(ControlRequest::Start { id: Uuid::nil() }.is_mutating());
