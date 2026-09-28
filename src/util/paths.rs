@@ -24,6 +24,9 @@ pub fn get_config_dir_override() -> Option<PathBuf> {
 /// 5. Platform user config directory (`%APPDATA%\ggg\` on Windows, `~/.config/ggg` on Unix)
 ///
 /// If no config directory is found, creates one in the XDG-style home config directory.
+///
+/// Test binaries without an override or `GGG_CONFIG_DIR` stop before step 3 and
+/// get a per-process scratch directory instead.
 pub fn find_config_directory() -> Result<PathBuf> {
     // Priority 1: Override from --config flag or tests
     if let Some(override_path) = get_config_dir_override() {
@@ -43,6 +46,21 @@ pub fn find_config_directory() -> Result<PathBuf> {
         }
     }
 
+    // A test without an override would otherwise read and overwrite the
+    // developer's real settings, queues and history (and `Config::save` deletes
+    // folder directories it does not know). Redirecting instead of panicking
+    // keeps parallel tests stable while a serial test clears the override.
+    if is_test_binary() {
+        return test_fallback_config_dir();
+    }
+
+    find_installed_config_directory()
+}
+
+/// Priorities 3-5 of `find_config_directory`: directories tied to the
+/// installation and the user account, created in the home config directory
+/// when none exists.
+fn find_installed_config_directory() -> Result<PathBuf> {
     // Priority 3: Executable directory (portable install alongside the binary)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
@@ -178,6 +196,27 @@ pub fn get_locale_data_dir() -> Result<PathBuf> {
     let data_dir = dirs::data_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine user data directory"))?;
     Ok(data_dir.join("ggg").join("locales"))
+}
+
+/// Unit tests set `cfg(test)`; integration-test and doctest binaries do not,
+/// but cargo builds all of them into `target/<profile>/deps/`, where a real
+/// `ggg` binary never runs from.
+fn is_test_binary() -> bool {
+    cfg!(test)
+        || std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().and_then(|p| p.file_name()).map(|n| n == "deps"))
+            .unwrap_or(false)
+}
+
+/// One scratch directory per test process, never the real config directory.
+fn test_fallback_config_dir() -> Result<PathBuf> {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        std::env::temp_dir().join(format!("ggg-test-config-{}", std::process::id()))
+    });
+    std::fs::create_dir_all(dir).context("Failed to create test config directory")?;
+    Ok(dir.clone())
 }
 
 /// Get absolute path to application-wide logs directory
@@ -319,9 +358,20 @@ mod tests {
         // user config directory (`%APPDATA%\ggg` on Windows).
         let xdg_config = get_xdg_config_dir().unwrap();
         if xdg_config.exists() {
-            let found_dir = find_config_directory().unwrap();
+            // Read-only here: the directory exists, so nothing is created.
+            let found_dir = find_installed_config_directory().unwrap();
             assert_eq!(found_dir, xdg_config);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_binary_without_override_never_gets_real_config_dir() {
+        reset_test_state();
+        let found = find_config_directory().unwrap();
+        assert_ne!(found, get_xdg_config_dir().unwrap());
+        assert_ne!(found, get_user_config_dir().unwrap());
+        assert!(found.starts_with(std::env::temp_dir()));
     }
 
     #[test]
