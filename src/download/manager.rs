@@ -427,6 +427,14 @@ impl DownloadManager {
         Ok(self.remove_claimed(id, &claim).await)
     }
 
+    /// Batch version of `remove_download`: removes every id concurrently
+    /// instead of paying the claim-wait budget once per id, for the same
+    /// reason `pause_in_flight` does (see its comment). Results are in `ids`
+    /// order.
+    pub async fn remove_many(&self, ids: &[Uuid]) -> Vec<Result<Option<DownloadTask>, TaskBusy>> {
+        futures_util::future::join_all(ids.iter().map(|&id| self.remove_download(id))).await
+    }
+
     /// Starts a download for `id`. Concurrent calls for the same id collapse
     /// into a single start: only the first caller to claim `id` proceeds, and
     /// the rest return `Ok(Busy)` immediately without touching the task. A
@@ -1338,6 +1346,14 @@ impl DownloadManager {
         self.write_paused_status(id).await;
         drop(claim);
         Ok(true)
+    }
+
+    /// Batch version of `pause_if_in_flight`: pauses every id concurrently
+    /// instead of paying the claim-wait budget once per id, for the same
+    /// reason `pause_in_flight` does (see its comment). Results are in `ids`
+    /// order.
+    pub async fn pause_many_if_in_flight(&self, ids: &[Uuid]) -> Vec<Result<bool, TaskBusy>> {
+        futures_util::future::join_all(ids.iter().map(|&id| self.pause_if_in_flight(id))).await
     }
 
     /// Applies a header edit to a queued task. Takes the same start claim
@@ -3508,6 +3524,64 @@ mod tests {
             manager.get_by_id(id).await.expect("task exists").status,
             DownloadStatus::Error,
             "a stale candidate must not have its terminal status overwritten"
+        );
+    }
+
+    /// `remove_many` must run its per-id claim waits concurrently: three busy
+    /// ids at a 300ms budget must together take well under 3 * 300ms.
+    #[tokio::test]
+    async fn remove_many_busy_ids_waits_one_budget() {
+        let mut manager = DownloadManager::new();
+        manager.set_claim_wait_budget(std::time::Duration::from_millis(300));
+
+        let mut ids = Vec::new();
+        let mut claims = Vec::new();
+        for i in 0..3 {
+            let task = DownloadTask::new(format!("https://example.com/{i}.bin"), "/tmp".into());
+            let id = task.id;
+            manager.add_download(task).await;
+            claims.push(StartClaim::try_acquire(&manager.start_claims, id).expect("claim must be free"));
+            ids.push(id);
+        }
+
+        let start = tokio::time::Instant::now();
+        let results = manager.remove_many(&ids).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 3);
+        for result in results {
+            match result {
+                Err(TaskBusy(_)) => {}
+                other => panic!("expected TaskBusy, got {other:?}"),
+            }
+        }
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "batch remove of busy ids took {elapsed:?}, expected one shared claim-wait budget"
+        );
+
+        drop(claims);
+    }
+
+    /// `pause_many_if_in_flight` skips a task that isn't in flight, reporting
+    /// `Ok(false)` without changing its status.
+    #[tokio::test]
+    async fn pause_many_skips_not_in_flight() {
+        let manager = DownloadManager::new();
+
+        let task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let results = manager.pause_many_if_in_flight(&[id]).await;
+        match results.as_slice() {
+            [Ok(false)] => {}
+            other => panic!("expected [Ok(false)], got {other:?}"),
+        }
+
+        assert_eq!(
+            manager.get_by_id(id).await.expect("task exists").status,
+            DownloadStatus::Pending
         );
     }
 }

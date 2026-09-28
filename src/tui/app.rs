@@ -2085,8 +2085,8 @@ impl TuiApp {
                 if let Some(folder_id) = self.state.selected_folder_id_from_tree() {
                     if let Some(tasks) = self.state.folder_downloads.get(folder_id) {
                         let ids: Vec<_> = tasks.iter().map(|t| t.id).collect();
-                        for id in ids {
-                            if let Err(e) = self.manager.remove_download(id).await {
+                        for (id, result) in ids.iter().copied().zip(self.manager.remove_many(&ids).await) {
+                            if let Err(e) = result {
                                 tracing::warn!("Failed to remove download {}: {}", id, e);
                                 busy_count += 1;
                             }
@@ -2132,30 +2132,44 @@ impl TuiApp {
         }
 
         let mut busy_count = 0;
-        for id in target_ids {
-            if reference_in_flight {
-                // Reference item is in flight → pause in-flight targets, so
-                // a target still in retry backoff is paused too. A busy
-                // claim (start still running its beforeRequest script) is an
-                // expected outcome, not a reason to tear down the TUI.
+        if reference_in_flight {
+            // Reference item is in flight → pause in-flight targets, so a
+            // target still in retry backoff is paused too. A busy claim
+            // (start still running its beforeRequest script) is an expected
+            // outcome, not a reason to tear down the TUI. Pausing is done as
+            // one batch so N busy targets wait one claim-wait budget total,
+            // not N budgets.
+            let mut in_flight_ids = Vec::new();
+            for id in target_ids {
                 if self.manager.is_in_flight(id).await {
-                    if let Err(e) = self.manager.pause_download(id).await {
-                        tracing::warn!("Failed to pause download {}: {}", id, e);
-                        busy_count += 1;
-                    }
+                    in_flight_ids.push(id);
                 }
-            } else if let Some(task) = self.manager.get_by_id(id).await {
-                // Reference item is not in flight → start startable items
-                match task.status {
-                    DownloadStatus::Pending | DownloadStatus::Paused | DownloadStatus::Error => {
-                        // A refused start (folder limit reached, circuit
-                        // breaker open) is an expected outcome, not a reason
-                        // to tear down the TUI.
-                        if let Err(e) = self.manager.start_download(id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await {
-                            tracing::warn!("Failed to start download {}: {}", id, e);
+            }
+            for (id, result) in in_flight_ids
+                .iter()
+                .copied()
+                .zip(self.manager.pause_many_if_in_flight(&in_flight_ids).await)
+            {
+                if let Err(e) = result {
+                    tracing::warn!("Failed to pause download {}: {}", id, e);
+                    busy_count += 1;
+                }
+            }
+        } else {
+            for id in target_ids {
+                if let Some(task) = self.manager.get_by_id(id).await {
+                    // Reference item is not in flight → start startable items
+                    match task.status {
+                        DownloadStatus::Pending | DownloadStatus::Paused | DownloadStatus::Error => {
+                            // A refused start (folder limit reached, circuit
+                            // breaker open) is an expected outcome, not a
+                            // reason to tear down the TUI.
+                            if let Err(e) = self.manager.start_download(id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await {
+                                tracing::warn!("Failed to start download {}: {}", id, e);
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -2178,8 +2192,9 @@ impl TuiApp {
             // Collect the deleted tasks as one batch so undo restores them all.
             let mut batch = Vec::new();
             let mut busy_count = 0;
-            for id in ids_to_delete {
-                match self.manager.remove_download(id).await {
+            let results = self.manager.remove_many(&ids_to_delete).await;
+            for (id, result) in ids_to_delete.iter().copied().zip(results) {
+                match result {
                     Ok(Some(mut task)) => {
                         task.status = DownloadStatus::Deleted;
                         self.manager.add_to_history(task.clone()).await;
