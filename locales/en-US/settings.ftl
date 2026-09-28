@@ -71,7 +71,13 @@ settings-referrer-url-origin = URL Origin
 settings-referrer-custom = Custom
 
 # Settings Screen Sections
-settings-section-application = Application Settings
-settings-section-folders = Folder Settings
 settings-new-folder = New Folder
 settings-no-folders = No folders configured
+
+# Settings tabs
+settings-tab-general = General
+settings-tab-downloads = Downloads
+settings-tab-scripts = Scripts
+settings-tab-folders = Folders
+settings-hint-switch-tab = Tab/Shift+Tab: switch tabs
+settings-hint-close = Esc/q/x: close

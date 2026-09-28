@@ -71,7 +71,13 @@ settings-referrer-url-origin = URLサーバー部分
 settings-referrer-custom = カスタム
 
 # Settings Screen Sections
-settings-section-application = アプリケーション設定
-settings-section-folders = フォルダ設定
 settings-new-folder = 新しいフォルダ
 settings-no-folders = フォルダが設定されていません
+
+# Settings tabs
+settings-tab-general = 一般
+settings-tab-downloads = ダウンロード
+settings-tab-scripts = スクリプト
+settings-tab-folders = フォルダ
+settings-hint-switch-tab = Tab/Shift+Tab: タブ切り替え
+settings-hint-close = Esc/q/x: 閉じる

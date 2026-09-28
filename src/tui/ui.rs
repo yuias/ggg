@@ -842,8 +842,10 @@ fn render_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
 
     // Render section content
     match app.state.settings_section {
-        SettingsSection::Application => render_application_settings(app, f, chunks[1]),
-        SettingsSection::Folder => {
+        SettingsSection::General | SettingsSection::Downloads | SettingsSection::Scripts => {
+            render_application_settings(app, f, chunks[1])
+        }
+        SettingsSection::Folders => {
             // Split into left (folder list) and right (details/editor) panels
             let folder_chunks = Layout::default()
                 .direction(Direction::Horizontal)
@@ -914,11 +916,14 @@ fn render_rename_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
 fn render_settings_tabs(app: &TuiApp, f: &mut Frame, area: Rect) {
     use crate::tui::state::SettingsSection;
 
-    let titles = vec!["Application", "Folders"];
-    let selected_index = match app.state.settings_section {
-        SettingsSection::Application => 0,
-        SettingsSection::Folder => 1,
-    };
+    let titles: Vec<String> = SettingsSection::ALL
+        .iter()
+        .map(|section| app.state.t(section.label_key()))
+        .collect();
+    let selected_index = SettingsSection::ALL
+        .iter()
+        .position(|s| *s == app.state.settings_section)
+        .unwrap_or(0);
 
     let tabs = Tabs::new(titles.clone())
         .block(
@@ -943,14 +948,14 @@ fn render_settings_tabs(app: &TuiApp, f: &mut Frame, area: Rect) {
     let inner_x = area.x + 1;
     let inner_y = area.y + 1;
 
-    // Calculate tab positions (tabs are separated by " | " which is 3 chars)
-    // Each tab has some padding around the text
+    // Calculate tab positions (tabs are separated by " │ " which is 3 cells
+    // wide); use display width, not byte length, so CJK labels line up.
     let mut tab_rects = Vec::new();
     let mut current_x = inner_x;
 
     for (idx, title) in titles.iter().enumerate() {
-        // Tab width: title length + 2 for padding
-        let tab_width = title.len() as u16 + 2;
+        // Tab width: display width + 2 for padding
+        let tab_width = UnicodeWidthStr::width(title.as_str()) as u16 + 2;
         let tab_rect = Rect {
             x: current_x,
             y: inner_y,
@@ -959,7 +964,7 @@ fn render_settings_tabs(app: &TuiApp, f: &mut Frame, area: Rect) {
         };
         tab_rects.push((idx, tab_rect));
 
-        // Move to next tab position (tab width + separator " | " = 3)
+        // Move to next tab position (tab width + separator " │ " = 3)
         current_x += tab_width + 3;
     }
 
@@ -971,7 +976,7 @@ fn render_settings_tabs(app: &TuiApp, f: &mut Frame, area: Rect) {
 
 /// Render application settings
 fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
-    use crate::tui::state::ApplicationSettingsField;
+    use crate::tui::state::{ApplicationSettingsField, SettingsSection};
 
     let config = app.state.app_state.config.try_read();
     let mut lines = Vec::new();
@@ -985,16 +990,18 @@ fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
     let error_color = theme::STATUS_ERROR;
     let muted_color = theme::TEXT_MUTED;
 
+    let current_section = app.state.settings_section;
+
     if let Ok(config) = config {
         lines.push(Line::from(Span::styled(
-            app.state.t("settings-section-application"),
+            app.state.t(current_section.label_key()),
             Style::default()
                 .fg(section_header_color)
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
-        let fields = ApplicationSettingsField::all();
+        let fields = ApplicationSettingsField::in_section(current_section);
         for (idx, field) in fields.iter().enumerate() {
             let is_selected = idx == app.state.app_settings_field_index;
             let prefix = if is_selected { "▸ " } else { "  " };
@@ -1078,103 +1085,108 @@ fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
             }
         }
 
-        // Add constraint info
-        lines.push(Line::from(""));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Constraint:",
-            Style::default().fg(section_header_color),
-        )));
-
-        let max_concurrent = config.download.max_concurrent;
-        let max_per_folder = config
-            .download
-            .max_concurrent_per_folder
-            .unwrap_or(max_concurrent);
-        let active_folders = config.download.parallel_folder_count.unwrap_or(1);
-        // Saturating: these come from unbounded user-entered config values.
-        let calculated = max_per_folder.saturating_mul(active_folders);
-        let constraint_met = calculated <= max_concurrent;
-
-        let constraint_style = if constraint_met {
-            Style::default().fg(success_color)
-        } else {
-            Style::default().fg(error_color)
-        };
-
-        lines.push(Line::from(Span::styled(
-            format!(
-                "({} × {}) = {} {} {}",
-                max_per_folder,
-                active_folders,
-                calculated,
-                if constraint_met { "≤" } else { ">" },
-                max_concurrent
-            ),
-            constraint_style,
-        )));
-
-        if !constraint_met {
+        // Add constraint info (Downloads tab only: it explains the
+        // MaxConcurrentPerFolder x MaxActiveFolders <= MaxConcurrent rule)
+        if current_section == SettingsSection::Downloads {
+            lines.push(Line::from(""));
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "⚠ Constraint violated! Values will be adjusted on save.",
-                Style::default().fg(error_color),
+                "Constraint:",
+                Style::default().fg(section_header_color),
             )));
+
+            let max_concurrent = config.download.max_concurrent;
+            let max_per_folder = config
+                .download
+                .max_concurrent_per_folder
+                .unwrap_or(max_concurrent);
+            let active_folders = config.download.parallel_folder_count.unwrap_or(1);
+            // Saturating: these come from unbounded user-entered config values.
+            let calculated = max_per_folder.saturating_mul(active_folders);
+            let constraint_met = calculated <= max_concurrent;
+
+            let constraint_style = if constraint_met {
+                Style::default().fg(success_color)
+            } else {
+                Style::default().fg(error_color)
+            };
+
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "({} × {}) = {} {} {}",
+                    max_per_folder,
+                    active_folders,
+                    calculated,
+                    if constraint_met { "≤" } else { ">" },
+                    max_concurrent
+                ),
+                constraint_style,
+            )));
+
+            if !constraint_met {
+                lines.push(Line::from(Span::styled(
+                    "⚠ Constraint violated! Values will be adjusted on save.",
+                    Style::default().fg(error_color),
+                )));
+            }
         }
 
-        // Add Scripts section (collapsible)
-        lines.push(Line::from(""));
-        lines.push(Line::from(""));
-
-        let script_files_config = config.scripts.script_files.clone();
-
-        // List all script files (cached; refreshed on tick by the app loop so
-        // rendering doesn't block on read_dir every frame).
-        let script_files = app.state.cached_script_files.clone();
-        let script_count = script_files.len();
-
-        // Collapsible header
-        let expand_icon = if app.state.app_scripts_expanded { "▼" } else { "▶" };
-        lines.push(Line::from(Span::styled(
-            format!("{} Scripts ({} files) - Press 's' to toggle", expand_icon, script_count),
-            Style::default().fg(section_header_color).add_modifier(Modifier::BOLD),
-        )));
-
-        // If expanded, show script files
-        if app.state.app_scripts_expanded {
+        // Add Scripts section (collapsible; Scripts tab only)
+        if current_section == SettingsSection::Scripts {
             lines.push(Line::from(""));
-            if script_files.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "  No script files found",
-                    Style::default().fg(muted_color),
-                )));
-            } else {
-                for (idx, filename) in script_files.iter().enumerate() {
-                    let is_selected = idx == app.state.script_files_index;
-                    let is_enabled = script_files_config.get(filename).copied().unwrap_or(true);
+            lines.push(Line::from(""));
 
-                    let prefix = if is_selected { "  ▸ " } else { "    " };
-                    let status = if is_enabled { "✓" } else { "✗" };
+            let script_files_config = config.scripts.script_files.clone();
 
-                    let style = if is_selected {
-                        Style::default().fg(selected_color).add_modifier(Modifier::BOLD)
-                    } else if is_enabled {
-                        Style::default().fg(success_color)
-                    } else {
-                        Style::default().fg(error_color)
-                    };
+            // List all script files (cached; refreshed on tick by the app loop so
+            // rendering doesn't block on read_dir every frame).
+            let script_files = app.state.cached_script_files.clone();
+            let script_count = script_files.len();
 
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, style),
-                        Span::styled(format!("{} ", status), style),
-                        Span::styled(filename.clone(), style),
-                    ]));
-                }
+            // Collapsible header
+            let expand_icon = if app.state.app_scripts_expanded { "▼" } else { "▶" };
+            lines.push(Line::from(Span::styled(
+                format!("{} Scripts ({} files) - Press 's' to toggle", expand_icon, script_count),
+                Style::default().fg(section_header_color).add_modifier(Modifier::BOLD),
+            )));
 
+            // If expanded, show script files
+            if app.state.app_scripts_expanded {
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    app.state.t("help-script-toggle"),
-                    Style::default().fg(muted_color),
-                )));
+                if script_files.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "  No script files found",
+                        Style::default().fg(muted_color),
+                    )));
+                } else {
+                    for (idx, filename) in script_files.iter().enumerate() {
+                        let is_selected = idx == app.state.script_files_index;
+                        let is_enabled = script_files_config.get(filename).copied().unwrap_or(true);
+
+                        let prefix = if is_selected { "  ▸ " } else { "    " };
+                        let status = if is_enabled { "✓" } else { "✗" };
+
+                        let style = if is_selected {
+                            Style::default().fg(selected_color).add_modifier(Modifier::BOLD)
+                        } else if is_enabled {
+                            Style::default().fg(success_color)
+                        } else {
+                            Style::default().fg(error_color)
+                        };
+
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, style),
+                            Span::styled(format!("{} ", status), style),
+                            Span::styled(filename.clone(), style),
+                        ]));
+                    }
+
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        app.state.t("help-script-toggle"),
+                        Style::default().fg(muted_color),
+                    )));
+                }
             }
         }
     } else {
@@ -1194,11 +1206,11 @@ fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
         Style::default().fg(success_color),
     )));
     lines.push(Line::from(Span::styled(
-        "Tab: Switch to Folders",
+        app.state.t("settings-hint-switch-tab"),
         Style::default().fg(section_header_color),
     )));
     lines.push(Line::from(Span::styled(
-        "x/Esc: Close",
+        app.state.t("settings-hint-close"),
         Style::default().fg(muted_color),
     )));
 

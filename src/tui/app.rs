@@ -470,17 +470,16 @@ impl TuiApp {
         // Check for tab click
         for (idx, rect) in &settings_tabs {
             if Self::point_in_rect(x, y, rect) {
-                match idx {
-                    0 => self.state.settings_section = SettingsSection::Application,
-                    1 => self.state.settings_section = SettingsSection::Folder,
-                    _ => {}
+                if let Some(section) = SettingsSection::ALL.get(*idx) {
+                    self.state.settings_section = *section;
+                    self.state.app_settings_field_index = 0;
                 }
                 return Ok(());
             }
         }
 
         // Check for folder item click (only in Folder section)
-        if self.state.settings_section == SettingsSection::Folder {
+        if self.state.settings_section == SettingsSection::Folders {
             for (idx, rect) in &settings_folder_items {
                 if Self::point_in_rect(x, y, rect) {
                     self.state.settings_folder_index = *idx;
@@ -1059,26 +1058,23 @@ impl TuiApp {
             return Ok(());
         }
 
-        // Switch between Application and Folder sections
+        // Switch tabs
         if matches!(key, KeyCode::Tab) {
-            self.state.settings_section = match self.state.settings_section {
-                SettingsSection::Application => SettingsSection::Folder,
-                SettingsSection::Folder => SettingsSection::Application,
-            };
+            self.state.settings_section = self.state.settings_section.next();
+            self.state.app_settings_field_index = 0;
             return Ok(());
         } else if matches!(key, KeyCode::BackTab) {
-            self.state.settings_section = match self.state.settings_section {
-                SettingsSection::Application => SettingsSection::Folder,
-                SettingsSection::Folder => SettingsSection::Application,
-            };
+            self.state.settings_section = self.state.settings_section.prev();
+            self.state.app_settings_field_index = 0;
             return Ok(());
         }
 
         match self.state.settings_section {
-            SettingsSection::Application => {
+            SettingsSection::General | SettingsSection::Downloads | SettingsSection::Scripts => {
+                let on_scripts_tab = self.state.settings_section == SettingsSection::Scripts;
                 match key {
-                    // Toggle scripts section expand/collapse
-                    KeyCode::Char('s') => {
+                    // Toggle scripts section expand/collapse (Scripts tab only)
+                    KeyCode::Char('s') if on_scripts_tab => {
                         self.state.app_scripts_expanded = !self.state.app_scripts_expanded;
                         if !self.state.app_scripts_expanded {
                             self.state.script_files_index = 0;
@@ -1087,7 +1083,7 @@ impl TuiApp {
 
                     // Navigation and actions depend on whether scripts section is expanded
                     KeyCode::Char('j') | KeyCode::Down => {
-                        if self.state.app_scripts_expanded {
+                        if on_scripts_tab && self.state.app_scripts_expanded {
                             // Navigate script files (cached; refreshed on tick)
                             let script_count = self.state.cached_script_files.len();
 
@@ -1096,8 +1092,10 @@ impl TuiApp {
                                     (self.state.script_files_index + 1) % script_count;
                             }
                         } else {
-                            // Navigate application settings fields
-                            let field_count = ApplicationSettingsField::all().len();
+                            // Navigate the fields on the active tab
+                            let field_count =
+                                ApplicationSettingsField::in_section(self.state.settings_section)
+                                    .len();
                             if field_count > 0 {
                                 self.state.app_settings_field_index =
                                     (self.state.app_settings_field_index + 1) % field_count;
@@ -1105,7 +1103,7 @@ impl TuiApp {
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        if self.state.app_scripts_expanded {
+                        if on_scripts_tab && self.state.app_scripts_expanded {
                             // Navigate script files (cached; refreshed on tick)
                             let script_count = self.state.cached_script_files.len();
 
@@ -1117,8 +1115,10 @@ impl TuiApp {
                                 };
                             }
                         } else {
-                            // Navigate application settings fields
-                            let field_count = ApplicationSettingsField::all().len();
+                            // Navigate the fields on the active tab
+                            let field_count =
+                                ApplicationSettingsField::in_section(self.state.settings_section)
+                                    .len();
                             if field_count > 0 {
                                 self.state.app_settings_field_index = if self.state.app_settings_field_index == 0 {
                                     field_count - 1
@@ -1131,7 +1131,7 @@ impl TuiApp {
 
                     // Enter or Space
                     KeyCode::Enter | KeyCode::Char(' ') => {
-                        if self.state.app_scripts_expanded {
+                        if on_scripts_tab && self.state.app_scripts_expanded {
                             // Toggle script file (cached; refreshed on tick)
                             let script_files = self.state.cached_script_files.clone();
 
@@ -1152,9 +1152,9 @@ impl TuiApp {
                         }
                     }
 
-                    // Reload scripts
+                    // Reload scripts (Scripts tab only, while expanded)
                     KeyCode::Char('r') => {
-                        if self.state.app_scripts_expanded {
+                        if on_scripts_tab && self.state.app_scripts_expanded {
                             use crate::ui::commands::{Command, handle_command};
 
                             let command = Command::ReloadScripts;
@@ -1172,7 +1172,7 @@ impl TuiApp {
                 }
             }
 
-            SettingsSection::Folder => {
+            SettingsSection::Folders => {
                 // Get folder list (sorted by display name)
                 let config = self.state.app_state.config.read().await;
                 let folder_entries = config.sorted_folder_entries();
@@ -2508,12 +2508,10 @@ impl TuiApp {
     async fn start_app_settings_edit(&mut self) -> Result<()> {
         use super::state::ApplicationSettingsField;
 
-        let fields = ApplicationSettingsField::all();
-        if self.state.app_settings_field_index >= fields.len() {
-            return Ok(());
-        }
-
-        let field = fields[self.state.app_settings_field_index];
+        let field = match self.state.current_app_field() {
+            Some(field) => field,
+            None => return Ok(()),
+        };
 
         // Handle toggle fields directly without entering input mode
         match field {
@@ -2600,12 +2598,10 @@ impl TuiApp {
         use super::state::ApplicationSettingsField;
         use crate::ui::commands::{Command, handle_command};
 
-        let fields = ApplicationSettingsField::all();
-        if self.state.app_settings_field_index >= fields.len() {
-            return Ok(());
-        }
-
-        let field = fields[self.state.app_settings_field_index];
+        let field = match self.state.current_app_field() {
+            Some(field) => field,
+            None => return Ok(()),
+        };
         let value_str = self.state.input_buffer.trim();
 
         // Parse and validate input

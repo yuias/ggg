@@ -89,41 +89,114 @@ pub enum DetailsPosition {
 /// Settings screen sections
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
-    Application,
-    Folder,
+    General,
+    Downloads,
+    Scripts,
+    Folders,
 }
 
-/// Application-level settings fields
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl SettingsSection {
+    pub const ALL: [SettingsSection; 4] = [
+        Self::General,
+        Self::Downloads,
+        Self::Scripts,
+        Self::Folders,
+    ];
+
+    /// Next tab, wrapping from the last back to the first.
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Previous tab, wrapping from the first back to the last.
+    pub fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// Translation key for the tab label
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Self::General => "settings-tab-general",
+            Self::Downloads => "settings-tab-downloads",
+            Self::Scripts => "settings-tab-scripts",
+            Self::Folders => "settings-tab-folders",
+        }
+    }
+}
+
+/// Application-level settings fields.
+///
+/// Order is display order within each `SettingsSection`, grouped by section
+/// (General, then Downloads, then Scripts) so `in_section` can filter `all()`
+/// without re-sorting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ApplicationSettingsField {
+    Language,
+    SkipDownloadPreview,
+    AutoLaunchDnd,
+    UserAgent,
+    ReferrerPolicy,
+    MaxRedirects,
+    RetryCount,
     MaxConcurrent,
     MaxConcurrentPerFolder,
     MaxActiveFolders,
-    MaxRedirects,
-    RetryCount,
-    UserAgent,
-    ReferrerPolicy,
     ScriptsEnabled,
-    SkipDownloadPreview,
-    Language,
-    AutoLaunchDnd,
 }
 
 impl ApplicationSettingsField {
     pub fn all() -> Vec<Self> {
         vec![
+            Self::Language,
+            Self::SkipDownloadPreview,
+            Self::AutoLaunchDnd,
+            Self::UserAgent,
+            Self::ReferrerPolicy,
+            Self::MaxRedirects,
+            Self::RetryCount,
             Self::MaxConcurrent,
             Self::MaxConcurrentPerFolder,
             Self::MaxActiveFolders,
-            Self::MaxRedirects,
-            Self::RetryCount,
-            Self::UserAgent,
-            Self::ReferrerPolicy,
             Self::ScriptsEnabled,
-            Self::SkipDownloadPreview,
-            Self::Language,
-            Self::AutoLaunchDnd,
         ]
+    }
+
+    /// The tab this field is shown on.
+    pub fn section(&self) -> SettingsSection {
+        match self {
+            Self::Language | Self::SkipDownloadPreview | Self::AutoLaunchDnd => {
+                SettingsSection::General
+            }
+            Self::UserAgent
+            | Self::ReferrerPolicy
+            | Self::MaxRedirects
+            | Self::RetryCount
+            | Self::MaxConcurrent
+            | Self::MaxConcurrentPerFolder
+            | Self::MaxActiveFolders => SettingsSection::Downloads,
+            Self::ScriptsEnabled => SettingsSection::Scripts,
+        }
+    }
+
+    /// Fields shown on `section`, in display order.
+    pub fn in_section(section: SettingsSection) -> Vec<Self> {
+        Self::all().into_iter().filter(|f| f.section() == section).collect()
+    }
+
+    /// Whether changing this field only takes effect after a restart.
+    /// `MaxConcurrent` is included until the manager is updated live.
+    pub fn requires_restart(&self) -> bool {
+        matches!(
+            self,
+            Self::Language
+                | Self::AutoLaunchDnd
+                | Self::RetryCount
+                | Self::MaxConcurrent
+                | Self::MaxConcurrentPerFolder
+                | Self::MaxActiveFolders
+        )
     }
 
     /// Get translation key for label
@@ -417,7 +490,7 @@ pub struct TuiState {
     /// Settings screen: field selection index (for editing)
     pub settings_field_index: usize,
 
-    /// Settings screen: active section (Application or Folder)
+    /// Settings screen: active tab
     pub settings_section: SettingsSection,
 
     /// Settings screen: application settings field index
@@ -540,7 +613,7 @@ impl TuiState {
             settings_edit_field: None,
             settings_folder_index: 0,
             settings_field_index: 0,
-            settings_section: SettingsSection::Application,
+            settings_section: SettingsSection::General,
             app_settings_field_index: 0,
             is_editing_app_setting: false,
             renaming_folder_id: None,
@@ -825,13 +898,22 @@ impl TuiState {
         self.settings_edit_field = None;
         self.settings_folder_index = 0;
         self.settings_field_index = 0;
-        self.settings_section = SettingsSection::Application;
+        self.settings_section = SettingsSection::General;
         self.app_settings_field_index = 0;
         self.is_editing_app_setting = false;
         self.script_files_index = 0;
         self.app_scripts_expanded = false;
         self.folder_scripts_expanded = false;
         self.input_buffer.clear();
+    }
+
+    /// The application settings field currently selected, if any (the field
+    /// list depends on the active tab, so this replaces indexing
+    /// `ApplicationSettingsField::all()` directly).
+    pub fn current_app_field(&self) -> Option<ApplicationSettingsField> {
+        ApplicationSettingsField::in_section(self.settings_section)
+            .get(self.app_settings_field_index)
+            .copied()
     }
 
     /// Move field selection down in folder edit mode
@@ -1012,5 +1094,39 @@ impl TuiState {
     /// Clear dirty flag after rendering
     pub fn clear_dirty(&mut self) {
         self.needs_redraw = false;
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn in_section_covers_every_field_exactly_once() {
+        let mut seen = std::collections::HashSet::new();
+        for section in SettingsSection::ALL {
+            for field in ApplicationSettingsField::in_section(section) {
+                assert!(
+                    seen.insert(field),
+                    "{:?} appeared in more than one section",
+                    field
+                );
+                assert_eq!(field.section(), section);
+            }
+        }
+        assert_eq!(seen.len(), ApplicationSettingsField::all().len());
+    }
+
+    #[test]
+    fn settings_section_next_and_prev_wrap() {
+        assert_eq!(SettingsSection::General.next(), SettingsSection::Downloads);
+        assert_eq!(SettingsSection::Downloads.next(), SettingsSection::Scripts);
+        assert_eq!(SettingsSection::Scripts.next(), SettingsSection::Folders);
+        assert_eq!(SettingsSection::Folders.next(), SettingsSection::General);
+
+        assert_eq!(SettingsSection::General.prev(), SettingsSection::Folders);
+        assert_eq!(SettingsSection::Folders.prev(), SettingsSection::Scripts);
+        assert_eq!(SettingsSection::Scripts.prev(), SettingsSection::Downloads);
+        assert_eq!(SettingsSection::Downloads.prev(), SettingsSection::General);
     }
 }
