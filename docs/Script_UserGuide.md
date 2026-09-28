@@ -289,6 +289,20 @@ Scripts are loaded **alphabetically** by filename:
 
 **Tip:** Use numeric prefixes to control execution order.
 
+### Reloading Scripts
+
+Scripts are otherwise loaded once at startup. To pick up edits (new
+scripts, changed handlers, enable/disable toggles) without restarting:
+
+- **Daemon mode:** start ggg as a daemon (`ggg --headless`) and run
+  `ggg script reload` against it from another terminal. Without a daemon
+  running, `ggg script reload` prints a notice instead, since there is
+  nothing to reload.
+- **TUI:** open Settings (`x`) and switch to the Scripts tab, then press
+  the reload-settings key (`R` by default; see
+  [KeyBindings.md](KeyBindings.md#default-bindings)) to reload scripts
+  instead of `settings.toml`.
+
 ### Handler Execution Order
 
 For each event:
@@ -476,7 +490,6 @@ Scripts are JavaScript (ES5+). Common issues:
 
 - TypeScript support with automatic type checking
 - Script debugging tools and REPL
-- Hot reload without application restart
 - More granular URL pattern matching (glob patterns)
 
 ## Security

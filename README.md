@@ -86,7 +86,22 @@ For a complete, fully documented configuration example, see `config/settings.tom
 
 ## Project Structure
 
-For detailed project structure and module organization, see the [Project Structure Guide](docs/dev/Project_Structure.md).
+Top-level modules under `src/`:
+
+| Module | Role |
+|--------|------|
+| `app`     | Config, keybindings, and shared application state. |
+| `cli`     | Argument parsing, CLI command handlers, and daemon routing/control (`src/cli/remote.rs`). |
+| `download` | The download manager, queue, and task types. |
+| `file`    | Filesystem helpers (paths, naming). |
+| `ipc`     | The Windows Named Pipe control protocol shared with the CLI, `ggg-dnd`, and `ggg-bridge`. |
+| `script`  | The JavaScript hook engine (see [Script_UserGuide.md](docs/Script_UserGuide.md)). |
+| `tui`     | The terminal UI (screens, keybinding resolution, rendering). |
+| `ui`      | Low-level rendering helpers shared across the TUI. |
+| `util`    | Small cross-cutting helpers (path resolution, redaction, ...). |
+
+`windows/` holds the three sibling crates described above
+(`ggg-ipc`, `ggg-dnd`, `ggg-bridge`).
 
 ## Development
 
