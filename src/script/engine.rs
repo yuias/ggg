@@ -316,8 +316,62 @@ impl ScriptEngine {
             source: e,
         })?;
 
+        // Collect handlers into a local Vec first, without touching the
+        // registry. This way a script that throws partway through, or
+        // registers a handler that fails to parse, cannot leave a partial
+        // handler list adopted by the registry.
+        let collected = self.collect_handlers(path, script_content);
+
+        // Clear the JS-side handlers map unconditionally, whether collection
+        // succeeded or not, so a failed script's `ggg.on()` calls don't leak
+        // into the next `load_script` call.
+        // (Callbacks remain in globalThis, the handlers map is just for registration.)
+        let clear_result =
+            self.execute_with_timeout("<ggg:clear_map>", "ggg._handlers.clear()".to_string());
+
+        let handlers = match collected {
+            Ok(handlers) => {
+                if let Err(e) = clear_result {
+                    tracing::warn!("Failed to clear handlers map: {}", e);
+                    return Err(ScriptError::InternalError(format!(
+                        "Failed to clear handlers map: {}",
+                        e
+                    )));
+                }
+                handlers
+            }
+            Err(e) => {
+                if let Err(clear_err) = clear_result {
+                    tracing::warn!("Failed to clear handlers map: {}", clear_err);
+                }
+                return Err(e);
+            }
+        };
+
+        // Only now, with a fully-parsed handler list in hand, lock the
+        // registry and adopt it.
+        let mut registry = self.handlers.lock().unwrap_or_else(|e| e.into_inner());
+        for (event, handler) in handlers {
+            Arc::make_mut(registry.entry(event).or_insert_with(|| Arc::new(Vec::new())))
+                .push(handler);
+        }
+        drop(registry); // Release the handlers lock before re-entering the runtime
+
+        tracing::info!("Loaded script: {:?}", path);
+        Ok(())
+    }
+
+    /// Execute a script and parse its registered handlers into a local list,
+    /// without touching the handler registry. The caller decides whether to
+    /// adopt the result, so a script that errors partway through (or contains
+    /// an invalid handler entry) cannot leave partial state in the registry.
+    fn collect_handlers(
+        &mut self,
+        path: &Path,
+        content: String,
+    ) -> ScriptResult<Vec<(HookEvent, EventHandler)>> {
         // Execute script to register handlers (with timeout)
-        self.execute_with_timeout("<ggg:load>", script_content)
+        self.execute_with_timeout("<ggg:load>", content)
             .map_err(|e| ScriptError::CompilationError {
                 path: path.to_owned(),
                 message: e.to_string(),
@@ -334,20 +388,15 @@ impl ScriptEngine {
             .map_err(|e| ScriptError::InternalError(format!("Failed to get handlers: {}", e)))?;
         let handlers_json: String = self.deserialize_v8(global)?;
 
-        // Parse handlers and store in registry
+        // Parse every handler entry: event name, callbackId, filter.
         let handlers_data: Vec<(String, Vec<serde_json::Value>)> =
             serde_json::from_str(&handlers_json)
                 .map_err(|e| ScriptError::InternalError(format!("Failed to parse handlers: {}", e)))?;
 
-        let mut registry = self.handlers.lock().unwrap_or_else(|e| e.into_inner());
-
+        let mut result = Vec::new();
         for (event_name, handlers_list) in handlers_data {
-            let event = HookEvent::from_str(&event_name).ok_or_else(|| {
-                ScriptError::InvalidEventName(event_name.clone())
-            })?;
-
-            let event_handlers =
-                Arc::make_mut(registry.entry(event).or_insert_with(|| Arc::new(Vec::new())));
+            let event = HookEvent::from_str(&event_name)
+                .ok_or_else(|| ScriptError::InvalidEventName(event_name.clone()))?;
 
             for handler_data in handlers_list {
                 let callback_id = handler_data["callbackId"]
@@ -361,24 +410,18 @@ impl ScriptEngine {
                     None
                 };
 
-                event_handlers.push(EventHandler {
-                    callback_id,
-                    filter,
-                    script_path: path.to_owned(),
-                });
+                result.push((
+                    event,
+                    EventHandler {
+                        callback_id,
+                        filter,
+                        script_path: path.to_owned(),
+                    },
+                ));
             }
         }
-        drop(registry); // Release the handlers lock before re-entering the runtime
 
-        // Clear JavaScript handlers map for next script
-        // (Callbacks remain in globalThis, handlers map is just for registration)
-        self.execute_with_timeout("<ggg:clear_map>", "ggg._handlers.clear()".to_string())
-            .map_err(|e| {
-                ScriptError::InternalError(format!("Failed to clear handlers map: {}", e))
-            })?;
-
-        tracing::info!("Loaded script: {:?}", path);
-        Ok(())
+        Ok(result)
     }
 
     /// Execute handlers for a specific event
@@ -792,5 +835,69 @@ mod tests {
         assert_eq!(ctx2.headers.get("X-Twitter"), None); // Should not be set
 
         std::fs::remove_file(script_path).ok();
+    }
+
+    #[test]
+    fn failed_script_handlers_not_adopted_by_next_script() {
+        let mut engine = ScriptEngine::new(Duration::from_secs(30)).unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let script_a = temp_dir.join("test_handler_leak_failed_script_a.js");
+        std::fs::write(
+            &script_a,
+            "ggg.on('beforeRequest', function(e){ return true; }); throw new Error('x');",
+        )
+        .unwrap();
+
+        let result_a = engine.load_script(&script_a);
+        assert!(result_a.is_err(), "Script A should fail to load");
+        std::fs::remove_file(&script_a).ok();
+
+        // Script B registers nothing; it must not inherit script A's leaked handler.
+        let script_b = temp_dir.join("test_handler_leak_failed_script_b.js");
+        std::fs::write(&script_b, "// no handlers here").unwrap();
+
+        let result_b = engine.load_script(&script_b);
+        assert!(result_b.is_ok(), "Script B should load: {:?}", result_b);
+        assert_eq!(engine.handler_count(HookEvent::BeforeRequest), 0);
+        std::fs::remove_file(&script_b).ok();
+    }
+
+    #[test]
+    fn partial_handler_list_not_registered() {
+        let mut engine = ScriptEngine::new(Duration::from_secs(30)).unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join("test_handler_leak_partial_handler.js");
+        std::fs::write(
+            &script_path,
+            "ggg.on('beforeRequest', function(e){ return true; }); \
+             ggg.on('noSuchEvent', function(e){ return true; });",
+        )
+        .unwrap();
+
+        let result = engine.load_script(&script_path);
+        assert!(result.is_err(), "Unknown event name should fail the load");
+        assert_eq!(engine.handler_count(HookEvent::BeforeRequest), 0);
+        std::fs::remove_file(&script_path).ok();
+    }
+
+    #[test]
+    fn invalid_filter_registers_nothing() {
+        let mut engine = ScriptEngine::new(Duration::from_secs(30)).unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let script_path = temp_dir.join("test_handler_leak_invalid_filter.js");
+        std::fs::write(
+            &script_path,
+            "ggg.on('beforeRequest', function(e){ return true; }); \
+             ggg.on('beforeRequest', function(e){ return true; }, '^(');",
+        )
+        .unwrap();
+
+        let result = engine.load_script(&script_path);
+        assert!(result.is_err(), "Invalid filter should fail the load");
+        assert_eq!(engine.handler_count(HookEvent::BeforeRequest), 0);
+        std::fs::remove_file(&script_path).ok();
     }
 }
