@@ -48,8 +48,7 @@ status-context-menu = 📋 Actions Menu
 # Status bar - Right side hints. Args are display-formatted configured keys
 # (see KeybindingResolver::display_key). status-hint-cancel and
 # status-hint-finish stay literal (free-text input keys are not
-# configurable); status-hint-confirm-cancel gets literal Enter/Esc from the
-# ChangeSavePath call site for the same reason.
+# configurable).
 status-hint-cancel = Esc: cancel
 status-hint-confirm-cancel = {$confirm}: confirm | {$cancel}: cancel
 status-hint-finish = Enter/Esc: finish

@@ -25,7 +25,7 @@ pub fn render(app: &TuiApp, f: &mut Frame) {
     let is_main_screen = matches!(
         app.state.ui_mode,
         UiMode::Normal | UiMode::AddDownload | UiMode::DownloadPreview |
-        UiMode::Search | UiMode::ChangeFolder | UiMode::ChangeSavePath | UiMode::ItemEdit |
+        UiMode::Search | UiMode::ChangeFolder | UiMode::ItemEdit |
         UiMode::SwitchFolder | UiMode::ConfirmDelete | UiMode::ContextMenu | UiMode::Help
     ) || (matches!(app.state.ui_mode, UiMode::EditingField) && !app.state.is_editing_app_setting);
 
@@ -63,7 +63,6 @@ pub fn render(app: &TuiApp, f: &mut Frame) {
         UiMode::DownloadPreview => render_download_preview_dialog(app, f, size),
         UiMode::Search => {}, // Search is inline in status bar
         UiMode::ChangeFolder => render_change_folder_for_item_dialog(app, f, size),
-        UiMode::ChangeSavePath => render_change_save_path_dialog(app, f, size),
         UiMode::ItemEdit => render_item_edit_dialog(app, f, size),
         UiMode::SwitchFolder => render_switch_folder_dialog(app, f, size),
         UiMode::ConfirmDelete => render_confirm_delete_dialog(app, f, size),
@@ -743,15 +742,6 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
                 "cancel" => key(KeyAction::Back),
             };
             (t_args("status-hint-navigate", Some(&args)), String::new())
-        }
-        UiMode::ChangeSavePath => {
-            // Free-text path input: Enter/Esc are the hard-coded text-edit
-            // keys, not resolver-backed.
-            let args = fluent_args! {
-                "confirm" => "Enter",
-                "cancel" => "Esc",
-            };
-            (t_args("status-hint-confirm-cancel", Some(&args)), String::new())
         }
         UiMode::ItemEdit => {
             // Field navigation (Tab/Enter/Esc) is hard-coded, like the other
@@ -2180,48 +2170,6 @@ fn render_change_folder_for_item_dialog(app: &TuiApp, f: &mut Frame, area: Rect)
         let mut regions = app.state.click_regions.borrow_mut();
         regions.folder_picker_items = folder_picker_rects;
     }
-}
-
-/// Render change save path dialog (free text input)
-fn render_change_save_path_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
-    let dialog_width = 80;
-    let dialog_height = 7;
-
-    let dialog_area = Rect {
-        x: (area.width.saturating_sub(dialog_width)) / 2,
-        y: (area.height.saturating_sub(dialog_height)) / 2,
-        width: dialog_width,
-        height: dialog_height,
-    };
-
-    // Get current path from selected download
-    let current_path = app
-        .state
-        .get_selected_download()
-        .map(|task| task.save_path.to_string_lossy().to_string())
-        .unwrap_or_else(|| "No download selected".to_string());
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Current: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(&current_path),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("New: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(&app.state.input_buffer),
-        ]),
-    ];
-
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.state.t("dialog-change-save-path"))
-                .style(Style::default().bg(theme::BG_PRIMARY)),
-        );
-
-    f.render_widget(paragraph, dialog_area);
 }
 
 /// One label/value row of a form-style dialog; the focused row is

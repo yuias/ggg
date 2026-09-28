@@ -9,7 +9,6 @@ dialog-edit-label = Edit {$label}
 dialog-add-download = Add Download (Tab: Switch Field, Shift+Enter: Expand [n-m])
 dialog-add-download-url = URL
 dialog-add-download-referrer = リファラー
-dialog-change-save-path = Change Save Path (Enter: Confirm, Esc: Cancel)
 dialog-item-edit = 項目を編集
 dialog-item-edit-multi = {$count}件の項目を編集
 dialog-item-edit-save-path = 保存先

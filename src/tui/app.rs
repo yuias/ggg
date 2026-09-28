@@ -161,7 +161,6 @@ impl TuiApp {
                     UiMode::Settings => self.handle_settings_mode(code, modifiers).await?,
                     UiMode::FolderEdit => self.handle_folder_edit_mode(code, modifiers).await?,
                     UiMode::ChangeFolder => self.handle_change_folder_for_item_mode(code, modifiers).await?,
-                    UiMode::ChangeSavePath => self.handle_change_save_path_mode(code, modifiers).await?,
                     UiMode::ItemEdit => self.handle_item_edit_mode(code, modifiers).await?,
                     UiMode::SwitchFolder => self.handle_switch_folder_mode(code, modifiers).await?,
                     UiMode::ConfirmDelete => self.handle_confirm_delete_mode(code, modifiers).await?,
@@ -2007,39 +2006,6 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Handle change save path mode (free text input for filesystem path)
-    async fn handle_change_save_path_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
-        match self.apply_text_edit_key(key, mods) {
-            TextEdit::Typed => {}
-            TextEdit::Submit => {
-                // Submit new path to all target downloads
-                if !self.state.input_buffer.is_empty() {
-                    let new_path = std::path::PathBuf::from(&self.state.input_buffer);
-                    let target_ids = self.state.get_target_download_ids();
-                    let mut changed = false;
-                    for id in target_ids {
-                        if let Err(e) = self.manager.change_save_path(id, new_path.clone()).await {
-                            tracing::warn!("Failed to change path for {}: {}", id, e);
-                        } else {
-                            changed = true;
-                        }
-                    }
-                    if changed {
-                        self.save_queue().await?;
-                    }
-                }
-                self.state.ui_mode = UiMode::Normal;
-                self.state.input_buffer.clear();
-            }
-            TextEdit::Cancel => {
-                self.state.ui_mode = UiMode::Normal;
-                self.state.input_buffer.clear();
-            }
-            TextEdit::Ignored => {}
-        }
-        Ok(())
-    }
-
     /// Opens the item editor for the current selection. No-op in the History
     /// view (editing completed items is not supported) or with nothing
     /// focused (no task to prefill from).
@@ -2224,7 +2190,7 @@ impl TuiApp {
                 self.execute_menu_action(ContextMenuAction::Delete).await?;
             }
             Some(KeyAction::EditItem) => {
-                self.execute_menu_action(ContextMenuAction::ChangeSavePath).await?;
+                self.execute_menu_action(ContextMenuAction::EditItem).await?;
             }
 
             // Cancel menu
@@ -2281,7 +2247,7 @@ impl TuiApp {
                 self.state.folder_picker_index = 0;
                 self.state.ui_mode = UiMode::ChangeFolder;
             }
-            ContextMenuAction::ChangeSavePath => {
+            ContextMenuAction::EditItem => {
                 self.open_item_editor();
             }
             ContextMenuAction::CopyUrl => {

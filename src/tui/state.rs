@@ -24,8 +24,6 @@ pub enum UiMode {
     Search,
     /// Changing application folder for selected download (folder picker)
     ChangeFolder,
-    /// Changing save path for selected download (free text input)
-    ChangeSavePath,
     /// Editing the save path and referrer of the target download(s)
     ItemEdit,
     /// Switching current folder for new downloads
@@ -55,7 +53,6 @@ impl UiMode {
                 | UiMode::EditingField
                 | UiMode::Search
                 | UiMode::FolderEdit
-                | UiMode::ChangeSavePath
                 | UiMode::ItemEdit
         )
     }
@@ -364,7 +361,7 @@ pub enum ContextMenuAction {
     Retry,
     Delete,
     ChangeFolder,
-    ChangeSavePath,
+    EditItem,
     CopyUrl,
     OpenFolder,
     Cancel,
@@ -378,7 +375,7 @@ impl ContextMenuAction {
             Self::Retry,
             Self::Delete,
             Self::ChangeFolder,
-            Self::ChangeSavePath,
+            Self::EditItem,
             Self::CopyUrl,
             Self::OpenFolder,
             Self::Cancel,
@@ -392,7 +389,7 @@ impl ContextMenuAction {
             Self::Retry => "context-menu-retry",
             Self::Delete => "context-menu-delete",
             Self::ChangeFolder => "context-menu-change-folder",
-            Self::ChangeSavePath => "context-menu-change-save-path",
+            Self::EditItem => "context-menu-edit-item",
             Self::CopyUrl => "context-menu-copy-url",
             Self::OpenFolder => "context-menu-open-folder",
             Self::Cancel => "context-menu-cancel",
@@ -411,7 +408,7 @@ impl ContextMenuAction {
             Self::Retry => resolver.display_key(KeyAction::RetryDownload),
             Self::Delete => resolver.display_key(KeyAction::DeleteDownload),
             Self::ChangeFolder => "f".to_string(),
-            Self::ChangeSavePath => resolver.display_key(KeyAction::EditItem),
+            Self::EditItem => resolver.display_key(KeyAction::EditItem),
             Self::CopyUrl => "c".to_string(),
             Self::OpenFolder => "o".to_string(),
             Self::Cancel => resolver.display_key(KeyAction::Back),

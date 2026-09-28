@@ -9,7 +9,6 @@ dialog-edit-label = Edit {$label}
 dialog-add-download = Add Download (Tab: switch field, Shift+Enter to expand [n-m] pattern)
 dialog-add-download-url = URL
 dialog-add-download-referrer = Referrer
-dialog-change-save-path = Change Save Path (Enter to confirm, Esc to cancel)
 dialog-item-edit = Edit item
 dialog-item-edit-multi = Edit {$count} items
 dialog-item-edit-save-path = Save path
