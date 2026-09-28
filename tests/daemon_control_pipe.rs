@@ -66,7 +66,7 @@ impl ControlHandler for TestHandler {
         .boxed()
     }
 
-    fn after_response(&self, _req: &ControlRequest) -> BoxFuture<'_, ()> {
+    fn after_response(&self, _req: &ControlRequest, _resp: &ControlResponse) -> BoxFuture<'_, ()> {
         async move {
             self.after_response_count.fetch_add(1, Ordering::SeqCst);
             self.after_response_notify.notify_one();

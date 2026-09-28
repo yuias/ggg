@@ -62,6 +62,12 @@ pub struct DaemonContext {
 /// Answers one request against the current daemon state. Variants not yet
 /// implemented answer `Error{Unsupported}` rather than panicking or hanging,
 /// so an older client talking to this daemon gets a clear message.
+///
+/// Contract: a handler for a mutating request (`ControlRequest::is_mutating`)
+/// returns `ControlResponse::Error` only on paths that changed no state.
+/// `after_response` relies on this to skip the queue save on an error reply
+/// (see `should_save`); returning `Error` after a real mutation would leave
+/// that change unsaved.
 pub async fn dispatch(req: ControlRequest, ctx: &DaemonContext) -> ControlResponse {
     match req {
         ControlRequest::Ping => ControlResponse::Pong {
@@ -631,17 +637,23 @@ async fn dispatch_add(
     ControlResponse::Added { added, skipped }
 }
 
+/// Error replies mean the handler changed nothing, so there is nothing to
+/// save (see `dispatch`'s contract doc comment).
+pub(crate) fn should_save(req: &ControlRequest, resp: &ControlResponse) -> bool {
+    req.is_mutating() && !matches!(resp, ControlResponse::Error { .. })
+}
+
 #[cfg(windows)]
 impl crate::ipc::control::server::ControlHandler for DaemonContext {
     fn handle(&self, req: ControlRequest) -> BoxFuture<'_, ControlResponse> {
         Box::pin(dispatch(req, self))
     }
 
-    fn after_response(&self, req: &ControlRequest) -> BoxFuture<'_, ()> {
-        let is_mutating = req.is_mutating();
+    fn after_response(&self, req: &ControlRequest, resp: &ControlResponse) -> BoxFuture<'_, ()> {
+        let needs_save = should_save(req, resp);
         let is_shutdown = matches!(req, ControlRequest::Shutdown);
         Box::pin(async move {
-            if is_mutating {
+            if needs_save {
                 // Held across the save so it can't overlap the auto-save or
                 // the final shutdown save; see `save_lock`'s doc comment.
                 let _guard = self.save_lock.lock().await;
@@ -724,13 +736,38 @@ mod tests {
     async fn after_response_notifies_shutdown() {
         use crate::ipc::control::server::ControlHandler;
         let ctx = test_context(DownloadManager::new());
-        ctx.after_response(&ControlRequest::Shutdown).await;
+        let resp = ControlResponse::Ok { message: "shutting down".to_string() };
+        ctx.after_response(&ControlRequest::Shutdown, &resp).await;
         let notified = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             ctx.shutdown.notified(),
         )
         .await;
         assert!(notified.is_ok(), "shutdown was not notified");
+    }
+
+    #[test]
+    fn should_save_mutating_ok_reply() {
+        let req = ControlRequest::Pause { id: Uuid::nil() };
+        let resp = ControlResponse::Ok { message: String::new() };
+        assert!(should_save(&req, &resp));
+    }
+
+    #[test]
+    fn should_save_skips_error_reply() {
+        let req = ControlRequest::Pause { id: Uuid::nil() };
+        let resp = ControlResponse::Error {
+            code: ControlErrorCode::NotFound,
+            message: String::new(),
+        };
+        assert!(!should_save(&req, &resp));
+    }
+
+    #[test]
+    fn should_save_skips_non_mutating() {
+        let req = ControlRequest::Ping;
+        let resp = ControlResponse::Ok { message: String::new() };
+        assert!(!should_save(&req, &resp));
     }
 
     // `AppState::new` (via `test_context`) never starts the script executor

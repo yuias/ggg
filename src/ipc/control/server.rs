@@ -23,9 +23,12 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 pub trait ControlHandler: Send + Sync + 'static {
     fn handle(&self, req: ControlRequest) -> BoxFuture<'_, ControlResponse>;
-    /// Runs after the response line has been written and flushed, so a
-    /// shutdown or a queue save never races the client's reply.
-    fn after_response(&self, req: &ControlRequest) -> BoxFuture<'_, ()>;
+    /// Runs after the response line has been written (or failed to write),
+    /// so a shutdown or a queue save never races the client's reply. `resp`
+    /// is what `handle` returned, so implementations can skip work that only
+    /// makes sense for a successful reply (e.g. skip a queue save after an
+    /// `Error` response).
+    fn after_response(&self, req: &ControlRequest, resp: &ControlResponse) -> BoxFuture<'_, ()>;
 }
 
 #[derive(Debug)]
@@ -185,7 +188,7 @@ async fn handle_connection(pipe: NamedPipeServer, handler: Arc<dyn ControlHandle
         // handler already applied the request in memory (e.g. a mutation
         // that needs saving, or a Shutdown), and that must not be lost just
         // because the client disconnected before the reply went out.
-        handler.after_response(&req).await;
+        handler.after_response(&req, &resp).await;
         if !write_ok {
             break;
         }
