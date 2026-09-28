@@ -185,3 +185,45 @@ async fn process_request(
         IpcRequest::Ping => IpcResponse::Pong,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A pipe created by this same process, opened through `ggg_ipc`'s
+    /// blocking client, passes the client-side owner check: this exercises
+    /// `ggg-ipc`'s client end to end, not just the pure `decide_owner` rule.
+    /// Uses a unique name, not `DEFAULT_PIPE_NAME`, so it cannot collide with
+    /// a real ggg-dnd server already holding that name.
+    #[tokio::test]
+    async fn ggg_ipc_client_accepts_pipe_created_by_same_user() {
+        let pipe_name = format!(r"\\.\pipe\ggg-dnd-test-{}", uuid::Uuid::new_v4());
+        let (event_tx, _event_rx) = mpsc::channel(1);
+
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .expect("create test pipe");
+
+        let accept_name = pipe_name.clone();
+        tokio::spawn(async move {
+            if server.connect().await.is_ok() {
+                handle_client(server, event_tx).await;
+            }
+            let _ = accept_name;
+        });
+
+        let ping_name = pipe_name.clone();
+        let result = tokio::time::timeout(
+            TEST_TIMEOUT,
+            tokio::task::spawn_blocking(move || ggg_ipc::ping(&ping_name)),
+        )
+        .await
+        .expect("ping did not complete within timeout")
+        .expect("spawn_blocking task panicked");
+
+        assert!(result.is_ok(), "expected same-user pipe to be trusted: {result:?}");
+    }
+}

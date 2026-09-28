@@ -8,6 +8,7 @@ use crate::protocol::{IpcRequest, IpcResponse};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::windows::io::AsRawHandle;
 use std::time::Duration;
 
 /// Default time to wait for a server response before giving up. Prevents a
@@ -29,6 +30,8 @@ pub enum ClientError {
     Server(String),
     /// Server returned a response of an unexpected variant
     Unexpected(String),
+    /// The pipe's owner SID is not one of ours; see `ggg_ipc::owner`.
+    Untrusted(String),
 }
 
 impl fmt::Display for ClientError {
@@ -40,6 +43,7 @@ impl fmt::Display for ClientError {
             Self::Deserialize(e) => write!(f, "Invalid response: {}", e),
             Self::Server(msg) => write!(f, "Server error: {}", msg),
             Self::Unexpected(msg) => write!(f, "Unexpected response: {}", msg),
+            Self::Untrusted(msg) => write!(f, "Refusing to use pipe: {}", msg),
         }
     }
 }
@@ -80,6 +84,10 @@ pub fn send_request_timeout(
 /// The blocking request/response transaction (open, write, read one line).
 fn send_request_blocking(pipe_name: &str, request: &IpcRequest) -> Result<IpcResponse, ClientError> {
     let pipe = open_pipe(pipe_name).map_err(ClientError::Connect)?;
+    // The pipe name is predictable, so another local user could squat it
+    // before we connect; check the pipe's owner SID before writing anything.
+    crate::owner::verify_pipe_owner(pipe.as_raw_handle())
+        .map_err(|e| ClientError::Untrusted(e.user_message()))?;
     let mut reader = BufReader::new(&pipe);
     let mut writer = &pipe;
 
