@@ -66,6 +66,22 @@ pub enum EditHeadersError {
     Busy(Uuid, &'static str),
 }
 
+/// Failure modes for [`DownloadManager::change_save_path`].
+#[derive(Debug, thiserror::Error)]
+pub enum ChangeSavePathError {
+    #[error("Download not found")]
+    NotFound,
+    /// Same rule `edit_task_headers` uses: a live handle (including retry
+    /// backoff, where the persisted status is `Paused`) or another operation
+    /// holds the start claim.
+    #[error("download {0} is busy; pause the download first")]
+    Busy(Uuid),
+    /// The task exists and is idle, but its persisted status (e.g. Completed,
+    /// Cancelled) doesn't allow a path change.
+    #[error("cannot change path of an active or completed download")]
+    InvalidStatus,
+}
+
 /// One running (or finished but not yet released) download.
 struct ActiveEntry {
     handle: JoinHandle<()>,
@@ -81,7 +97,7 @@ struct ActiveEntry {
 pub enum RunState {
     /// No claim and no live handle.
     Idle,
-    /// Some operation (start, pause, remove, move, header edit) holds the claim.
+    /// Some operation (start, pause, remove, move, header edit, save-path edit) holds the claim.
     Claimed,
     /// Live handle, not in backoff (downloading or waiting for a permit).
     Active,
@@ -99,7 +115,7 @@ pub enum StartOutcome {
     /// status is already Downloading.
     AlreadyRunning,
     /// Nothing done: another operation holds the task's claim (a concurrent
-    /// start, or a pause/remove/move/header edit).
+    /// start, or a pause/remove/move/header edit/save-path edit).
     Busy,
 }
 
@@ -1580,22 +1596,44 @@ impl DownloadManager {
         Ok(())
     }
 
-    pub async fn change_save_path(&self, id: Uuid, new_path: std::path::PathBuf) -> Result<()> {
-        if let Some(mut task) = self.get_by_id(id).await {
-            // Only allow changing path if download hasn't started or is paused
-            if matches!(task.status, DownloadStatus::Pending | DownloadStatus::Paused | DownloadStatus::Error) {
-                let folder_id = task.folder_id.clone();
-                task.save_path = new_path;
-                if let Some(queue) = self.get_folder_queue(&folder_id).await {
-                    queue.update(task).await;
-                }
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("Cannot change path of active or completed download"))
-            }
-        } else {
-            Err(anyhow::anyhow!("Task not found"))
+    /// Changes a task's save path, mirroring `edit_task_headers`'s claim +
+    /// in-flight check: a task in retry backoff is `Paused` with a live
+    /// handle, and without this check the edit would be accepted only for
+    /// the retry loop's next `queue.update` to overwrite it with the old
+    /// path. The claim is held across the read and the write (via
+    /// `FolderQueue::modify`), closing the same race `edit_task_headers`
+    /// closes against a concurrent `start_download`.
+    pub async fn change_save_path(
+        &self,
+        id: Uuid,
+        new_path: std::path::PathBuf,
+    ) -> Result<(), ChangeSavePathError> {
+        let Some(_claim) = StartClaim::try_acquire(&self.start_claims, id) else {
+            return Err(ChangeSavePathError::Busy(id));
+        };
+        if self.is_running(id).await {
+            return Err(ChangeSavePathError::Busy(id));
         }
+
+        let queues: Vec<FolderQueue> = {
+            let guard = self.folder_queues.read().await;
+            guard.values().cloned().collect()
+        };
+        for queue in &queues {
+            let Some(task) = queue.get_by_id(id).await else {
+                continue;
+            };
+            // Only allow changing path if the download hasn't started or is paused.
+            if !matches!(task.status, DownloadStatus::Pending | DownloadStatus::Paused | DownloadStatus::Error) {
+                return Err(ChangeSavePathError::InvalidStatus);
+            }
+            return queue
+                .modify(id, move |task| task.save_path = new_path)
+                .await
+                .map(|_| ())
+                .ok_or(ChangeSavePathError::NotFound);
+        }
+        Err(ChangeSavePathError::NotFound)
     }
 
     /// Resume all paused and error downloads
@@ -3225,6 +3263,77 @@ mod tests {
             task.headers.get("Referer").map(String::as_str),
             Some("https://a.example/"),
             "the edit must not be overwritten by the collapsed start"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_save_path_updates_pending_task() {
+        let manager = DownloadManager::new();
+        let task = DownloadTask::new("https://example.com/f".to_string(), "/tmp/old".into());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let result = manager.change_save_path(id, "/tmp/new".into()).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(task.save_path, std::path::PathBuf::from("/tmp/new"));
+    }
+
+    /// A task in retry backoff has status `Paused` but a live handle; only
+    /// checking the persisted status (as a plain read-then-write would)
+    /// misses this and lets the retry loop's next `queue.update` overwrite
+    /// the new path with the old one.
+    #[tokio::test]
+    async fn change_save_path_rejects_task_in_retry_backoff() {
+        let manager = DownloadManager::new();
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp/old".into());
+        task.status = DownloadStatus::Paused;
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+
+        let result = manager.change_save_path(id, "/tmp/new".into()).await;
+        match result {
+            Err(ChangeSavePathError::Busy(busy_id)) => assert_eq!(busy_id, id),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(
+            task.save_path,
+            std::path::PathBuf::from("/tmp/old"),
+            "a rejected edit must not be applied"
+        );
+
+        manager.abort_active_handle_for_test(id).await;
+    }
+
+    /// Holds a `StartClaim` directly (this test lives in the same module, so
+    /// it can reach the private type) rather than driving a real
+    /// `start_download` call, since only the claim itself -- not the script
+    /// round trip -- matters here.
+    #[tokio::test]
+    async fn change_save_path_rejects_while_start_claim_held() {
+        let manager = DownloadManager::new();
+        let task = DownloadTask::new("https://example.com/f".to_string(), "/tmp/old".into());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let _claim = StartClaim::try_acquire(&manager.start_claims, id).expect("claim must be free");
+        assert!(manager.is_start_in_progress(id));
+
+        let result = manager.change_save_path(id, "/tmp/new".into()).await;
+        match result {
+            Err(ChangeSavePathError::Busy(busy_id)) => assert_eq!(busy_id, id),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(
+            task.save_path,
+            std::path::PathBuf::from("/tmp/old"),
+            "a rejected edit must not be applied"
         );
     }
 

@@ -195,6 +195,7 @@ pub async fn apply_item_edit(
         if let Some(path) = new_save_path {
             match manager.change_save_path(id, path.to_path_buf()).await {
                 Ok(()) => applied = true,
+                Err(crate::download::manager::ChangeSavePathError::Busy(_)) => report.busy += 1,
                 Err(_) => report.failed += 1,
             }
         }
@@ -392,6 +393,29 @@ mod tests {
         let task = manager.get_by_id(id).await.expect("task still queued");
         assert_eq!(find_header(&task, "Referer"), None, "a busy target must get neither field applied");
         assert_ne!(task.save_path, new_path, "a busy target must get neither field applied");
+
+        manager.abort_active_handle_for_test(id).await;
+    }
+
+    /// A save-path-only edit (no header_edit) on a running task exercises
+    /// `change_save_path`'s own busy check directly, not `edit_task_headers`'s.
+    #[tokio::test]
+    async fn apply_skips_running_task_save_path_only_as_busy() {
+        let (manager, id) = manager_with_task(&[]).await;
+        let original_path = manager.get_by_id(id).await.expect("task queued").save_path;
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+
+        let new_path = PathBuf::from("/tmp/new-name");
+        let report = apply_item_edit(&manager, &[id], None, Some(&new_path)).await;
+        assert_eq!(
+            report,
+            ItemEditReport { busy: 1, ..Default::default() },
+            "a busy save-path edit must count as busy, not failed"
+        );
+
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(task.save_path, original_path, "a busy target must not have its path changed");
 
         manager.abort_active_handle_for_test(id).await;
     }
