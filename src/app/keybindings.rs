@@ -113,7 +113,7 @@ impl KeyAction {
             KeyAction::MoveToTop
             | KeyAction::MoveToBottom
             | KeyAction::PageUp
-            | KeyAction::PageDown => &[Normal, Settings, Dialog],
+            | KeyAction::PageDown => &[Normal, Settings, Dialog, Help],
             KeyAction::FocusNextPane
             | KeyAction::FocusPrevPane
             | KeyAction::FocusLeft

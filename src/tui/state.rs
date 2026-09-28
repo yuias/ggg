@@ -624,6 +624,12 @@ pub struct TuiState {
     /// IPC Named Pipe name (Windows only, set when pipe server starts)
     #[cfg(windows)]
     pub ipc_pipe_name: Option<String>,
+
+    /// Line offset the help overlay is scrolled to. Reset to 0 whenever help opens.
+    pub help_scroll: usize,
+    /// Help body height from the last frame; the key handler has no terminal
+    /// size, and without it a scroll past the end would need extra presses to undo.
+    pub help_viewport_height: std::sync::atomic::AtomicUsize,
 }
 
 /// Loads `language`, falling back to English and then to a placeholder
@@ -643,6 +649,21 @@ fn load_translations(language: &str) -> Arc<LocalizationManager> {
 /// Shared by the folder tree and every other row-indexed list (settings rows,
 /// the Folders list, the folder editor fields) so paging feels consistent.
 const TREE_PAGE_SIZE: usize = 10;
+
+/// Line count moved per PageUp/PageDown in the help overlay.
+pub(super) const HELP_PAGE_SIZE: usize = 10;
+
+/// Clamps a help-overlay scroll offset so the last screenful of content is never
+/// scrolled past. `content_len <= viewport_height` (everything already fits)
+/// collapses to zero regardless of the requested offset.
+pub(super) fn clamp_help_scroll_offset(
+    offset: usize,
+    content_len: usize,
+    viewport_height: usize,
+) -> usize {
+    let max_offset = content_len.saturating_sub(viewport_height);
+    offset.min(max_offset)
+}
 
 /// Index after jumping to the top of a `count`-row list.
 fn tree_top_index(_count: usize) -> usize {
@@ -728,6 +749,8 @@ impl TuiState {
             keybinding_resolver,
             #[cfg(windows)]
             ipc_pipe_name: None,
+            help_scroll: 0,
+            help_viewport_height: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1569,6 +1592,26 @@ mod tree_navigation_tests {
         assert_eq!(tree_page_down_index(0, 1, 10), 0);
         assert_eq!(tree_page_down_index(0, 15, 10), 10);
         assert_eq!(tree_page_down_index(8, 15, 10), 14);
+    }
+
+    #[test]
+    fn clamp_help_scroll_offset_fits_entirely() {
+        // Content shorter than the viewport never scrolls, regardless of the
+        // requested offset.
+        assert_eq!(clamp_help_scroll_offset(0, 10, 20), 0);
+        assert_eq!(clamp_help_scroll_offset(5, 10, 20), 0);
+    }
+
+    #[test]
+    fn clamp_help_scroll_offset_exact_fit_has_no_slack() {
+        assert_eq!(clamp_help_scroll_offset(0, 20, 20), 0);
+        assert_eq!(clamp_help_scroll_offset(7, 20, 20), 0);
+    }
+
+    #[test]
+    fn clamp_help_scroll_offset_overflow_clamps_to_max() {
+        assert_eq!(clamp_help_scroll_offset(5, 30, 20), 5);
+        assert_eq!(clamp_help_scroll_offset(100, 30, 20), 10);
     }
 }
 

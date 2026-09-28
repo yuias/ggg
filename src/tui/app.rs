@@ -921,6 +921,7 @@ impl TuiApp {
                 }
                 KeyAction::OpenHelp => {
                     self.state.ui_mode = UiMode::Help;
+                    self.state.help_scroll = 0;
                     return Ok(());
                 }
                 KeyAction::OpenSettings => {
@@ -1133,6 +1134,38 @@ impl TuiApp {
             || matches!((action, key), (None, KeyCode::Esc))
         {
             self.state.ui_mode = UiMode::Normal;
+            return;
+        }
+
+        // The viewport height comes from the last frame (0 before the first
+        // one, which only allows a harmless overshoot the renderer clamps).
+        let viewport = self
+            .state
+            .help_viewport_height
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let max_offset = super::ui::help_content_line_count(&self.state).saturating_sub(viewport);
+        match action {
+            Some(KeyAction::MoveUp) => {
+                self.state.help_scroll = self.state.help_scroll.saturating_sub(1);
+            }
+            Some(KeyAction::MoveDown) => {
+                self.state.help_scroll = (self.state.help_scroll + 1).min(max_offset);
+            }
+            Some(KeyAction::PageUp) => {
+                self.state.help_scroll =
+                    self.state.help_scroll.saturating_sub(super::state::HELP_PAGE_SIZE);
+            }
+            Some(KeyAction::PageDown) => {
+                self.state.help_scroll =
+                    (self.state.help_scroll + super::state::HELP_PAGE_SIZE).min(max_offset);
+            }
+            Some(KeyAction::MoveToTop) => {
+                self.state.help_scroll = 0;
+            }
+            Some(KeyAction::MoveToBottom) => {
+                self.state.help_scroll = max_offset;
+            }
+            _ => {}
         }
     }
 

@@ -2,7 +2,10 @@ use super::app::TuiApp;
 use super::format::{
     format_progress_bar, format_progress_with_bar, format_size, format_speed, truncate_filename,
 };
-use super::state::{DeleteTarget, DetailsPosition, FocusPane, FolderTreeItem, UiMode};
+use super::state::{
+    clamp_help_scroll_offset, DeleteTarget, DetailsPosition, FocusPane, FolderTreeItem, TuiState,
+    UiMode,
+};
 use super::theme;
 use crate::app::keybindings::{format_key_for_display, KeyAction};
 use crate::download::task::{DownloadStatus, LogLevel};
@@ -907,22 +910,13 @@ fn to_kebab_case(name: &str) -> String {
     out
 }
 
-/// Render help screen overlay as centered popup
-fn render_help(app: &TuiApp, f: &mut Frame, area: Rect) {
-    let t = |key: &str| app.state.t(key);
-    let resolver = &app.state.keybinding_resolver;
-
-    // Define popup dimensions
-    let dialog_width = 80;
-    let dialog_height = 40;
-
-    // Calculate centered position
-    let dialog_area = Rect {
-        x: (area.width.saturating_sub(dialog_width)) / 2,
-        y: (area.height.saturating_sub(dialog_height)) / 2,
-        width: dialog_width.min(area.width),
-        height: dialog_height.min(area.height),
-    };
+/// Scrollable body of the help overlay: title, key sections, and (Windows) the
+/// IPC pipe name. Kept apart from the close-hint footer so callers can compute
+/// its line count without duplicating layout code, and so the footer can stay
+/// pinned outside the scrolled area.
+fn help_body_lines(state: &TuiState) -> Vec<Line<'static>> {
+    let t = |key: &str| state.t(key);
+    let resolver = &state.keybinding_resolver;
 
     let mut help_text = vec![
         Line::from(Span::styled(
@@ -955,7 +949,7 @@ fn render_help(app: &TuiApp, f: &mut Frame, area: Rect) {
 
     // Show IPC pipe name on Windows
     #[cfg(windows)]
-    if let Some(ref pipe_name) = app.state.ipc_pipe_name {
+    if let Some(ref pipe_name) = state.ipc_pipe_name {
         help_text.push(Line::from(Span::styled(
             "IPC",
             Style::default().add_modifier(Modifier::BOLD),
@@ -963,6 +957,64 @@ fn render_help(app: &TuiApp, f: &mut Frame, area: Rect) {
         help_text.push(Line::from(format!("  Pipe: {}", pipe_name)));
         help_text.push(Line::from(""));
     }
+
+    help_text
+}
+
+/// Line count of the help overlay's scrollable body, shared with key handling
+/// so `MoveToBottom`/paging can target the same bound the renderer clamps to.
+pub(super) fn help_content_line_count(state: &TuiState) -> usize {
+    help_body_lines(state).len()
+}
+
+/// Render help screen overlay, sized to the terminal and scrollable when the
+/// content overflows. The close hint is rendered as a fixed footer outside the
+/// scrolled area so it always stays visible.
+fn render_help(app: &TuiApp, f: &mut Frame, area: Rect) {
+    let resolver = &app.state.keybinding_resolver;
+
+    // Fill most of the terminal, leaving a one-row margin so the overlay never
+    // touches the screen edges; still shrinks to fit very small terminals.
+    let dialog_width = 80.min(area.width);
+    let dialog_height = area.height.saturating_sub(2).min(area.height);
+
+    let dialog_area = Rect {
+        x: (area.width.saturating_sub(dialog_width)) / 2,
+        y: (area.height.saturating_sub(dialog_height)) / 2,
+        width: dialog_width,
+        height: dialog_height,
+    };
+
+    f.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(app.state.t("dialog-help"))
+        .style(Style::default().bg(theme::BG_PRIMARY));
+    let inner_area = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+
+    // Reserve the last inner row for the close hint so it can never scroll out of view.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner_area);
+    let (body_area, footer_area) = (chunks[0], chunks[1]);
+
+    let body_lines = help_body_lines(&app.state);
+    app.state
+        .help_viewport_height
+        .store(body_area.height as usize, std::sync::atomic::Ordering::Relaxed);
+    let scroll_offset = clamp_help_scroll_offset(
+        app.state.help_scroll,
+        body_lines.len(),
+        body_area.height as usize,
+    );
+
+    let body = Paragraph::new(body_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset as u16, 0));
+    f.render_widget(body, body_area);
 
     // Help closes on Back (Esc/q) or a second OpenHelp (?) press; generate the
     // footer from the resolver so a remap of either is reflected here too.
@@ -973,23 +1025,11 @@ fn render_help(app: &TuiApp, f: &mut Frame, area: Rect) {
         .collect::<Vec<_>>()
         .join(", ");
     let footer_args = fluent_args! { "keys" => close_keys };
-    help_text.push(Line::from(Span::styled(
+    let footer = Paragraph::new(Line::from(Span::styled(
         app.state.t_with_args("help-footer", Some(&footer_args)),
         Style::default().fg(Color::Green),
     )));
-
-    let paragraph = Paragraph::new(help_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.state.t("dialog-help"))
-                .style(Style::default().bg(theme::BG_PRIMARY)),
-        )
-        .wrap(Wrap { trim: false });
-
-    // Clear the background area and render the popup
-    f.render_widget(Clear, dialog_area);
-    f.render_widget(paragraph, dialog_area);
+    f.render_widget(footer, footer_area);
 }
 
 /// Render settings screen with tabs (Application / Folder)
