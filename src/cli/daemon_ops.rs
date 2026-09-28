@@ -21,7 +21,7 @@ use crate::download::manager::{DownloadEvent, DownloadManager, StartOutcome, Tas
 use crate::download::task::{DownloadStatus, DownloadTask};
 use crate::ipc::control::protocol::{
     AddedTask, ControlErrorCode, ControlRequest, ControlResponse, DaemonStatus, HeaderEdit,
-    SkippedUrl, WaitOutcome, CONTROL_PROTOCOL_VERSION,
+    MoveOp, SkippedUrl, WaitOutcome, CONTROL_PROTOCOL_VERSION,
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -139,6 +139,8 @@ pub async fn dispatch(req: ControlRequest, ctx: &DaemonContext) -> ControlRespon
             dispatch_set_script_enabled(name, enabled, ctx).await
         }
         ControlRequest::Modify { id, edit } => dispatch_modify(id, edit, ctx).await,
+        ControlRequest::Move { id, op } => dispatch_move(id, op, ctx).await,
+        ControlRequest::Priority { id, priority } => dispatch_priority(id, priority, ctx).await,
         _ => ControlResponse::Error {
             code: ControlErrorCode::Unsupported,
             message: "not supported by this daemon yet".to_string(),
@@ -253,6 +255,95 @@ fn modify_error_response(e: crate::download::manager::EditHeadersError) -> Contr
         EditHeadersError::Busy(..) => ControlErrorCode::InvalidInput,
     };
     ControlResponse::Error { code, message: e.to_string() }
+}
+
+/// Mirrors the standalone `move` command (`handle_move` in `handler.rs`):
+/// same messages, same folder resolution, and the same `TaskBusy`/not-found
+/// mapping for `change_folder`. Unlike `handle_move`, `to_top`/`to_bottom`
+/// check the id up front, because `move_to_top`/`move_to_bottom` do not
+/// distinguish "not found" from other failures the way `change_folder` does.
+async fn dispatch_move(id: Uuid, op: MoveOp, ctx: &DaemonContext) -> ControlResponse {
+    if ctx.manager.get_by_id(id).await.is_none() {
+        return not_found("Download not found");
+    }
+    match op {
+        MoveOp::ToTop => match ctx.manager.move_to_top(id).await {
+            Ok(()) => ControlResponse::Ok {
+                message: format!("Moved download {id} to top of queue"),
+            },
+            Err(e) => not_found(&e.to_string()),
+        },
+        MoveOp::ToBottom => match ctx.manager.move_to_bottom(id).await {
+            Ok(()) => ControlResponse::Ok {
+                message: format!("Moved download {id} to bottom of queue"),
+            },
+            Err(e) => not_found(&e.to_string()),
+        },
+        MoveOp::Before { id: before_id } => {
+            if ctx.manager.get_by_id(before_id).await.is_none() {
+                return not_found("Target download not found");
+            }
+            match ctx.manager.move_before(id, before_id).await {
+                Ok(()) => ControlResponse::Ok {
+                    message: format!("Moved download {id} before {before_id}"),
+                },
+                Err(e) => ControlResponse::Error {
+                    code: ControlErrorCode::InvalidInput,
+                    message: e.to_string(),
+                },
+            }
+        }
+        MoveOp::Folder { folder } => {
+            // Accept a display name as well as the UUID key, as `add` does.
+            // The read guard is dropped before `change_folder`, which takes
+            // the config lock itself.
+            let folder_id = {
+                let config = ctx.state.config.read().await.clone();
+                match resolve_folder_id(&config, &folder) {
+                    Some(f) => f,
+                    None => {
+                        return ControlResponse::Error {
+                            code: ControlErrorCode::InvalidInput,
+                            message: format!("Folder '{folder}' not found"),
+                        }
+                    }
+                }
+            };
+            match ctx
+                .manager
+                .change_folder(id, folder_id.clone(), Some(&ctx.state.config))
+                .await
+            {
+                Ok(()) => ControlResponse::Ok {
+                    message: format!("Moved download {id} to folder '{folder_id}'"),
+                },
+                Err(e) => {
+                    if let Some(busy) = e.downcast_ref::<TaskBusy>() {
+                        task_busy_response(TaskBusy(busy.0))
+                    } else if e.to_string() == "Task not found" {
+                        not_found(&e.to_string())
+                    } else {
+                        ControlResponse::Error {
+                            code: ControlErrorCode::InvalidInput,
+                            message: e.to_string(),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Mirrors the standalone `priority` command's message. `set_priority`'s
+/// only error is "not found", so any `Err` maps to `NotFound` without
+/// touching state.
+async fn dispatch_priority(id: Uuid, priority: u8, ctx: &DaemonContext) -> ControlResponse {
+    match ctx.manager.set_priority(id, priority).await {
+        Ok(()) => ControlResponse::Ok {
+            message: format!("Set priority to {priority} for download {id}"),
+        },
+        Err(e) => not_found(&e.to_string()),
+    }
 }
 
 fn not_found(message: &str) -> ControlResponse {
@@ -784,16 +875,13 @@ mod tests {
         }
     }
 
-    // `Move` is not handled by the daemon yet, so it still falls
+    // `ConfigGet` is not handled by the daemon yet, so it still falls
     // through `dispatch`'s catch-all arm.
     #[tokio::test]
     async fn dispatch_unhandled_is_unsupported() {
         let ctx = test_context(DownloadManager::new());
         let resp = dispatch(
-            ControlRequest::Move {
-                id: Uuid::new_v4(),
-                op: crate::ipc::control::protocol::MoveOp::ToTop,
-            },
+            ControlRequest::ConfigGet { key: "download.max_concurrent".to_string() },
             &ctx,
         )
         .await;
@@ -1417,5 +1505,145 @@ mod tests {
         }
 
         ctx.manager.abort_active_handle_for_test(id).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_move_to_top_reorders() {
+        let manager = DownloadManager::new();
+        let task1 = DownloadTask::new(
+            "https://example.com/a".to_string(),
+            std::path::PathBuf::from("a"),
+        );
+        let task2 = DownloadTask::new(
+            "https://example.com/b".to_string(),
+            std::path::PathBuf::from("b"),
+        );
+        let id2 = task2.id;
+        manager.add_download(task1).await;
+        manager.add_download(task2).await;
+        let ctx = test_context(manager);
+
+        let resp = dispatch(
+            ControlRequest::Move { id: id2, op: MoveOp::ToTop },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Ok { message } => {
+                assert!(message.contains("top of queue"), "message: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let tasks = ctx.manager.get_all_downloads().await;
+        assert_eq!(tasks[0].id, id2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_move_unknown_id_not_found() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::Move {
+                id: Uuid::new_v4(),
+                op: MoveOp::ToTop,
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::NotFound),
+            other => panic!("expected Error{{NotFound}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_move_unknown_folder_invalid() {
+        let manager = DownloadManager::new();
+        let task = DownloadTask::new(
+            "https://example.com/a".to_string(),
+            std::path::PathBuf::from("a"),
+        );
+        let id = task.id;
+        manager.add_download(task).await;
+        let ctx = test_context(manager);
+
+        let resp = dispatch(
+            ControlRequest::Move {
+                id,
+                op: MoveOp::Folder { folder: "no-such-folder".to_string() },
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::InvalidInput),
+            other => panic!("expected Error{{InvalidInput}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_move_folder_moves_task() {
+        let manager = DownloadManager::new();
+        let task = DownloadTask::new(
+            "https://example.com/a".to_string(),
+            std::path::PathBuf::from("a"),
+        );
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let mut config = Config::default();
+        config.folders.insert(
+            "archive".to_string(),
+            crate::app::config::FolderConfig {
+                name: "Archive".to_string(),
+                ..Default::default()
+            },
+        );
+        let ctx = DaemonContext {
+            state: AppState::new(config, "en"),
+            manager,
+            shutdown: Arc::new(Notify::new()),
+            started_at: Instant::now(),
+            pipe_name: r"\\.\pipe\ggg-daemon-test".to_string(),
+            save_lock: Arc::new(Mutex::new(())),
+        };
+
+        let resp = dispatch(
+            ControlRequest::Move {
+                id,
+                op: MoveOp::Folder { folder: "archive".to_string() },
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Ok { message } => {
+                assert!(message.contains("archive"), "message: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let task = ctx.manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(task.folder_id, "archive");
+    }
+
+    #[tokio::test]
+    async fn dispatch_priority_sets_priority() {
+        let manager = DownloadManager::new();
+        let task = DownloadTask::new(
+            "https://example.com/a".to_string(),
+            std::path::PathBuf::from("a"),
+        );
+        let id = task.id;
+        manager.add_download(task).await;
+        let ctx = test_context(manager);
+
+        let resp = dispatch(ControlRequest::Priority { id, priority: 5 }, &ctx).await;
+        match resp {
+            ControlResponse::Ok { message } => {
+                assert!(message.contains("5"), "message: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        let task = ctx.manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(task.priority, 5);
     }
 }

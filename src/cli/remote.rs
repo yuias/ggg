@@ -19,7 +19,7 @@ use super::error;
 use super::output;
 // `protocol` is compiled on every target (see `src/ipc/control/mod.rs`), so
 // the `add` payload types are available to render standalone output too.
-use crate::ipc::control::protocol::{AddedTask, SkippedUrl, WaitOutcome};
+use crate::ipc::control::protocol::{AddedTask, MoveOp, SkippedUrl, WaitOutcome};
 #[cfg(windows)]
 use crate::ipc::control::protocol::{
     ControlErrorCode, ControlRequest, ControlResponse, HeaderEdit,
@@ -108,8 +108,8 @@ pub fn classify(cmd: &Commands) -> RemoteClass {
         },
         Commands::Clear { .. } => RemoteClass::RefuseWhileRunning,
         Commands::BatchAdd { .. } => RemoteClass::RefuseWhileRunning,
-        Commands::Priority { .. } => RemoteClass::RefuseWhileRunning,
-        Commands::Move { .. } => RemoteClass::RefuseWhileRunning,
+        Commands::Priority { .. } => RemoteClass::Routed,
+        Commands::Move { .. } => RemoteClass::Routed,
         Commands::Export { action } => match action {
             ExportAction::Queue { .. } | ExportAction::Config { .. } => RemoteClass::ReadOnly,
         },
@@ -452,6 +452,51 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
             }
         }
 
+        Commands::Priority { id, set } => {
+            let uid = match super::handler::parse_task_id(id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            let req = ControlRequest::Priority { id: uid, priority: *set };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+
+        Commands::Move { id, to_top, to_bottom, before, folder } => {
+            let uid = match super::handler::parse_task_id(id) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            let op = match move_op_from_args(*to_top, *to_bottom, before.as_deref(), folder.as_deref()) {
+                Ok(op) => op,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return RouteDecision::Handled(error::INVALID_INPUT);
+                }
+            };
+            let req = ControlRequest::Move { id: uid, op };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+
         Commands::Script { action: ScriptAction::Reload } => {
             match client::send(pipe_name, &ControlRequest::ReloadScripts, Some(REQUEST_TIMEOUT)).await {
                 Ok(ControlResponse::Ok { message }) => {
@@ -651,6 +696,29 @@ pub fn parse_status_arg(s: Option<&str>) -> anyhow::Result<Vec<DownloadStatus>> 
                 .map_err(|_| anyhow::anyhow!("unknown status '{s}'"))
         })
         .collect()
+}
+
+/// Turns `move`'s CLI flags into one `MoveOp`. The clap `move_op` group
+/// already rejects more than one flag being set; this only needs to check
+/// that at least one was, matching `handle_move`'s own check.
+pub fn move_op_from_args(
+    to_top: bool,
+    to_bottom: bool,
+    before: Option<&str>,
+    folder: Option<&str>,
+) -> Result<MoveOp, String> {
+    if to_top {
+        Ok(MoveOp::ToTop)
+    } else if to_bottom {
+        Ok(MoveOp::ToBottom)
+    } else if let Some(before) = before {
+        let id = uuid::Uuid::parse_str(before).map_err(|_| "Invalid before UUID format".to_string())?;
+        Ok(MoveOp::Before { id })
+    } else if let Some(folder) = folder {
+        Ok(MoveOp::Folder { folder: folder.to_string() })
+    } else {
+        Err("Must specify one of: --to-top, --to-bottom, --before, --folder".to_string())
+    }
 }
 
 /// Replaces every header value with a placeholder before a task is printed.
@@ -858,6 +926,64 @@ mod tests {
         assert_eq!(
             classify(&Commands::Wait { id: "x".to_string(), timeout: None, json: false }),
             RemoteClass::RequiresDaemon
+        );
+        assert_eq!(
+            classify(&Commands::Priority { id: "x".to_string(), set: 5 }),
+            RemoteClass::Routed
+        );
+        assert_eq!(
+            classify(&Commands::Move {
+                id: "x".to_string(),
+                to_top: true,
+                to_bottom: false,
+                before: None,
+                folder: None,
+            }),
+            RemoteClass::Routed
+        );
+    }
+
+    #[test]
+    fn move_op_from_args_to_top() {
+        assert_eq!(move_op_from_args(true, false, None, None), Ok(MoveOp::ToTop));
+    }
+
+    #[test]
+    fn move_op_from_args_to_bottom() {
+        assert_eq!(move_op_from_args(false, true, None, None), Ok(MoveOp::ToBottom));
+    }
+
+    #[test]
+    fn move_op_from_args_before() {
+        let id = uuid::Uuid::new_v4();
+        let id_str = id.to_string();
+        assert_eq!(
+            move_op_from_args(false, false, Some(&id_str), None),
+            Ok(MoveOp::Before { id })
+        );
+    }
+
+    #[test]
+    fn move_op_from_args_folder() {
+        assert_eq!(
+            move_op_from_args(false, false, None, Some("archive")),
+            Ok(MoveOp::Folder { folder: "archive".to_string() })
+        );
+    }
+
+    #[test]
+    fn move_op_from_args_none_is_error() {
+        assert_eq!(
+            move_op_from_args(false, false, None, None),
+            Err("Must specify one of: --to-top, --to-bottom, --before, --folder".to_string())
+        );
+    }
+
+    #[test]
+    fn move_op_from_args_bad_before_uuid_is_error() {
+        assert_eq!(
+            move_op_from_args(false, false, Some("not-a-uuid"), None),
+            Err("Invalid before UUID format".to_string())
         );
     }
 
