@@ -24,10 +24,10 @@ pub const OWNER_MISMATCH_MSG: &str = ggg_ipc::owner::OTHER_OWNER_MSG;
 
 /// Ok only if the pipe's owner SID is one of the current process's own SIDs
 /// (see `ggg_ipc::owner::decide_owner`). `Err(message)` is safe to show the
-/// user; callers also log the underlying detail at warn.
-pub fn check_server_owner(client: &NamedPipeClient) -> Result<(), String> {
+/// user; the underlying detail is logged at warn with the pipe name.
+pub fn check_server_owner(client: &NamedPipeClient, pipe_name: &str) -> Result<(), String> {
     ggg_ipc::owner::verify_pipe_owner(client.as_raw_handle()).map_err(|e| {
-        tracing::warn!("control pipe owner check failed: {e:?}");
+        tracing::warn!("control pipe {pipe_name} failed owner check: {e:?}");
         e.user_message()
     })
 }

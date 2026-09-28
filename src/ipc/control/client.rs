@@ -76,7 +76,7 @@ pub async fn probe(pipe_name: &str) -> DaemonProbe {
         }
     };
 
-    if let Err(msg) = owner::check_server_owner(&client) {
+    if let Err(msg) = owner::check_server_owner(&client, pipe_name) {
         return DaemonProbe::Unreachable(msg);
     }
 
@@ -130,7 +130,7 @@ pub async fn send(
 ) -> anyhow::Result<ControlResponse> {
     let client = open_for_send(pipe_name).await?;
 
-    if let Err(msg) = owner::check_server_owner(&client) {
+    if let Err(msg) = owner::check_server_owner(&client, pipe_name) {
         return Err(anyhow::anyhow!(msg));
     }
 
