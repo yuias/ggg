@@ -646,22 +646,42 @@ impl TuiApp {
                     return Ok(());
                 }
                 KeyAction::MoveToTop => {
-                    self.state.move_to_top();
+                    match self.state.focus_pane {
+                        FocusPane::FolderTree => self.state.move_tree_to_top(),
+                        FocusPane::DownloadList | FocusPane::DetailsPanel => {
+                            self.state.move_to_top()
+                        }
+                    }
                     return Ok(());
                 }
                 KeyAction::MoveToBottom => {
-                    self.state.move_to_bottom();
+                    match self.state.focus_pane {
+                        FocusPane::FolderTree => self.state.move_tree_to_bottom(),
+                        FocusPane::DownloadList | FocusPane::DetailsPanel => {
+                            self.state.move_to_bottom()
+                        }
+                    }
                     return Ok(());
                 }
                 KeyAction::PageUp => {
-                    for _ in 0..10 {
-                        self.state.move_selection_up();
+                    match self.state.focus_pane {
+                        FocusPane::FolderTree => self.state.tree_page_up(),
+                        FocusPane::DownloadList | FocusPane::DetailsPanel => {
+                            for _ in 0..10 {
+                                self.state.move_selection_up();
+                            }
+                        }
                     }
                     return Ok(());
                 }
                 KeyAction::PageDown => {
-                    for _ in 0..10 {
-                        self.state.move_selection_down();
+                    match self.state.focus_pane {
+                        FocusPane::FolderTree => self.state.tree_page_down(),
+                        FocusPane::DownloadList | FocusPane::DetailsPanel => {
+                            for _ in 0..10 {
+                                self.state.move_selection_down();
+                            }
+                        }
                     }
                     return Ok(());
                 }
@@ -712,11 +732,17 @@ impl TuiApp {
                     return Ok(());
                 }
                 KeyAction::ToggleSelection => {
-                    self.state.toggle_selection();
+                    // No-op on the folder tree: there is no list item under the cursor.
+                    if self.state.focus_pane != FocusPane::FolderTree {
+                        self.state.toggle_selection();
+                    }
                     return Ok(());
                 }
                 KeyAction::SelectAll => {
-                    self.state.select_all();
+                    // No-op on the folder tree: there is no list item under the cursor.
+                    if self.state.focus_pane != FocusPane::FolderTree {
+                        self.state.select_all();
+                    }
                     return Ok(());
                 }
                 KeyAction::DeselectAll => {
@@ -732,8 +758,10 @@ impl TuiApp {
                     return Ok(());
                 }
                 KeyAction::DeleteDownload => {
-                    if !self.state.selected_downloads.is_empty()
-                        || self.state.get_selected_download().is_some()
+                    // No-op on the folder tree: there is no list item under the cursor.
+                    if self.state.focus_pane != FocusPane::FolderTree
+                        && (!self.state.selected_downloads.is_empty()
+                            || self.state.get_selected_download().is_some())
                     {
                         self.state.ui_mode = UiMode::ConfirmDelete;
                     }
@@ -797,6 +825,9 @@ impl TuiApp {
                 KeyAction::EditItem => {
                     // TODO: Expand to a multi-field editor supporting Referrer,
                     //       Cookie, and other per-item properties.
+                    if self.state.get_selected_download().is_none() {
+                        return Ok(());
+                    }
                     self.state.ui_mode = UiMode::ChangeSavePath;
                     self.state.input_buffer.clear();
                     return Ok(());

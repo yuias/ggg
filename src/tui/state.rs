@@ -592,6 +592,33 @@ fn load_translations(language: &str) -> Arc<LocalizationManager> {
     }))
 }
 
+/// Row count moved per PageUp/PageDown, kept equal to the download list's page size.
+const TREE_PAGE_SIZE: usize = 10;
+
+/// Index after jumping to the top of a `count`-row tree.
+fn tree_top_index(_count: usize) -> usize {
+    0
+}
+
+/// Index after jumping to the bottom of a `count`-row tree.
+fn tree_bottom_index(count: usize) -> usize {
+    count.saturating_sub(1)
+}
+
+/// Index after paging up by `page` rows from `current`.
+fn tree_page_up_index(current: usize, page: usize) -> usize {
+    current.saturating_sub(page)
+}
+
+/// Index after paging down by `page` rows from `current`, clamped to `count` rows.
+fn tree_page_down_index(current: usize, count: usize, page: usize) -> usize {
+    if count == 0 {
+        0
+    } else {
+        (current + page).min(count - 1)
+    }
+}
+
 impl TuiState {
     pub fn new(
         app_state: AppState,
@@ -836,6 +863,45 @@ impl TuiState {
             self.selected_index = 0;
             self.table_state.borrow_mut().select(Some(0));
         }
+    }
+
+    /// Update the tree cursor and, only if it actually moved, reset the
+    /// download list selection to match: `current_downloads` follows the
+    /// tree cursor, so landing on a different row means a different list.
+    fn set_tree_index(&mut self, new_index: usize) {
+        if new_index != self.tree_selected_index {
+            self.tree_selected_index = new_index;
+            self.selected_index = 0;
+            self.table_state.borrow_mut().select(Some(0));
+        }
+    }
+
+    /// Move tree selection to the top row (visual only, use
+    /// sync_current_folder_from_tree to confirm)
+    pub fn move_tree_to_top(&mut self) {
+        self.set_tree_index(tree_top_index(self.tree_items.len()));
+    }
+
+    /// Move tree selection to the bottom row (visual only, use
+    /// sync_current_folder_from_tree to confirm)
+    pub fn move_tree_to_bottom(&mut self) {
+        self.set_tree_index(tree_bottom_index(self.tree_items.len()));
+    }
+
+    /// Page the tree selection up (visual only, use
+    /// sync_current_folder_from_tree to confirm)
+    pub fn tree_page_up(&mut self) {
+        self.set_tree_index(tree_page_up_index(self.tree_selected_index, TREE_PAGE_SIZE));
+    }
+
+    /// Page the tree selection down (visual only, use
+    /// sync_current_folder_from_tree to confirm)
+    pub fn tree_page_down(&mut self) {
+        self.set_tree_index(tree_page_down_index(
+            self.tree_selected_index,
+            self.tree_items.len(),
+            TREE_PAGE_SIZE,
+        ));
     }
 
     /// Sync current_folder_id with tree selection (if a folder is selected)
@@ -1224,5 +1290,39 @@ mod settings_tests {
         let field_count = SettingsField::all().len();
         assert_eq!(SettingsField::row_count(0), field_count);
         assert_eq!(SettingsField::row_count(4), field_count + 4);
+    }
+}
+
+#[cfg(test)]
+mod tree_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn tree_top_index_is_always_zero() {
+        assert_eq!(tree_top_index(0), 0);
+        assert_eq!(tree_top_index(1), 0);
+        assert_eq!(tree_top_index(5), 0);
+    }
+
+    #[test]
+    fn tree_bottom_index_clamps_to_last_row() {
+        assert_eq!(tree_bottom_index(0), 0);
+        assert_eq!(tree_bottom_index(1), 0);
+        assert_eq!(tree_bottom_index(5), 4);
+    }
+
+    #[test]
+    fn tree_page_up_index_does_not_underflow() {
+        assert_eq!(tree_page_up_index(0, 10), 0);
+        assert_eq!(tree_page_up_index(3, 10), 0);
+        assert_eq!(tree_page_up_index(15, 10), 5);
+    }
+
+    #[test]
+    fn tree_page_down_index_clamps_to_last_row() {
+        assert_eq!(tree_page_down_index(0, 0, 10), 0);
+        assert_eq!(tree_page_down_index(0, 1, 10), 0);
+        assert_eq!(tree_page_down_index(0, 15, 10), 10);
+        assert_eq!(tree_page_down_index(8, 15, 10), 14);
     }
 }
