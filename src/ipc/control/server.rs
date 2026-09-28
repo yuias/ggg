@@ -223,6 +223,11 @@ async fn handle_connection(pipe: NamedPipeServer, handler: Arc<dyn ControlHandle
 /// client disconnected). `None` means the client is gone; the caller must
 /// then skip writing a reply and calling `after_response`, because the
 /// request only existed to answer a connection that no longer exists.
+///
+/// If the client has already sent more bytes, EOF can no longer be seen
+/// without consuming them, so watching stops and the request runs to its
+/// normal end. The shipped client sends one request per connection, so only
+/// a non-standard client reaches that case.
 async fn run_until_disconnect<R: AsyncBufRead + Unpin>(
     fut: BoxFuture<'_, ControlResponse>,
     reader: &mut R,
