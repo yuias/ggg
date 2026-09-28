@@ -537,6 +537,10 @@ impl TuiApp {
     async fn handle_settings_click(&mut self, x: u16, y: u16) -> Result<()> {
         use super::state::SettingsSection;
 
+        // A rejected edit's error is only relevant until the user's next
+        // action, including a mouse click.
+        self.state.validation_error = None;
+
         // Clone regions data to avoid borrow issues
         let (settings_tabs, settings_folder_items) = {
             let regions = self.state.click_regions.borrow();
@@ -1136,6 +1140,10 @@ impl TuiApp {
     async fn handle_settings_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
         use super::state::SettingsSection;
 
+        // A rejected edit's error is only relevant until the user's next
+        // action; a command below that fails again re-sets it.
+        self.state.validation_error = None;
+
         let action = self.state.keybinding_resolver.resolve_in(KeyContext::Settings, key, mods);
 
         // Close settings screen
@@ -1218,14 +1226,19 @@ impl TuiApp {
                         if let Some(script_index) = self.state.current_app_script_index() {
                             let script_files = self.state.cached_script_files.clone();
                             if let Some(filename) = script_files.get(script_index).cloned() {
-                                use crate::ui::commands::{Command, handle_command};
+                                use crate::ui::commands::{Command, CommandResponse, handle_command};
 
                                 let command = Command::ToggleScriptFile { filename };
-                                handle_command(
+                                let response = handle_command(
                                     command,
                                     self.state.app_state.clone(),
                                     self.manager.clone(),
                                 ).await;
+                                if let CommandResponse::Error(err) = response {
+                                    tracing::error!("Failed to toggle script file: {}", err);
+                                    self.state.validation_error =
+                                        Some(crate::tui::localize_command_error(&self.state, &err));
+                                }
                             }
                         } else {
                             self.start_app_settings_edit().await?;
@@ -1349,6 +1362,10 @@ impl TuiApp {
 
     /// Handle folder edit mode
     async fn handle_folder_edit_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
+        // A rejected edit's error is only relevant until the user's next
+        // action; a save below that fails again re-sets it.
+        self.state.validation_error = None;
+
         // If currently editing a field, handle text input before the resolver
         // ever sees the key (otherwise typing e.g. 'j' into the Name field
         // would move the row selection instead of entering the letter).
@@ -1415,17 +1432,22 @@ impl TuiApp {
                         let script_files = self.state.cached_script_files.clone();
 
                         if let Some(filename) = script_files.get(script_index).cloned() {
-                            use crate::ui::commands::{Command, handle_command};
+                            use crate::ui::commands::{Command, CommandResponse, handle_command};
 
                             let command = Command::ToggleFolderScriptFile {
                                 folder_id: folder_id.clone(),
                                 filename,
                             };
-                            handle_command(
+                            let response = handle_command(
                                 command,
                                 self.state.app_state.clone(),
                                 self.manager.clone(),
                             ).await;
+                            if let CommandResponse::Error(err) = response {
+                                tracing::error!("Failed to toggle folder script file: {}", err);
+                                self.state.validation_error =
+                                    Some(crate::tui::localize_command_error(&self.state, &err));
+                            }
                         }
                     }
                 } else {
@@ -1817,15 +1839,22 @@ impl TuiApp {
         )
         .await;
 
-        if let crate::ui::commands::CommandResponse::Success { .. } = response {
-            let args = fluent::fluent_args! {
-                "label" => self.state.t(ApplicationSettingsField::ScriptsEnabled.label_key()),
-            };
-            self.state.status_message =
-                Some(self.state.t_with_args("settings-restart-notice", Some(&args)));
+        match response {
+            crate::ui::commands::CommandResponse::Success { .. } => {
+                self.state.validation_error = None;
+                let args = fluent::fluent_args! {
+                    "label" => self.state.t(ApplicationSettingsField::ScriptsEnabled.label_key()),
+                };
+                self.state.status_message =
+                    Some(self.state.t_with_args("settings-restart-notice", Some(&args)));
+                tracing::info!("Toggled scripts enabled to {}", new_value);
+            }
+            crate::ui::commands::CommandResponse::Error(err) => {
+                tracing::error!("Failed to toggle scripts enabled: {}", err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
+            }
         }
 
-        tracing::info!("Toggled scripts enabled to {}", new_value);
         Ok(())
     }
 
@@ -1875,15 +1904,22 @@ impl TuiApp {
         )
         .await;
 
-        if let crate::ui::commands::CommandResponse::Success { .. } = response {
-            let args = fluent::fluent_args! {
-                "label" => self.state.t(ApplicationSettingsField::AutoLaunchDnd.label_key()),
-            };
-            self.state.status_message =
-                Some(self.state.t_with_args("settings-restart-notice", Some(&args)));
+        match response {
+            crate::ui::commands::CommandResponse::Success { .. } => {
+                self.state.validation_error = None;
+                let args = fluent::fluent_args! {
+                    "label" => self.state.t(ApplicationSettingsField::AutoLaunchDnd.label_key()),
+                };
+                self.state.status_message =
+                    Some(self.state.t_with_args("settings-restart-notice", Some(&args)));
+                tracing::info!("Toggled auto launch dnd to {}", new_value);
+            }
+            crate::ui::commands::CommandResponse::Error(err) => {
+                tracing::error!("Failed to toggle auto launch dnd: {}", err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
+            }
         }
 
-        tracing::info!("Toggled auto launch dnd to {}", new_value);
         Ok(())
     }
 

@@ -651,6 +651,23 @@ fn render_task_logs(_app: &TuiApp, task: &crate::download::task::DownloadTask, f
     f.render_widget(paragraph, area);
 }
 
+/// Build the `" | msg | err"`-style suffix appended to a status line, for
+/// modes (Settings, FolderEdit) that surface both the restart notice
+/// (`status_message`) and a rejected-edit error (`validation_error`) in the
+/// same line. Either, both, or neither may be present.
+fn status_suffix(status_message: Option<&str>, validation_error: Option<&str>) -> String {
+    let mut suffix = String::new();
+    if let Some(msg) = status_message {
+        suffix.push_str(" | ");
+        suffix.push_str(msg);
+    }
+    if let Some(err) = validation_error {
+        suffix.push_str(" | ");
+        suffix.push_str(err);
+    }
+    suffix
+}
+
 /// Render status bar with keybindings (Quick Actions Bar)
 fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
     let t = |key: &str| app.state.t(key);
@@ -764,15 +781,14 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
             (t_args("status-hint-close", Some(&args)), String::new())
         }
         UiMode::Settings => {
-            // The restart notice set right after editing a field is shown
-            // here too, not only in Normal mode, since the user is usually
-            // still on the settings screen when it matters.
-            let status_hint = app
-                .state
-                .status_message
-                .as_ref()
-                .map(|msg| format!(" | {msg}"))
-                .unwrap_or_default();
+            // The restart notice set right after editing a field, and a
+            // rejected edit's error, are both shown here too, not only in
+            // Normal mode, since the user is usually still on the settings
+            // screen when they matter.
+            let status_hint = status_suffix(
+                app.state.status_message.as_deref(),
+                app.state.validation_error.as_deref(),
+            );
             let args = fluent_args! {
                 "back" => key(KeyAction::Back),
                 "reload" => key(KeyAction::ReloadConfig),
@@ -783,13 +799,20 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
             )
         }
         UiMode::FolderEdit => {
+            let status_hint = status_suffix(
+                app.state.status_message.as_deref(),
+                app.state.validation_error.as_deref(),
+            );
             let args = fluent_args! {
                 "down" => key(KeyAction::MoveDown),
                 "up" => key(KeyAction::MoveUp),
                 "select" => key(KeyAction::SelectItem),
                 "back" => key(KeyAction::Back),
             };
-            (t_args("status-hint-folder-edit", Some(&args)), String::new())
+            (
+                format!("{}{}", t_args("status-hint-folder-edit", Some(&args)), status_hint),
+                String::new(),
+            )
         }
         UiMode::ConfirmDelete => {
             let args = fluent_args! {
@@ -2735,6 +2758,17 @@ mod tests {
             .add_resource(Arc::new(resource))
             .unwrap_or_else(|errors| panic!("failed to add resource {path}: {errors:?}"));
         bundle
+    }
+
+    #[test]
+    fn status_suffix_covers_message_and_error_combinations() {
+        assert_eq!(status_suffix(None, None), "");
+        assert_eq!(status_suffix(Some("restart needed"), None), " | restart needed");
+        assert_eq!(status_suffix(None, Some("invalid value")), " | invalid value");
+        assert_eq!(
+            status_suffix(Some("restart needed"), Some("invalid value")),
+            " | restart needed | invalid value"
+        );
     }
 
     /// Every action shown on the help screen must have a description in both
