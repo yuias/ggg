@@ -1,6 +1,5 @@
 use super::config::Config;
 use crate::script::{executor, message::ScriptRequest};
-use crate::util::i18n::LocalizationManager;
 use anyhow::Result;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -9,8 +8,6 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<Config>>,
-    /// Shared internationalization manager
-    pub i18n: Arc<LocalizationManager>,
     /// Channel sender for script execution requests
     ///
     /// When Some, scripts are enabled and requests are sent to the executor thread.
@@ -19,31 +16,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Create LocalizationManager with fallback to English
-    fn create_i18n(language: &str) -> Arc<LocalizationManager> {
-        Arc::new(
-            LocalizationManager::new(language).unwrap_or_else(|e| {
-                tracing::error!("Failed to load translations for '{}': {}", language, e);
-                tracing::info!("Falling back to English");
-                LocalizationManager::new("en").unwrap_or_else(|e2| {
-                    // Bundled English should always load; if it somehow can't,
-                    // start with a placeholder manager rather than panicking.
-                    tracing::error!("Failed to load fallback English locale: {}", e2);
-                    LocalizationManager::fallback()
-                })
-            }),
-        )
-    }
-
-    pub fn new(config: Config, language: &str) -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
-            i18n: Self::create_i18n(language),
             script_sender: None,
         }
     }
 
-    pub async fn new_with_scripts(config: Config, language: &str) -> Result<Self> {
+    pub async fn new_with_scripts(config: Config) -> Result<Self> {
         // Spawn script executor thread if scripts enabled
         let script_sender = if config.scripts.enabled {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -107,19 +87,8 @@ impl AppState {
 
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
-            i18n: Self::create_i18n(language),
             script_sender,
         })
-    }
-
-    /// Get translated string by key
-    pub fn t(&self, key: &str) -> String {
-        self.i18n.get(key)
-    }
-
-    /// Get translated string with arguments
-    pub fn t_with_args(&self, key: &str, args: Option<&fluent_bundle::FluentArgs>) -> String {
-        self.i18n.get_with_args(key, args)
     }
 
     /// Reload all scripts from disk
@@ -198,12 +167,12 @@ mod tests {
     fn app_state_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AppState>();
-        assert_send_sync::<LocalizationManager>();
+        assert_send_sync::<crate::util::i18n::LocalizationManager>();
     }
 
     #[tokio::test]
     async fn flush_scripts_without_executor_returns_immediately() {
-        let state = AppState::new(Config::default(), "en");
+        let state = AppState::new(Config::default());
         assert!(state.script_sender.is_none());
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

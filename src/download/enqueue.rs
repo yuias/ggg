@@ -212,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_respects_prevent_duplicate() {
         let config = config_with_folder("downloads", false, true);
-        let state = AppState::new(config.clone(), "en");
+        let state = AppState::new(config.clone());
         let manager = crate::download::manager::DownloadManager::new();
 
         let opts = EnqueueOptions::default();
@@ -229,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_does_not_start_when_not_allowed() {
         let config = config_with_folder("downloads", true, false);
-        let state = AppState::new(config.clone(), "en");
+        let state = AppState::new(config.clone());
         let manager = crate::download::manager::DownloadManager::new();
 
         let opts = EnqueueOptions::default();

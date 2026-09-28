@@ -5,12 +5,12 @@
 //! machine-readable data, and this is where each variant becomes a translated,
 //! user-facing string in the application's current locale.
 
-use crate::AppState;
+use super::state::TuiState;
 use crate::ui::commands::CommandError;
 use fluent::fluent_args;
 
 /// Translate a [`CommandError`] into a localized, user-facing message.
-pub(crate) fn localize_command_error(state: &AppState, err: &CommandError) -> String {
+pub(crate) fn localize_command_error(state: &TuiState, err: &CommandError) -> String {
     match err {
         CommandError::InvalidUuid => state.t("cmd-error-invalid-uuid"),
         CommandError::InvalidConfig => state.t("cmd-error-invalid-config"),

@@ -820,7 +820,7 @@ mod tests {
 
     fn test_context(manager: DownloadManager) -> DaemonContext {
         DaemonContext {
-            state: AppState::new(Config::default(), "en"),
+            state: AppState::new(Config::default()),
             manager,
             shutdown: Arc::new(Notify::new()),
             started_at: Instant::now(),
@@ -1634,7 +1634,7 @@ mod tests {
             },
         );
         let ctx = DaemonContext {
-            state: AppState::new(config, "en"),
+            state: AppState::new(config),
             manager,
             shutdown: Arc::new(Notify::new()),
             started_at: Instant::now(),

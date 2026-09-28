@@ -57,9 +57,10 @@ impl TuiApp {
         app_state: AppState,
         manager: DownloadManager,
         keybindings: &crate::app::keybindings::KeybindingsConfig,
+        language: &str,
     ) -> Self {
         Self {
-            state: TuiState::new(app_state, keybindings),
+            state: TuiState::new(app_state, keybindings, language),
             manager,
             should_quit: false,
             last_update_time: std::time::Instant::now(),
@@ -2710,7 +2711,7 @@ impl TuiApp {
                 // log the plain-English Display form for diagnostics.
                 tracing::error!("Failed to update setting: {}", err);
                 self.state.validation_error =
-                    Some(crate::tui::localize_command_error(&self.state.app_state, &err));
+                    Some(crate::tui::localize_command_error(&self.state, &err));
             }
         }
 
@@ -2799,14 +2800,12 @@ pub async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Read keybindings from config
-    let keybindings = {
+    let (keybindings, language) = {
         let config = app_state.config.read().await;
-        config.ui.keybindings.clone()
+        (config.ui.keybindings.clone(), config.general.language.clone())
     };
 
-    // Create app
-    let mut app = TuiApp::new(app_state, manager, &keybindings);
+    let mut app = TuiApp::new(app_state, manager, &keybindings, &language);
 
     // Set initial current_folder_id to the "default" folder's UUID
     {

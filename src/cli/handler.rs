@@ -2019,7 +2019,7 @@ mod tests {
             folder.save_path = std::path::PathBuf::from("/batch-add-save-path");
             folder.default_headers.insert("X-Batch".to_string(), "1".to_string());
         }
-        let state = AppState::new(config, "en");
+        let state = AppState::new(config);
         let manager = DownloadManager::new();
 
         let urls = vec!["https://example.com/f.zip".to_string()];
@@ -2037,7 +2037,7 @@ mod tests {
     #[tokio::test]
     async fn batch_enqueue_skips_invalid_and_duplicate() {
         let (config, folder_id) = config_with_folder("downloads", true);
-        let state = AppState::new(config, "en");
+        let state = AppState::new(config);
         let manager = DownloadManager::new();
 
         let urls = vec![
@@ -2058,7 +2058,7 @@ mod tests {
     #[tokio::test]
     async fn batch_enqueue_unknown_folder_is_err() {
         let (config, _) = config_with_folder("downloads", false);
-        let state = AppState::new(config, "en");
+        let state = AppState::new(config);
         let manager = DownloadManager::new();
 
         let urls = vec!["https://example.com/f.zip".to_string()];

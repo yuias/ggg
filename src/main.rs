@@ -136,8 +136,7 @@ async fn main() -> Result<()> {
         config.download.retry_count);
 
     // Initialize application state with scripts
-    let language = config.general.language.clone();
-    let state = AppState::new_with_scripts(config.clone(), &language).await?;
+    let state = AppState::new_with_scripts(config.clone()).await?;
 
     // Initialize download manager with folder slot configuration
     let max_concurrent = config.download.max_concurrent;

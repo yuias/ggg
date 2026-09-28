@@ -489,16 +489,29 @@ pub struct TuiState {
     pub ipc_pipe_name: Option<String>,
 }
 
+/// Loads `language`, falling back to English and then to a placeholder
+/// manager, so a bad locale never keeps the TUI from starting.
+fn load_translations(language: &str) -> Arc<LocalizationManager> {
+    Arc::new(LocalizationManager::new(language).unwrap_or_else(|e| {
+        tracing::error!("Failed to load translations for '{}': {}", language, e);
+        tracing::info!("Falling back to English");
+        LocalizationManager::new("en").unwrap_or_else(|e2| {
+            tracing::error!("Failed to load fallback English locale: {}", e2);
+            LocalizationManager::fallback()
+        })
+    }))
+}
+
 impl TuiState {
     pub fn new(
         app_state: AppState,
         keybindings: &crate::app::keybindings::KeybindingsConfig,
+        language: &str,
     ) -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
 
-        // Share translations from AppState
-        let i18n = app_state.i18n.clone();
+        let i18n = load_translations(language);
 
         // Create keybinding resolver from config
         let keybinding_resolver =
