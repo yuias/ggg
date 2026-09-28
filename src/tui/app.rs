@@ -510,15 +510,18 @@ impl TuiApp {
                     // Confirm and add download (same logic as Enter key)
                     let url = self.state.input_buffer.clone();
                     let config = self.state.app_state.config.read().await;
-                    let task = crate::download::task::DownloadTask::new_with_folder(
+                    let mut task = crate::download::task::DownloadTask::new_with_folder(
                         url,
                         self.state.current_folder_id.clone(),
                         &config,
                     );
                     drop(config);
+                    item_editor::apply_add_referrer(&mut task, &self.state.add_referrer);
                     self.add_download_with_auto_start(task).await?;
                     self.state.ui_mode = UiMode::Normal;
                     self.state.input_buffer.clear();
+                    self.state.add_referrer.clear();
+                    self.state.add_referrer_focused = false;
                     self.state.preview_info = None;
                 } else {
                     // Cancel - return to add download mode
@@ -820,6 +823,8 @@ impl TuiApp {
                 KeyAction::AddDownload => {
                     self.state.ui_mode = UiMode::AddDownload;
                     self.state.input_buffer.clear();
+                    self.state.add_referrer.clear();
+                    self.state.add_referrer_focused = false;
                     return Ok(());
                 }
                 KeyAction::DeleteDownload => {
@@ -951,6 +956,13 @@ impl TuiApp {
 
     /// Handle input mode (for Add Download dialog)
     async fn handle_input_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
+        // Tab only switches fields in the add-download dialog: EditingField
+        // (app-settings text edit) has no second field.
+        if self.state.ui_mode == UiMode::AddDownload && matches!(key, KeyCode::Tab | KeyCode::BackTab) {
+            self.state.add_referrer_focused = !self.state.add_referrer_focused;
+            return Ok(());
+        }
+
         match self.apply_text_edit_key(key, mods) {
             TextEdit::Typed => {
                 // Clear validation error on any edit
@@ -962,6 +974,11 @@ impl TuiApp {
                     self.save_app_setting_value().await?;
                     self.state.is_editing_app_setting = false;
                 } else if !self.state.input_buffer.is_empty() {
+                    if !item_editor::is_valid_referrer(&self.state.add_referrer) {
+                        self.state.validation_error =
+                            Some(self.state.t("dialog-item-edit-invalid-referrer"));
+                        return Ok(());
+                    }
                     let url = self.state.input_buffer.clone();
 
                     // Shift+Enter: Expand URL patterns like [1-10] or [001-010]
@@ -992,17 +1009,20 @@ impl TuiApp {
                     if skip_preview || is_batch {
                         // Add downloads directly without preview
                         // Create all tasks first while holding the config lock
+                        let referrer = self.state.add_referrer.clone();
                         let tasks: Vec<_> = {
                             let config = self.state.app_state.config.read().await;
                             let folder_id = self.state.current_folder_id.clone();
                             urls_to_add
                                 .iter()
                                 .map(|url| {
-                                    crate::download::task::DownloadTask::new_with_folder(
+                                    let mut task = crate::download::task::DownloadTask::new_with_folder(
                                         url.clone(),
                                         folder_id.clone(),
                                         &config,
-                                    )
+                                    );
+                                    item_editor::apply_add_referrer(&mut task, &referrer);
+                                    task
                                 })
                                 .collect()
                         };
@@ -1018,13 +1038,17 @@ impl TuiApp {
 
                         self.state.ui_mode = UiMode::Normal;
                         self.state.input_buffer.clear();
+                        self.state.add_referrer.clear();
+                        self.state.add_referrer_focused = false;
                     } else if let Some(single_url) = urls_to_add.into_iter().next() {
                         // Single URL with preview
-                        match self.fetch_download_info(&single_url).await {
+                        let referrer = self.state.add_referrer.clone();
+                        let referrer = if referrer.trim().is_empty() { None } else { Some(referrer.trim()) };
+                        match self.fetch_download_info(&single_url, referrer).await {
                             Ok(info) => {
                                 self.state.preview_info = Some(info);
                                 self.state.ui_mode = UiMode::DownloadPreview;
-                                // Keep input_buffer for preview dialog
+                                // Keep input_buffer and add_referrer for the preview dialog
                             }
                             Err(e) => {
                                 tracing::error!("Failed to fetch download info: {}", e);
@@ -1037,10 +1061,14 @@ impl TuiApp {
                         // No URLs to add (e.g. an invalid range pattern) — back to normal.
                         self.state.ui_mode = UiMode::Normal;
                         self.state.input_buffer.clear();
+                        self.state.add_referrer.clear();
+                        self.state.add_referrer_focused = false;
                     }
                 } else {
                     self.state.ui_mode = UiMode::Normal;
                     self.state.input_buffer.clear();
+                    self.state.add_referrer.clear();
+                    self.state.add_referrer_focused = false;
                 }
             }
             TextEdit::Cancel => {
@@ -1049,6 +1077,8 @@ impl TuiApp {
                     self.state.ui_mode = UiMode::Settings;
                 } else {
                     self.state.ui_mode = UiMode::Normal;
+                    self.state.add_referrer.clear();
+                    self.state.add_referrer_focused = false;
                 }
                 self.state.input_buffer.clear();
                 // Clear validation error on cancel
@@ -2574,8 +2604,14 @@ impl TuiApp {
         self.manager.save_queue_to_folders().await
     }
 
-    /// Fetch download information from URL
-    async fn fetch_download_info(&self, url: &str) -> Result<crate::download::http_client::DownloadInfo> {
+    /// Fetch download information from URL, sending `referrer` (if any) with
+    /// the preview HEAD request so a server that gates on Referer previews
+    /// correctly.
+    async fn fetch_download_info(
+        &self,
+        url: &str,
+        referrer: Option<&str>,
+    ) -> Result<crate::download::http_client::DownloadInfo> {
         use crate::download::http_client::HttpClient;
 
         let config = self.state.app_state.config.read().await;
@@ -2583,7 +2619,8 @@ impl TuiApp {
         drop(config);
 
         let client = HttpClient::with_user_agent(&user_agent)?;
-        let headers = HttpClient::build_headers(Some(&user_agent), None, &std::collections::HashMap::new())?;
+        let headers =
+            HttpClient::build_headers(Some(&user_agent), referrer, &std::collections::HashMap::new())?;
 
         client.get_info(url, &headers).await
     }
@@ -2601,12 +2638,13 @@ impl TuiApp {
                     let config = self.state.app_state.config.read().await;
 
                     // Use new_with_folder to apply folder defaults
-                    let task = crate::download::task::DownloadTask::new_with_folder(
+                    let mut task = crate::download::task::DownloadTask::new_with_folder(
                         url,
                         self.state.current_folder_id.clone(),
                         &config,
                     );
                     drop(config); // Release read lock before async operations
+                    item_editor::apply_add_referrer(&mut task, &self.state.add_referrer);
 
                     self.add_download_with_auto_start(task).await?;
                 }
@@ -2614,6 +2652,8 @@ impl TuiApp {
                 // Clean up and return to normal mode
                 self.state.ui_mode = UiMode::Normal;
                 self.state.input_buffer.clear();
+                self.state.add_referrer.clear();
+                self.state.add_referrer_focused = false;
                 self.state.preview_info = None;
             }
             Some(KeyAction::Back) => {

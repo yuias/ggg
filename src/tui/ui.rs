@@ -1825,10 +1825,35 @@ fn render_field_edit_dialog(app: &TuiApp, f: &mut Frame, area: Rect, field: supe
     f.render_widget(input_widget, dialog_area);
 }
 
-/// Render add download dialog (centered overlay)
+/// Render add download dialog (centered overlay). Two fields (URL, Referrer)
+/// in the same form style as the item editor; Tab switches focus.
 fn render_add_download_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
-    let dialog_width = 60;
-    let dialog_height = 5;
+    let referrer_focused = app.state.add_referrer_focused;
+
+    let mut lines = vec![
+        form_row(
+            &app.state.t("dialog-add-download-url"),
+            &app.state.input_buffer,
+            !referrer_focused,
+        ),
+        form_row(&app.state.t("dialog-add-download-referrer"), &app.state.add_referrer, referrer_focused),
+    ];
+
+    if let Some(error) = &app.state.validation_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(error.as_str(), Style::default().fg(Color::Red))));
+    }
+
+    let dialog_width = 80;
+    // A long URL or referrer wraps inside the box (`Wrap { trim: true }`
+    // below), so the row count must account for wrapped width, not just line
+    // count, or the bottom rows (including the validation error) get clipped.
+    let inner_width = (dialog_width - 2) as usize;
+    let wrapped_rows: usize = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(inner_width))
+        .sum();
+    let dialog_height = (wrapped_rows as u16 + 2).max(5);
 
     let dialog_area = Rect {
         x: (area.width.saturating_sub(dialog_width)) / 2,
@@ -1837,15 +1862,16 @@ fn render_add_download_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
         height: dialog_height,
     };
 
-    let text = format!("{} {}", app.state.t("prompt-url"), app.state.input_buffer);
-    let paragraph = Paragraph::new(text)
+    let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(app.state.t("dialog-add-download"))
                 .style(Style::default().bg(theme::BG_PRIMARY)),
-        );
+        )
+        .wrap(Wrap { trim: true });
 
+    f.render_widget(Clear, dialog_area);
     f.render_widget(paragraph, dialog_area);
 }
 

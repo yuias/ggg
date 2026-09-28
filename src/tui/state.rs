@@ -529,6 +529,16 @@ pub struct TuiState {
     /// Input buffer for dialogs
     pub input_buffer: String,
 
+    /// Referrer typed in the add-download dialog (`UiMode::AddDownload`);
+    /// applied to every URL added from that dialog, including `[n-m]`
+    /// expansions. Cleared whenever the dialog closes to `Normal`, kept
+    /// across Preview -> Esc -> AddDownload.
+    pub add_referrer: String,
+
+    /// Whether Tab moved focus to the Referrer field in the add-download
+    /// dialog; otherwise the URL field (`input_buffer`) is focused.
+    pub add_referrer_focused: bool,
+
     /// Input dialog title (for EditingField mode)
     pub input_title: String,
 
@@ -691,6 +701,8 @@ impl TuiState {
             ui_mode: UiMode::Normal,
             show_details: true,
             input_buffer: String::new(),
+            add_referrer: String::new(),
+            add_referrer_focused: false,
             input_title: String::new(),
             input_prompt: String::new(),
             current_folder_id: "default".to_string(),
@@ -1389,12 +1401,17 @@ impl TuiState {
     }
 
     /// Buffer that typed/pasted text goes to in the current mode: the focused
-    /// item-editor field in `ItemEdit`, otherwise the generic `input_buffer`.
+    /// item-editor field in `ItemEdit`, `add_referrer` when the add-download
+    /// dialog has its Referrer field focused, otherwise the generic
+    /// `input_buffer`.
     pub fn active_input_mut(&mut self) -> &mut String {
         if self.ui_mode == UiMode::ItemEdit {
             if let Some(editor) = self.item_editor.as_mut() {
                 return editor.focused_mut();
             }
+        }
+        if self.ui_mode == UiMode::AddDownload && self.add_referrer_focused {
+            return &mut self.add_referrer;
         }
         &mut self.input_buffer
     }
