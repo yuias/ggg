@@ -169,6 +169,11 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Show every header value, including credentials such as
+        /// Authorization and Cookie
+        #[arg(long)]
+        show_secrets: bool,
     },
 
     /// Manage configuration

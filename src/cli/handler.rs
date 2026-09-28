@@ -33,7 +33,7 @@ pub async fn handle_command(
         Commands::Start { id, wait } => handle_start(id, &state, &manager, wait).await,
         Commands::Pause { id } => handle_pause(id, &manager).await,
         Commands::Remove { id } => handle_remove(id, &manager).await,
-        Commands::Status { id, json } => handle_status(id, &manager, json).await,
+        Commands::Status { id, json, show_secrets } => handle_status(id, &manager, json, show_secrets).await,
         Commands::Config { action } => handle_config(action, &state).await,
         Commands::Logs { follow, level, lines } => handle_logs(follow, level, lines).await,
         Commands::History { today, folder, json } => handle_history(today, folder, json).await,
@@ -368,13 +368,13 @@ async fn handle_remove(
 }
 
 /// Show download status
-async fn handle_status(id_str: String, manager: &DownloadManager, json: bool) -> Result<i32> {
+async fn handle_status(id_str: String, manager: &DownloadManager, json: bool, show_secrets: bool) -> Result<i32> {
     let id = parse_task_id(&id_str)?;
 
     let task = manager.get_by_id(id).await
         .ok_or_else(|| anyhow::anyhow!("Download not found"))?;
 
-    super::remote::render_task(task, false, json);
+    super::remote::render_task(task, false, json, show_secrets);
 
     Ok(error::SUCCESS)
 }

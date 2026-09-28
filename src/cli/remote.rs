@@ -312,7 +312,7 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
                 Err(e) => render_send_error(&e),
             }
         }
-        Commands::Status { id, json } => {
+        Commands::Status { id, json, show_secrets } => {
             let uid = match super::handler::parse_task_id(id) {
                 Ok(u) => u,
                 Err(e) => {
@@ -322,7 +322,7 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
             };
             match client::send(pipe_name, &ControlRequest::Get { id: uid }, Some(REQUEST_TIMEOUT)).await {
                 Ok(ControlResponse::Task { task, in_history }) => {
-                    render_task(task, in_history, *json);
+                    render_task(task, in_history, *json, *show_secrets);
                     RouteDecision::Handled(error::SUCCESS)
                 }
                 Ok(other) => render_unexpected(other),
@@ -733,14 +733,16 @@ pub fn move_op_from_args(
     }
 }
 
-/// Replaces every header value with a placeholder before a task is printed.
-/// Header *names* stay visible (useful to confirm a `--header`/`--referrer`
-/// landed), but a value can itself be a secret (`Cookie`, `Authorization`, a
-/// signed URL) that must never reach stdout via `list`/`status`, daemon-routed
-/// or not.
+/// Masks credential-like header values (`crate::util::redact`) before a task
+/// is printed via `list`/`status`/`modify`/`wait`, daemon-routed or not.
+/// Names and harmless values such as `Referer` stay visible so a
+/// `--header`/`--referrer` edit can be confirmed; `status --show-secrets`
+/// skips this.
 fn redact_task_headers(mut task: DownloadTask) -> DownloadTask {
-    for value in task.headers.values_mut() {
-        *value = "<redacted>".to_string();
+    for (name, value) in task.headers.iter_mut() {
+        if crate::util::redact::is_sensitive_header(name) {
+            *value = crate::util::redact::REDACTED.to_string();
+        }
     }
     task
 }
@@ -756,8 +758,8 @@ pub fn render_tasks(tasks: Vec<DownloadTask>, json: bool) {
 /// Renders a `status`/`get` result. `in_history` only affects the
 /// human-readable form (a small trailing note); the JSON form always matches
 /// the standalone shape, which never had an `in_history` field.
-pub fn render_task(task: DownloadTask, in_history: bool, json: bool) {
-    let task = redact_task_headers(task);
+pub fn render_task(task: DownloadTask, in_history: bool, json: bool, show_secrets: bool) {
+    let task = if show_secrets { task } else { redact_task_headers(task) };
     if json {
         match serde_json::to_string_pretty(&task) {
             Ok(s) => println!("{s}"),
@@ -1028,14 +1030,16 @@ mod tests {
     }
 
     #[test]
-    fn redact_task_headers_hides_values_but_keeps_names() {
+    fn redact_task_headers_masks_sensitive_values_only() {
         let mut task = DownloadTask::new(
             "https://example.com/f".to_string(),
             std::path::PathBuf::from("f"),
         );
         task.headers.insert("Cookie".to_string(), "sid=SECRET".to_string());
+        task.headers.insert("Referer".to_string(), "https://example.com/".to_string());
         let redacted = redact_task_headers(task);
         assert_eq!(redacted.headers.get("Cookie").map(String::as_str), Some("<redacted>"));
+        assert_eq!(redacted.headers.get("Referer").map(String::as_str), Some("https://example.com/"));
     }
 
     #[test]
