@@ -473,6 +473,35 @@ fn render_task_info(app: &TuiApp, task: &crate::download::task::DownloadTask, f:
         Line::from(""),
         Line::from(vec![
             Span::styled(
+                format!("{} ", app.state.t("details-label-referrer")),
+                Style::default().add_modifier(Modifier::BOLD)
+            ),
+        ]),
+        Line::from(Span::raw(
+            crate::tui::item_editor::find_header(task, "Referer")
+                .map(str::to_string)
+                .unwrap_or_else(|| app.state.t("details-referrer-policy")),
+        )),
+    ];
+
+    let masked = crate::tui::item_editor::masked_headers(task);
+    if !masked.is_empty() {
+        details.push(Line::from(""));
+        details.push(Line::from(vec![
+            Span::styled(
+                format!("{} ", app.state.t("details-label-headers")),
+                Style::default().add_modifier(Modifier::BOLD)
+            ),
+        ]));
+        for (name, value) in &masked {
+            details.push(Line::from(Span::raw(format!("{}: {}", name, value))));
+        }
+    }
+
+    details.extend([
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
                 format!("{} ", app.state.t("details-label-size")),
                 Style::default().add_modifier(Modifier::BOLD)
             ),
@@ -491,7 +520,7 @@ fn render_task_info(app: &TuiApp, task: &crate::download::task::DownloadTask, f:
             Span::raw(format!("{:.1}%", progress)),
         ]),
         Line::from(Span::raw(format_progress_bar(task.downloaded, task.size, 30))),
-    ];
+    ]);
 
     // Add error message if present - enhanced display with visual prominence
     if let Some(ref error) = task.error_message {

@@ -5,6 +5,9 @@
 details-label-status = Status:
 details-label-url = URL:
 details-label-save-path = Save Path:
+details-label-referrer = Referrer:
+details-referrer-policy = (referrer policy)
+details-label-headers = Headers:
 details-label-size = Size:
 details-label-downloaded = Downloaded:
 details-label-filename = 📄 Filename:
