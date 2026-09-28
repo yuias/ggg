@@ -4,7 +4,7 @@ use super::format::{
 };
 use super::state::{DeleteTarget, DetailsPosition, FocusPane, FolderTreeItem, UiMode};
 use super::theme;
-use crate::app::keybindings::KeyAction;
+use crate::app::keybindings::{format_key_for_display, KeyAction};
 use crate::download::task::{DownloadStatus, LogLevel};
 use crate::download::http_errors::HttpErrorInfo;
 use fluent::fluent_args;
@@ -626,12 +626,15 @@ fn render_task_logs(_app: &TuiApp, task: &crate::download::task::DownloadTask, f
 fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
     let t = |key: &str| app.state.t(key);
     let t_args = |key: &str, args: Option<&fluent_bundle::FluentArgs>| app.state.t_with_args(key, args);
+    let resolver = &app.state.keybinding_resolver;
+    let key = |action: KeyAction| resolver.display_key(action);
 
     let (left_content, right_content) = match app.state.ui_mode {
         UiMode::Normal => {
             // Quick actions for main screen
             let undo_hint = if !app.state.delete_history.is_empty() {
                 let args = fluent_args! {
+                    "key" => key(KeyAction::Undo),
                     "count" => app.state.delete_history.len(),
                 };
                 format!(" | {}", t_args("status-normal-undo", Some(&args)))
@@ -656,13 +659,25 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
                 FocusPane::DownloadList => "status-normal-actions-download",
                 FocusPane::DetailsPanel => "status-normal-actions-details",
             };
+            let actions_args = fluent_args! {
+                "toggle" => key(KeyAction::ToggleDownload),
+                "select" => key(KeyAction::ToggleSelection),
+                "add" => key(KeyAction::AddDownload),
+                "delete" => key(KeyAction::DeleteDownload),
+                "menu" => key(KeyAction::OpenContextMenu),
+            };
+            let right_args = fluent_args! {
+                "switch" => key(KeyAction::SwitchFolder),
+                "help" => key(KeyAction::OpenHelp),
+                "quit" => key(KeyAction::Quit),
+            };
             let left = format!(
                 "{} | {}{}{} | {}",
                 t_args("status-normal-folder", Some(&args)),
-                t(actions_key),
+                t_args(actions_key, Some(&actions_args)),
                 undo_hint,
                 status_hint,
-                t("status-normal-right")
+                t_args("status-normal-right", Some(&right_args))
             );
             // Version displayed on the right for main screen
             let version_args = fluent_args! {
@@ -671,7 +686,9 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
             let right = t_args("app-version", Some(&version_args));
             (left, right)
         }
-        // For other screens, show hints on left, nothing on right
+        // For other screens, show hints on left, nothing on right.
+        // Esc/Enter here belong to a free-text input box (typing, not a
+        // configurable action) so they stay literal.
         UiMode::AddDownload => {
             (t("status-hint-cancel"), String::new())
         }
@@ -679,22 +696,47 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
             (t("status-hint-cancel"), String::new())
         }
         UiMode::DownloadPreview => {
-            (t("status-hint-confirm-cancel"), String::new())
+            let args = fluent_args! {
+                "confirm" => key(KeyAction::SelectItem),
+                "cancel" => key(KeyAction::Back),
+            };
+            (t_args("status-hint-confirm-cancel", Some(&args)), String::new())
         }
         UiMode::Search => {
             (t("status-hint-finish"), String::new())
         }
         UiMode::ChangeFolder => {
-            (t("status-hint-navigate"), String::new())
+            let args = fluent_args! {
+                "down" => key(KeyAction::MoveDown),
+                "up" => key(KeyAction::MoveUp),
+                "select" => key(KeyAction::SelectItem),
+                "cancel" => key(KeyAction::Back),
+            };
+            (t_args("status-hint-navigate", Some(&args)), String::new())
         }
         UiMode::ChangeSavePath => {
-            (t("status-hint-confirm-cancel"), String::new())
+            // Free-text path input: Enter/Esc are the hard-coded text-edit
+            // keys, not resolver-backed.
+            let args = fluent_args! {
+                "confirm" => "Enter",
+                "cancel" => "Esc",
+            };
+            (t_args("status-hint-confirm-cancel", Some(&args)), String::new())
         }
         UiMode::SwitchFolder => {
-            (t("status-hint-navigate"), String::new())
+            let args = fluent_args! {
+                "down" => key(KeyAction::MoveDown),
+                "up" => key(KeyAction::MoveUp),
+                "select" => key(KeyAction::SelectItem),
+                "cancel" => key(KeyAction::Back),
+            };
+            (t_args("status-hint-navigate", Some(&args)), String::new())
         }
         UiMode::Help => {
-            (t("status-hint-close"), String::new())
+            let args = fluent_args! {
+                "back" => key(KeyAction::Back),
+            };
+            (t_args("status-hint-close", Some(&args)), String::new())
         }
         UiMode::Settings => {
             // The restart notice set right after editing a field is shown
@@ -706,19 +748,49 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
                 .as_ref()
                 .map(|msg| format!(" | {msg}"))
                 .unwrap_or_default();
-            (format!("{}{}", t("status-hint-settings"), status_hint), String::new())
+            let args = fluent_args! {
+                "back" => key(KeyAction::Back),
+                "reload" => key(KeyAction::ReloadConfig),
+            };
+            (
+                format!("{}{}", t_args("status-hint-settings", Some(&args)), status_hint),
+                String::new(),
+            )
         }
         UiMode::FolderEdit => {
-            (t("status-hint-folder-edit"), String::new())
+            let args = fluent_args! {
+                "down" => key(KeyAction::MoveDown),
+                "up" => key(KeyAction::MoveUp),
+                "select" => key(KeyAction::SelectItem),
+                "back" => key(KeyAction::Back),
+            };
+            (t_args("status-hint-folder-edit", Some(&args)), String::new())
         }
         UiMode::ConfirmDelete => {
-            (t("status-hint-confirm-yn"), String::new())
+            let args = fluent_args! {
+                "yes" => key(KeyAction::ConfirmYes),
+                "no" => key(KeyAction::ConfirmNo),
+                "back" => key(KeyAction::Back),
+            };
+            (t_args("status-hint-confirm-yn", Some(&args)), String::new())
         }
         UiMode::ContextMenu => {
-            (t("status-hint-menu"), String::new())
+            let args = fluent_args! {
+                "down" => key(KeyAction::MoveDown),
+                "up" => key(KeyAction::MoveUp),
+                "select" => key(KeyAction::SelectItem),
+                "back" => key(KeyAction::Back),
+            };
+            (t_args("status-hint-menu", Some(&args)), String::new())
         }
         UiMode::FolderContextMenu => {
-            (t("status-hint-menu"), String::new())
+            let args = fluent_args! {
+                "down" => key(KeyAction::MoveDown),
+                "up" => key(KeyAction::MoveUp),
+                "select" => key(KeyAction::SelectItem),
+                "back" => key(KeyAction::Back),
+            };
+            (t_args("status-hint-menu", Some(&args)), String::new())
         }
     };
 
@@ -785,18 +857,6 @@ fn to_kebab_case(name: &str) -> String {
         }
     }
     out
-}
-
-/// Short, human-friendly form of a configured key string, for on-screen
-/// display only (help screen, status-bar and dialog hints). The resolver's
-/// own key strings stay unabbreviated since they double as the parseable
-/// config format; do not use this for parsing.
-pub(crate) fn format_key_for_display(key: &str) -> String {
-    match key {
-        "Escape" => "Esc".to_string(),
-        "BackTab" => "Shift+Tab".to_string(),
-        other => other.to_string(),
-    }
 }
 
 /// Render help screen overlay as centered popup
@@ -980,6 +1040,9 @@ fn render_settings_tabs(app: &TuiApp, f: &mut Frame, area: Rect) {
 /// Render application settings
 fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
     use crate::tui::state::{ApplicationSettingsField, SettingsSection};
+
+    let resolver = &app.state.keybinding_resolver;
+    let key = |action: KeyAction| resolver.display_key(action);
 
     let config = app.state.app_state.config.try_read();
     let mut lines = Vec::new();
@@ -1195,8 +1258,15 @@ fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
                 }
 
                 lines.push(Line::from(""));
+                let toggle_args = fluent_args! {
+                    "down" => key(KeyAction::MoveDown),
+                    "up" => key(KeyAction::MoveUp),
+                    "toggle" => key(KeyAction::ToggleSelection),
+                    "select" => key(KeyAction::SelectItem),
+                    "reload" => key(KeyAction::ReloadConfig),
+                };
                 lines.push(Line::from(Span::styled(
-                    app.state.t("help-script-toggle"),
+                    app.state.t_with_args("help-script-toggle", Some(&toggle_args)),
                     Style::default().fg(muted_color),
                 )));
             }
@@ -1213,16 +1283,25 @@ fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
     // Add help text
     lines.push(Line::from(""));
     lines.push(Line::from(""));
+    let edit_field_args = fluent_args! { "select" => key(KeyAction::SelectItem) };
     lines.push(Line::from(Span::styled(
-        app.state.t("help-edit-field"),
+        app.state.t_with_args("help-edit-field", Some(&edit_field_args)),
         Style::default().fg(success_color),
     )));
+    let switch_tab_args = fluent_args! {
+        "next" => key(KeyAction::FocusNextPane),
+        "prev" => key(KeyAction::FocusPrevPane),
+    };
     lines.push(Line::from(Span::styled(
-        app.state.t("settings-hint-switch-tab"),
+        app.state.t_with_args("settings-hint-switch-tab", Some(&switch_tab_args)),
         Style::default().fg(section_header_color),
     )));
+    let close_args = fluent_args! {
+        "back" => key(KeyAction::Back),
+        "toggle" => key(KeyAction::OpenSettings),
+    };
     lines.push(Line::from(Span::styled(
-        app.state.t("settings-hint-close"),
+        app.state.t_with_args("settings-hint-close", Some(&close_args)),
         Style::default().fg(muted_color),
     )));
 
@@ -1353,6 +1432,9 @@ fn render_folder_list(app: &TuiApp, f: &mut Frame, area: Rect) {
 /// Render folder details/editor (right panel)
 fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
     use super::state::SettingsField;
+
+    let resolver = &app.state.keybinding_resolver;
+    let key = |action: KeyAction| resolver.display_key(action);
 
     let config = app.state.app_state.config.try_read();
     let is_edit_mode = app.state.ui_mode == UiMode::FolderEdit;
@@ -1569,8 +1651,15 @@ fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
                     }
 
                     detail_lines.push(Line::from(""));
+                    let toggle_args = fluent_args! {
+                        "down" => key(KeyAction::MoveDown),
+                        "up" => key(KeyAction::MoveUp),
+                        "toggle" => key(KeyAction::ToggleSelection),
+                        "select" => key(KeyAction::SelectItem),
+                        "reload" => key(KeyAction::ReloadConfig),
+                    };
                     detail_lines.push(Line::from(Span::styled(
-                        app.state.t("help-script-toggle"),
+                        app.state.t_with_args("help-script-toggle", Some(&toggle_args)),
                         Style::default().fg(muted_color),
                     )));
                 }
@@ -1619,8 +1708,14 @@ fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
 
     // Show different help text based on mode
     if is_edit_mode {
+        let navigate_args = fluent_args! {
+            "down" => key(KeyAction::MoveDown),
+            "up" => key(KeyAction::MoveUp),
+            "select" => key(KeyAction::SelectItem),
+            "back" => key(KeyAction::Back),
+        };
         detail_lines.push(Line::from(Span::styled(
-            app.state.t("help-folder-edit-navigate"),
+            app.state.t_with_args("help-folder-edit-navigate", Some(&navigate_args)),
             Style::default().fg(success_color),
         )));
         detail_lines.push(Line::from(Span::styled(
@@ -1628,8 +1723,9 @@ fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
             Style::default().fg(muted_color),
         )));
     } else {
+        let list_args = fluent_args! { "select" => key(KeyAction::SelectItem) };
         detail_lines.push(Line::from(Span::styled(
-            app.state.t("help-folder-list"),
+            app.state.t_with_args("help-folder-list", Some(&list_args)),
             Style::default().fg(success_color),
         )));
     }
@@ -1999,11 +2095,16 @@ fn render_change_folder_for_item_dialog(app: &TuiApp, f: &mut Frame, area: Rect)
         }
     }
 
+    let nav_args = fluent_args! {
+        "down" => app.state.keybinding_resolver.display_key(KeyAction::MoveDown),
+        "up" => app.state.keybinding_resolver.display_key(KeyAction::MoveUp),
+        "select" => app.state.keybinding_resolver.display_key(KeyAction::SelectItem),
+    };
     let paragraph = Paragraph::new(folder_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(app.state.t("dialog-change-folder"))
+                .title(app.state.t_with_args("dialog-change-folder", Some(&nav_args)))
                 .style(Style::default().bg(theme::BG_PRIMARY)),
         )
         .alignment(Alignment::Left);
@@ -2122,17 +2223,34 @@ fn render_confirm_delete_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
         ]
     };
 
+    // Show the keys that actually confirm/cancel the dialog (Enter/y confirm,
+    // n/Esc cancel by default) rather than a fixed "Y"/"N" that stops matching
+    // once ConfirmYes/ConfirmNo are configured with a different case or key.
+    let resolver = &app.state.keybinding_resolver;
+    let select_key = resolver.display_key(KeyAction::SelectItem);
+    let confirm_key = resolver.display_key(KeyAction::ConfirmYes);
+    let cancel_key = resolver.display_key(KeyAction::ConfirmNo);
+    let back_key = resolver.display_key(KeyAction::Back);
+
     lines.extend([
         Line::from(""),
         Line::from(Span::styled(
-            "Press Enter or Y to confirm, N or Esc to cancel",
+            format!(
+                "Press {select_key} or {confirm_key} to confirm, {cancel_key} or {back_key} to cancel"
+            ),
             Style::default().fg(Color::Cyan),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("      [ Yes (Y) ]", Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("      [ Yes ({confirm_key}) ]"),
+                Style::default().fg(Color::Green),
+            ),
             Span::raw("       "),
-            Span::styled("[ No (N) ]      ", Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("[ No ({cancel_key}) ]      "),
+                Style::default().fg(Color::Red),
+            ),
         ]),
     ]);
 
@@ -2256,11 +2374,16 @@ fn render_switch_folder_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
         ]));
     }
 
+    let nav_args = fluent_args! {
+        "down" => app.state.keybinding_resolver.display_key(KeyAction::MoveDown),
+        "up" => app.state.keybinding_resolver.display_key(KeyAction::MoveUp),
+        "select" => app.state.keybinding_resolver.display_key(KeyAction::SelectItem),
+    };
     let paragraph = Paragraph::new(folder_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(app.state.t("dialog-switch-folder"))
+                .title(app.state.t_with_args("dialog-switch-folder", Some(&nav_args)))
                 .style(Style::default().bg(theme::BG_PRIMARY)),
         )
         .alignment(Alignment::Left);
@@ -2324,11 +2447,16 @@ fn render_context_menu(app: &TuiApp, f: &mut Frame, area: Rect) {
         ]));
     }
 
+    let nav_args = fluent_args! {
+        "down" => app.state.keybinding_resolver.display_key(KeyAction::MoveDown),
+        "up" => app.state.keybinding_resolver.display_key(KeyAction::MoveUp),
+        "select" => app.state.keybinding_resolver.display_key(KeyAction::SelectItem),
+    };
     let paragraph = Paragraph::new(menu_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(app.state.t("dialog-actions"))
+                .title(app.state.t_with_args("dialog-actions", Some(&nav_args)))
                 .style(Style::default().bg(theme::BG_PRIMARY)),
         )
         .alignment(Alignment::Left);
@@ -2540,14 +2668,6 @@ mod tests {
     }
 
     #[test]
-    fn format_key_for_display_shortens_known_names() {
-        assert_eq!(format_key_for_display("Escape"), "Esc");
-        assert_eq!(format_key_for_display("BackTab"), "Shift+Tab");
-        assert_eq!(format_key_for_display("j"), "j");
-        assert_eq!(format_key_for_display("Ctrl+u"), "Ctrl+u");
-    }
-
-    #[test]
     fn kebab_case_matches_action_ids() {
         assert_eq!(
             help_action_message_id(KeyAction::MoveToTop),
@@ -2557,5 +2677,127 @@ mod tests {
             help_action_message_id(KeyAction::ConfirmYes),
             "help-action-confirm-yes"
         );
+    }
+
+    /// Every status-bar / dialog hint message that now takes the configured
+    /// key as an argument must format without a Fluent error (missing or
+    /// unknown argument) in both locales, and the two locales must agree on
+    /// argument names (a message present in one but not the other, or with a
+    /// different arg name, would leave one locale showing `{$arg}` literally).
+    #[test]
+    fn key_hint_messages_format_with_their_args_in_both_locales() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "main.ftl",
+                "status-normal-actions-download",
+                &["toggle", "select", "add", "delete", "menu"],
+            ),
+            (
+                "main.ftl",
+                "status-normal-actions-folder",
+                &["toggle", "add", "menu"],
+            ),
+            (
+                "main.ftl",
+                "status-normal-actions-details",
+                &["toggle", "menu"],
+            ),
+            ("main.ftl", "status-normal-undo", &["key", "count"]),
+            (
+                "main.ftl",
+                "status-normal-right",
+                &["switch", "help", "quit"],
+            ),
+            (
+                "main.ftl",
+                "status-hint-confirm-cancel",
+                &["confirm", "cancel"],
+            ),
+            (
+                "main.ftl",
+                "status-hint-navigate",
+                &["down", "up", "select", "cancel"],
+            ),
+            ("main.ftl", "status-hint-close", &["back"]),
+            ("main.ftl", "status-hint-settings", &["back", "reload"]),
+            (
+                "main.ftl",
+                "status-hint-folder-edit",
+                &["down", "up", "select", "back"],
+            ),
+            (
+                "main.ftl",
+                "status-hint-confirm-yn",
+                &["yes", "no", "back"],
+            ),
+            (
+                "main.ftl",
+                "status-hint-menu",
+                &["down", "up", "select", "back"],
+            ),
+            (
+                "dialogs.ftl",
+                "dialog-change-folder",
+                &["down", "up", "select"],
+            ),
+            (
+                "dialogs.ftl",
+                "dialog-switch-folder",
+                &["down", "up", "select"],
+            ),
+            ("dialogs.ftl", "dialog-actions", &["down", "up", "select"]),
+            ("dialogs.ftl", "help-edit-field", &["select"]),
+            (
+                "dialogs.ftl",
+                "help-folder-edit-navigate",
+                &["down", "up", "select", "back"],
+            ),
+            ("dialogs.ftl", "help-folder-list", &["select"]),
+            (
+                "dialogs.ftl",
+                "help-script-toggle",
+                &["down", "up", "toggle", "select", "reload"],
+            ),
+            (
+                "settings.ftl",
+                "settings-hint-switch-tab",
+                &["next", "prev"],
+            ),
+            ("settings.ftl", "settings-hint-close", &["back", "toggle"]),
+        ];
+
+        for locale in ["en-US", "ja-JP"] {
+            for (file, id, arg_names) in cases {
+                let path = format!(
+                    "{}/locales/{}/{}",
+                    env!("CARGO_MANIFEST_DIR"),
+                    locale,
+                    file
+                );
+                let bundle = load_bundle(&path);
+                let message = bundle
+                    .get_message(id)
+                    .unwrap_or_else(|| panic!("missing {locale} {id} in {file}"));
+                let pattern = message
+                    .value()
+                    .unwrap_or_else(|| panic!("{locale} {id} has no value"));
+
+                let mut args = fluent_bundle::FluentArgs::new();
+                for name in arg_names.iter() {
+                    args.set(*name, "K");
+                }
+
+                let mut errors = vec![];
+                let formatted = bundle.format_pattern(pattern, Some(&args), &mut errors);
+                assert!(
+                    errors.is_empty(),
+                    "{locale} {id} formatting errors: {errors:?}"
+                );
+                assert!(
+                    !formatted.contains("{$"),
+                    "{locale} {id} left an unresolved placeable: {formatted}"
+                );
+            }
+        }
     }
 }

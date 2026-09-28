@@ -85,8 +85,9 @@ settings-tab-general = General
 settings-tab-downloads = Downloads
 settings-tab-scripts = Scripts
 settings-tab-folders = Folders
-settings-hint-switch-tab = Tab/Shift+Tab: switch tabs
-settings-hint-close = Esc/q/x: close
+# Args are display-formatted configured keys (see KeybindingResolver::display_key).
+settings-hint-switch-tab = {$next}/{$prev}: switch tabs
+settings-hint-close = {$back}/{$toggle}: close
 
 # Restart-required fields
 settings-restart-marker = (restart required)

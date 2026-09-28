@@ -85,8 +85,9 @@ settings-tab-general = 一般
 settings-tab-downloads = ダウンロード
 settings-tab-scripts = スクリプト
 settings-tab-folders = フォルダ
-settings-hint-switch-tab = Tab/Shift+Tab: タブ切り替え
-settings-hint-close = Esc/q/x: 閉じる
+# Args are display-formatted configured keys (see KeybindingResolver::display_key).
+settings-hint-switch-tab = {$next}/{$prev}: タブ切り替え
+settings-hint-close = {$back}/{$toggle}: 閉じる
 
 # Restart-required fields
 settings-restart-marker = (再起動が必要)

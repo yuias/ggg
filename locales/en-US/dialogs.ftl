@@ -8,10 +8,10 @@ dialog-edit-field = Edit Field
 dialog-edit-label = Edit {$label}
 dialog-add-download = Add Download (Shift+Enter to expand [n-m] pattern)
 dialog-change-save-path = Change Save Path (Enter to confirm, Esc to cancel)
-dialog-change-folder = 📁 Change Folder (j/k to navigate, Enter to select)
+dialog-change-folder = 📁 Change Folder ({$down}/{$up} to navigate, {$select} to select)
 dialog-confirm-delete = Confirm Delete
-dialog-switch-folder = 📁 Switch Folder (j/k to navigate, Enter to select)
-dialog-actions = Actions (j/k to navigate, Enter to select)
+dialog-switch-folder = 📁 Switch Folder ({$down}/{$up} to navigate, {$select} to select)
+dialog-actions = Actions ({$down}/{$up} to navigate, {$select} to select)
 dialog-folder-actions = Folder Actions
 dialog-history-actions = History Actions
 
@@ -36,8 +36,9 @@ confirm-delete-single = Delete this download?
 confirm-delete-multiple = Delete {$count} downloads?
 confirm-delete-folder-config-note = This also removes its config directory.
 
-# Help text in dialogs
-help-edit-field = Enter: Edit value
-help-folder-edit-navigate = j/k: navigate | Enter: edit field | Esc: back to settings
-help-folder-list = Enter: edit folder
-help-script-toggle = j/k: Navigate  Space/Enter: Toggle  Shift+R: Reload all
+# Help text in dialogs. Args are display-formatted configured keys (see
+# KeybindingResolver::display_key).
+help-edit-field = {$select}: Edit value
+help-folder-edit-navigate = {$down}/{$up}: navigate | {$select}: edit field | {$back}: back to settings
+help-folder-list = {$select}: edit folder
+help-script-toggle = {$down}/{$up}: Navigate  {$toggle}/{$select}: Toggle  {$reload}: Reload all

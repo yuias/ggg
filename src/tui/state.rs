@@ -390,29 +390,16 @@ impl ContextMenuAction {
         use crate::app::keybindings::KeyAction;
 
         match self {
-            Self::StartPause => first_key_or(resolver, KeyAction::ToggleDownload, "s"),
-            Self::Retry => first_key_or(resolver, KeyAction::RetryDownload, "r"),
-            Self::Delete => first_key_or(resolver, KeyAction::DeleteDownload, "d"),
+            Self::StartPause => resolver.display_key(KeyAction::ToggleDownload),
+            Self::Retry => resolver.display_key(KeyAction::RetryDownload),
+            Self::Delete => resolver.display_key(KeyAction::DeleteDownload),
             Self::ChangeFolder => "f".to_string(),
-            Self::ChangeSavePath => first_key_or(resolver, KeyAction::EditItem, "e"),
+            Self::ChangeSavePath => resolver.display_key(KeyAction::EditItem),
             Self::CopyUrl => "c".to_string(),
             Self::OpenFolder => "o".to_string(),
-            Self::Cancel => first_key_or(resolver, KeyAction::Back, "Esc"),
+            Self::Cancel => resolver.display_key(KeyAction::Back),
         }
     }
-}
-
-/// The first configured key string for `action`, or `fallback` if unbound.
-fn first_key_or(
-    resolver: &crate::app::keybindings::KeybindingResolver,
-    action: crate::app::keybindings::KeyAction,
-    fallback: &str,
-) -> String {
-    resolver
-        .keys_for(action)
-        .first()
-        .cloned()
-        .unwrap_or_else(|| fallback.to_string())
 }
 
 
@@ -453,11 +440,11 @@ impl FolderContextMenuAction {
         use crate::app::keybindings::KeyAction;
 
         match self {
-            Self::StartAll => first_key_or(resolver, KeyAction::ToggleDownload, "s"),
+            Self::StartAll => resolver.display_key(KeyAction::ToggleDownload),
             Self::StopAll => "p".to_string(),
-            Self::DeleteAll => first_key_or(resolver, KeyAction::DeleteDownload, "d"),
+            Self::DeleteAll => resolver.display_key(KeyAction::DeleteDownload),
             Self::ClearHistory => "c".to_string(),
-            Self::Cancel => first_key_or(resolver, KeyAction::Back, "Esc"),
+            Self::Cancel => resolver.display_key(KeyAction::Back),
         }
     }
 }
@@ -1577,5 +1564,13 @@ mod menu_accelerator_tests {
         assert_eq!(ContextMenuAction::StartPause.key_hint(&resolver), "t");
         // Local accelerators are unaffected by a resolver remap.
         assert_eq!(ContextMenuAction::ChangeFolder.key_hint(&resolver), "f");
+    }
+
+    #[test]
+    fn cancel_key_hint_uses_short_display_form() {
+        let resolver = KeybindingResolver::default();
+        // Back's configured key string is "Escape"; the hint shows the short form.
+        assert_eq!(ContextMenuAction::Cancel.key_hint(&resolver), "Esc");
+        assert_eq!(FolderContextMenuAction::Cancel.key_hint(&resolver), "Esc");
     }
 }

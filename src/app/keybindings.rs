@@ -486,6 +486,29 @@ impl KeybindingResolver {
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
+
+    /// Short, human-friendly form of the first configured key for `action`,
+    /// for on-screen hints (status bar, menus, dialogs, help). `"-"` if the
+    /// action is unbound, so a remap-to-nothing shows a placeholder rather
+    /// than a stale literal.
+    pub fn display_key(&self, action: KeyAction) -> String {
+        self.keys_for(action)
+            .first()
+            .map(|k| format_key_for_display(k))
+            .unwrap_or_else(|| "-".to_string())
+    }
+}
+
+/// Short, human-friendly form of a configured key string, for on-screen
+/// display only (help screen, status-bar and dialog hints). The resolver's
+/// own key strings stay unabbreviated since they double as the parseable
+/// config format; do not use this for parsing.
+pub fn format_key_for_display(key: &str) -> String {
+    match key {
+        "Escape" => "Esc".to_string(),
+        "BackTab" => "Shift+Tab".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Normalize key events to handle shifted characters consistently.
@@ -710,6 +733,26 @@ no_such_action = \"z\"
                 }
             }
         }
+    }
+
+    #[test]
+    fn format_key_for_display_shortens_known_names() {
+        assert_eq!(format_key_for_display("Escape"), "Esc");
+        assert_eq!(format_key_for_display("BackTab"), "Shift+Tab");
+        assert_eq!(format_key_for_display("j"), "j");
+        assert_eq!(format_key_for_display("Ctrl+u"), "Ctrl+u");
+    }
+
+    #[test]
+    fn display_key_uses_short_form_and_placeholder() {
+        let resolver = KeybindingResolver::default();
+        assert_eq!(resolver.display_key(KeyAction::Back), "Esc");
+        assert_eq!(resolver.display_key(KeyAction::MoveDown), "j");
+
+        let mut bindings = HashMap::new();
+        bindings.insert(KeyAction::Quit, KeyBindingSpec::Multiple(vec![]));
+        let resolver = KeybindingResolver::from_config(&KeybindingsConfig { bindings });
+        assert_eq!(resolver.display_key(KeyAction::Quit), "-");
     }
 
     #[test]

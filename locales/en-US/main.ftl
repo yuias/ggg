@@ -25,12 +25,12 @@ column-eta = ETA
 
 # Status bar - Normal mode
 status-normal-folder = 📁 [{$folder}]
-status-normal-actions-download = ⏯ s:toggle | ✓ Space:select | ➕ a:add | 🗑 d:delete | 📋 m:menu
-status-normal-actions-folder = ▶ s:start all | ➕ a:add | 📋 m:menu
-status-normal-actions-details = ⏯ s:toggle | 📋 m:menu
-status-normal-undo = Ctrl+Z: undo({$count})
+status-normal-actions-download = ⏯ {$toggle}:toggle | ✓ {$select}:select | ➕ {$add}:add | 🗑 {$delete}:delete | 📋 {$menu}:menu
+status-normal-actions-folder = ▶ {$toggle}:start all | ➕ {$add}:add | 📋 {$menu}:menu
+status-normal-actions-details = ⏯ {$toggle}:toggle | 📋 {$menu}:menu
+status-normal-undo = {$key}: undo({$count})
 status-normal-busy = ⚠ {$count} busy, try again
-status-normal-right = 🔄 F:folder | ❓ ?:help | ❌ q:quit
+status-normal-right = 🔄 {$switch}:folder | ❓ {$help}:help | ❌ {$quit}:quit
 
 # Status bar - Other modes
 status-add-download = 📥 Enter URL and press Enter to add
@@ -45,16 +45,20 @@ status-folder-edit = 📂 Edit Folder
 status-confirm-delete = ⚠️  Confirm Delete
 status-context-menu = 📋 Actions Menu
 
-# Status bar - Right side hints
+# Status bar - Right side hints. Args are display-formatted configured keys
+# (see KeybindingResolver::display_key). status-hint-cancel and
+# status-hint-finish stay literal (free-text input keys are not
+# configurable); status-hint-confirm-cancel gets literal Enter/Esc from the
+# ChangeSavePath call site for the same reason.
 status-hint-cancel = Esc: cancel
-status-hint-confirm-cancel = Enter: confirm | Esc: cancel
+status-hint-confirm-cancel = {$confirm}: confirm | {$cancel}: cancel
 status-hint-finish = Enter/Esc: finish
-status-hint-navigate = j/k: navigate | Enter: select | Esc: cancel
-status-hint-close = Esc/q: close
-status-hint-settings = Esc/q: close | Shift+R: reload config
-status-hint-folder-edit = j/k: navigate | Enter: edit | Esc: back
-status-hint-confirm-yn = Y: confirm | N/Esc: cancel
-status-hint-menu = j/k: navigate | Enter: execute | Esc: cancel
+status-hint-navigate = {$down}/{$up}: navigate | {$select}: select | {$cancel}: cancel
+status-hint-close = {$back}: close
+status-hint-settings = {$back}: close | {$reload}: reload config
+status-hint-folder-edit = {$down}/{$up}: navigate | {$select}: edit | {$back}: back
+status-hint-confirm-yn = {$yes}: confirm | {$no}/{$back}: cancel
+status-hint-menu = {$down}/{$up}: navigate | {$select}: execute | {$back}: cancel
 
 # Quick Actions bar title
 quick-actions-title = ⚡ Quick Actions
