@@ -27,6 +27,16 @@ use tokio::sync::mpsc;
 /// URLs can be up to 2048 chars (common browser limit)
 const MAX_INPUT_LENGTH: usize = 2048;
 
+/// Result of a key handled by the shared text-input editing helper. Modes match
+/// on this to apply their own Enter/Esc behaviour; `Typed` covers every buffer
+/// mutation (Char, Backspace, Ctrl+u, Ctrl+v).
+enum TextEdit {
+    Typed,
+    Submit,
+    Cancel,
+    Ignored,
+}
+
 /// Scan a scripts directory for `.js` filenames, sorted. Returns an empty list
 /// on any error. Used to populate `TuiState::cached_script_files`.
 fn scan_script_files(dir: &std::path::Path) -> Vec<String> {
@@ -145,7 +155,7 @@ impl TuiApp {
                     UiMode::Normal => self.handle_normal_mode(code, modifiers).await?,
                     UiMode::AddDownload | UiMode::EditingField => self.handle_input_mode(code, modifiers).await?,
                     UiMode::DownloadPreview => self.handle_download_preview_mode(code, modifiers).await?,
-                    UiMode::Search => self.handle_search_mode(code).await?,
+                    UiMode::Search => self.handle_search_mode(code, modifiers).await?,
                     UiMode::Help => self.handle_help_mode(code, modifiers),
                     UiMode::Settings => self.handle_settings_mode(code, modifiers).await?,
                     UiMode::FolderEdit => self.handle_folder_edit_mode(code, modifiers).await?,
@@ -217,6 +227,46 @@ impl TuiApp {
         // Clear any validation error, mirroring normal keystroke handling
         self.state.validation_error = None;
         self.state.mark_dirty();
+    }
+
+    /// Outcome of a key handled by [`Self::apply_text_edit_key`]. Every text-input
+    /// mode keeps its own behaviour for `Submit` and `Cancel`; only the raw
+    /// buffer editing (typing, Backspace, Ctrl+u, Ctrl+v) is shared.
+    fn apply_text_edit_key(&mut self, key: KeyCode, mods: KeyModifiers) -> TextEdit {
+        if mods.contains(KeyModifiers::CONTROL) {
+            match key {
+                KeyCode::Char('u') => {
+                    self.state.input_buffer.clear();
+                    return TextEdit::Typed;
+                }
+                // Some terminals deliver Ctrl+v as a raw key event instead of a
+                // bracketed-paste `Event::Paste`, so read the clipboard directly
+                // here rather than relying on the paste event.
+                KeyCode::Char('v') => {
+                    if let Some(text) = Self::read_clipboard_text() {
+                        self.insert_input_text(&text);
+                    }
+                    return TextEdit::Typed;
+                }
+                _ => {}
+            }
+        }
+
+        match key {
+            KeyCode::Char(c) => {
+                if self.state.input_buffer.len() < MAX_INPUT_LENGTH {
+                    self.state.input_buffer.push(c);
+                }
+                TextEdit::Typed
+            }
+            KeyCode::Backspace => {
+                self.state.input_buffer.pop();
+                TextEdit::Typed
+            }
+            KeyCode::Enter => TextEdit::Submit,
+            KeyCode::Esc => TextEdit::Cancel,
+            _ => TextEdit::Ignored,
+        }
     }
 
     /// Read UTF-8 text from the system clipboard, returning None on failure.
@@ -901,35 +951,12 @@ impl TuiApp {
 
     /// Handle input mode (for Add Download dialog)
     async fn handle_input_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
-        // Handle Ctrl+u first (before Char match)
-        if matches!(key, KeyCode::Char('u')) && mods.contains(KeyModifiers::CONTROL) {
-            self.state.input_buffer.clear();
-            return Ok(());
-        }
-
-        // Ctrl+v: paste from the system clipboard. Some terminals deliver Ctrl+v
-        // as a raw key event instead of a bracketed-paste `Event::Paste`, so read
-        // the clipboard directly here rather than relying on the paste event.
-        if matches!(key, KeyCode::Char('v')) && mods.contains(KeyModifiers::CONTROL) {
-            if let Some(text) = Self::read_clipboard_text() {
-                self.insert_input_text(&text);
-            }
-            return Ok(());
-        }
-
-        match key {
-            KeyCode::Char(c) => {
-                // Prevent buffer overflow
-                if self.state.input_buffer.len() < MAX_INPUT_LENGTH {
-                    self.state.input_buffer.push(c);
-                }
-                // Clear validation error on new input
+        match self.apply_text_edit_key(key, mods) {
+            TextEdit::Typed => {
+                // Clear validation error on any edit
                 self.state.validation_error = None;
             }
-            KeyCode::Backspace => {
-                self.state.input_buffer.pop();
-            }
-            KeyCode::Enter => {
+            TextEdit::Submit => {
                 // Check if editing application setting
                 if self.state.is_editing_app_setting {
                     self.save_app_setting_value().await?;
@@ -1016,7 +1043,7 @@ impl TuiApp {
                     self.state.input_buffer.clear();
                 }
             }
-            KeyCode::Esc => {
+            TextEdit::Cancel => {
                 if self.state.is_editing_app_setting {
                     self.state.is_editing_app_setting = false;
                     self.state.ui_mode = UiMode::Settings;
@@ -1027,27 +1054,21 @@ impl TuiApp {
                 // Clear validation error on cancel
                 self.state.validation_error = None;
             }
-            _ => {}
+            TextEdit::Ignored => {}
         }
         Ok(())
     }
 
     /// Handle search mode
-    async fn handle_search_mode(&mut self, key: KeyCode) -> Result<()> {
-        match key {
-            KeyCode::Char(c) => {
-                tracing::trace!("Search mode: char '{}' added to buffer", c);
-                // Prevent buffer overflow
-                if self.state.input_buffer.len() < MAX_INPUT_LENGTH {
-                    self.state.input_buffer.push(c);
-                    self.state.set_search_query(self.state.input_buffer.clone());
-                }
-            }
-            KeyCode::Backspace => {
-                self.state.input_buffer.pop();
+    async fn handle_search_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
+        match self.apply_text_edit_key(key, mods) {
+            TextEdit::Typed => {
+                // `insert_input_text` (used by Ctrl+v) already syncs the query,
+                // so this is redundant for paste but keeps Char/Backspace/Ctrl+u
+                // edits reflected in the live filter too.
                 self.state.set_search_query(self.state.input_buffer.clone());
             }
-            KeyCode::Enter => {
+            TextEdit::Submit => {
                 // Check if search query is actually a URL
                 let query = self.state.input_buffer.trim().to_string();
                 if Self::is_valid_download_url(&query) {
@@ -1061,10 +1082,10 @@ impl TuiApp {
                 }
                 self.state.ui_mode = UiMode::Normal;
             }
-            KeyCode::Esc => {
+            TextEdit::Cancel => {
                 self.state.ui_mode = UiMode::Normal;
             }
-            _ => {}
+            TextEdit::Ignored => {}
         }
         Ok(())
     }
@@ -1394,34 +1415,20 @@ impl TuiApp {
 
     /// Handle text input when editing a field
     async fn handle_field_text_input(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
-        // Handle Ctrl+u to clear buffer
-        if matches!(key, KeyCode::Char('u')) && mods.contains(KeyModifiers::CONTROL) {
-            self.state.input_buffer.clear();
-            return Ok(());
-        }
-
-        match key {
-            KeyCode::Char(c) => {
-                // Prevent buffer overflow
-                if self.state.input_buffer.len() < MAX_INPUT_LENGTH {
-                    self.state.input_buffer.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                self.state.input_buffer.pop();
-            }
-            KeyCode::Enter => {
+        match self.apply_text_edit_key(key, mods) {
+            TextEdit::Typed => {}
+            TextEdit::Submit => {
                 // Save the edited value
                 self.save_field_edit().await?;
                 self.state.settings_edit_field = None;
                 self.state.input_buffer.clear();
             }
-            KeyCode::Esc => {
+            TextEdit::Cancel => {
                 // Cancel editing
                 self.state.settings_edit_field = None;
                 self.state.input_buffer.clear();
             }
-            _ => {}
+            TextEdit::Ignored => {}
         }
 
         Ok(())
@@ -1942,31 +1949,9 @@ impl TuiApp {
 
     /// Handle change save path mode (free text input for filesystem path)
     async fn handle_change_save_path_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
-        // Handle Ctrl+u first (before Char match)
-        if matches!(key, KeyCode::Char('u')) && mods.contains(KeyModifiers::CONTROL) {
-            self.state.input_buffer.clear();
-            return Ok(());
-        }
-
-        // Ctrl+v: paste from the system clipboard (see handle_input_mode).
-        if matches!(key, KeyCode::Char('v')) && mods.contains(KeyModifiers::CONTROL) {
-            if let Some(text) = Self::read_clipboard_text() {
-                self.insert_input_text(&text);
-            }
-            return Ok(());
-        }
-
-        match key {
-            KeyCode::Char(c) => {
-                // Prevent buffer overflow
-                if self.state.input_buffer.len() < MAX_INPUT_LENGTH {
-                    self.state.input_buffer.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                self.state.input_buffer.pop();
-            }
-            KeyCode::Enter => {
+        match self.apply_text_edit_key(key, mods) {
+            TextEdit::Typed => {}
+            TextEdit::Submit => {
                 // Submit new path to all target downloads
                 if !self.state.input_buffer.is_empty() {
                     let new_path = std::path::PathBuf::from(&self.state.input_buffer);
@@ -1986,11 +1971,11 @@ impl TuiApp {
                 self.state.ui_mode = UiMode::Normal;
                 self.state.input_buffer.clear();
             }
-            KeyCode::Esc => {
+            TextEdit::Cancel => {
                 self.state.ui_mode = UiMode::Normal;
                 self.state.input_buffer.clear();
             }
-            _ => {}
+            TextEdit::Ignored => {}
         }
         Ok(())
     }
@@ -3121,5 +3106,28 @@ mod tests {
         assert!(TuiApp::is_valid_download_url(
             "http://example.com/path/to/file?param1=value1&param2=value2"
         ));
+    }
+
+    /// Builds a `TuiApp` in memory only; no config/queue/history I/O happens,
+    /// so this needs no `set_config_dir_override`.
+    fn test_app() -> TuiApp {
+        let app_state = AppState::new(crate::app::config::Config::default());
+        let keybindings = crate::app::keybindings::KeybindingsConfig::default();
+        TuiApp::new(app_state, DownloadManager::new(), &keybindings, "en-US")
+    }
+
+    #[tokio::test]
+    async fn search_mode_ctrl_u_clears_buffer_and_query() {
+        let mut app = test_app();
+        app.state.ui_mode = UiMode::Search;
+        app.state.input_buffer = "example query".to_string();
+        app.state.set_search_query("example query".to_string());
+
+        app.handle_search_mode(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            .await
+            .unwrap();
+
+        assert!(app.state.input_buffer.is_empty());
+        assert!(app.state.search_query.is_empty());
     }
 }
