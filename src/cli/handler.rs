@@ -1671,6 +1671,11 @@ async fn handle_batch_add(
             eprintln!("Skipping invalid URL: {}", skip.url);
         }
     }
+    // Still a success: a batch file with only stale lines is not an error
+    // for scripted use, but it is worth a visible note.
+    if added.is_empty() {
+        eprintln!("Warning: no downloads were added from {}", file);
+    }
 
     Ok(error::SUCCESS)
 }
