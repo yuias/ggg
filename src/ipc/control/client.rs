@@ -5,9 +5,8 @@
 //! `probe` does here: right after opening the pipe and before its first
 //! write, returning `Err(anyhow!(msg))` on an untrusted owner so `route`
 //! exits 5. An open that fails with access denied (os error 5) gets its own
-//! message, because that is the common shape of an elevation mismatch: the
-//! elevated daemon's default DACL denies a non-elevated caller before the
-//! owner check ever runs.
+//! message, because both an elevation mismatch and another user's pipe fail
+//! there (default DACLs), before the owner check ever runs.
 
 use std::time::{Duration, Instant};
 
@@ -32,13 +31,13 @@ const MAX_PROBE_RESPONSE_BYTES: u64 = 64 * 1024;
 /// `Tasks`/`List` response can carry many `DownloadTask`s.
 const MAX_SEND_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Maps an open failure that looks like an elevation mismatch (an elevated
-/// server's default DACL denying a non-elevated caller) to a message that
-/// names the likely cause; other open errors are reported as-is by the
-/// caller.
+/// Maps an access-denied open to a message naming both likely causes: the
+/// default pipe DACL gives other users read-only access, and an elevated
+/// server's DACL denies a non-elevated caller. Other open errors are
+/// reported as-is by the caller.
 fn open_access_denied_message(e: &std::io::Error) -> Option<String> {
     (e.raw_os_error() == Some(ERROR_ACCESS_DENIED)).then(|| {
-        "access denied opening the daemon pipe (the daemon may be running elevated while this command is not)"
+        "access denied opening the daemon pipe (it is held by another user, or the daemon is running elevated while this command is not)"
             .to_string()
     })
 }
