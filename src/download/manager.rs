@@ -650,6 +650,33 @@ impl DownloadManager {
                             // Max retries exceeded, mark as error
                             current_task.status = DownloadStatus::Error;
                             current_task.log_error(format!("Max retries ({}) exceeded", max_retries));
+
+                            // Hook Point 4: error - fire-and-forget, but queued before
+                            // the queue write and the Failed event, so a `wait`
+                            // unblocked by either one, or a standalone process exiting
+                            // right after them, still has the request in the channel
+                            // by the time it flushes. The send is inline (not
+                            // spawn_blocking): this is an unbounded std channel, so
+                            // send() never blocks.
+                            if let Some(ref sender) = script_sender_for_error {
+                                let effective_script_files = Self::compute_effective_script_files(&config, &current_task.folder_id).await;
+
+                                let ctx = crate::script::events::ErrorContext {
+                                    url: current_task.url.clone(),
+                                    filename: Some(current_task.filename.clone()),
+                                    error: current_task.error_message.as_deref().unwrap_or("Unknown error").to_string(),
+                                    retry_count: current_task.retry_count,
+                                    status_code: current_task.last_status_code,
+                                };
+
+                                if let Err(e) = sender.send(ScriptRequest::Error {
+                                    ctx,
+                                    effective_script_files,
+                                }) {
+                                    tracing::error!("Failed to send error hook: {}", e);
+                                }
+                            }
+
                             queue.update(current_task.clone()).await;
                             manager_for_cleanup.emit(DownloadEvent::Failed {
                                 task_id: id,
@@ -661,30 +688,6 @@ impl DownloadManager {
                                 circuit_breaker.record_failure(&domain);
                             }
 
-                            // Hook Point 4: error - Error handling (fire-and-forget)
-                            if let Some(ref sender) = script_sender_for_error {
-                                // Compute effective script_files
-                                let effective_script_files = Self::compute_effective_script_files(&config, &current_task.folder_id).await;
-
-                                let ctx = crate::script::events::ErrorContext {
-                                    url: current_task.url.clone(),
-                                    filename: Some(current_task.filename.clone()),
-                                    error: current_task.error_message.as_deref().unwrap_or("Unknown error").to_string(),
-                                    retry_count: current_task.retry_count,
-                                    status_code: current_task.last_status_code,
-                                };
-
-                                // Fire-and-forget (no need to wait for response)
-                                let sender_clone = (*sender).clone();
-                                tokio::task::spawn_blocking(move || {
-                                    if let Err(e) = sender_clone.send(ScriptRequest::Error {
-                                        ctx,
-                                        effective_script_files,
-                                    }) {
-                                        tracing::error!("Failed to send error hook: {}", e);
-                                    }
-                                });
-                            }
                             break;
                         }
                     }
@@ -2838,6 +2841,64 @@ mod tests {
 
         assert!(!manager.has_active_downloads().await);
         assert_eq!(manager.run_state(id).await, RunState::Idle);
+    }
+
+    /// A download that exhausts its retries must have already queued the
+    /// error hook request by the time the `Failed` event is observable, so a
+    /// `wait` unblocked by that event (or a standalone process exiting right
+    /// after it) still sees the hook in the channel. Needs a multi-thread
+    /// runtime: on a current-thread runtime the test task would only resume
+    /// (and observe `Failed`) after the download task itself yields, which
+    /// would hide a stale ordering where the hook is sent after `emit`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn error_hook_queued_before_failed_event() {
+        let manager = DownloadManager::with_retry_settings(1, 0);
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let mut events = manager.subscribe();
+        let (script_tx, script_rx) = mpsc::channel::<ScriptRequest>();
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+
+        // `start_download` awaits the beforeRequest hook's response before it
+        // returns, so a single blocking recv answers it and hands the
+        // receiver back untouched for the assertion below.
+        let responder = tokio::task::spawn_blocking(move || {
+            if let Ok(ScriptRequest::BeforeRequest { ctx, response, .. }) = script_rx.recv() {
+                let _ = response.send((ctx, Ok(())));
+            }
+            script_rx
+        });
+
+        assert_eq!(
+            manager
+                .start_download(id, Some(script_tx), config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+
+        let script_rx = responder.await.expect("responder task panicked");
+
+        let wait_for_failed = async {
+            loop {
+                match events.recv().await {
+                    Ok(DownloadEvent::Failed { task_id, .. }) if task_id == id => return,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel closed before Failed: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), wait_for_failed)
+            .await
+            .expect("did not observe Failed within timeout");
+
+        match script_rx.try_recv() {
+            Ok(ScriptRequest::Error { .. }) => {}
+            other => panic!("expected a queued Error hook request, got {other:?}"),
+        }
     }
 
     #[tokio::test]
