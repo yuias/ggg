@@ -1561,6 +1561,58 @@ async fn handle_clear(
     Ok(error::SUCCESS)
 }
 
+/// Enqueue path for `batch-add`, mirroring `handle_add`'s loop so folder
+/// rules and duplicate handling match: resolves the target folder once, then
+/// for each input line expands `[1-10]`-style range patterns, validates,
+/// builds, and enqueues every resulting URL through the same
+/// `build_task`/`enqueue` calls the daemon's `Add` handler uses. `Err(())`
+/// means an unknown folder.
+async fn enqueue_urls(
+    state: &AppState,
+    manager: &DownloadManager,
+    urls: &[String],
+    folder: Option<&str>,
+) -> Result<(Vec<AddedTask>, Vec<SkippedUrl>), ()> {
+    let config = state.config.read().await.clone();
+    let folder_id = resolve_target_folder(&config, folder).map_err(|_| ())?;
+    let opts = EnqueueOptions::default();
+
+    let mut added = Vec::new();
+    let mut skipped = Vec::new();
+    for line in urls {
+        for u in crate::util::url_expansion::expand_url(line) {
+            if !is_valid_download_url(&u) {
+                skipped.push(SkippedUrl {
+                    url: u,
+                    reason: "invalid_url".to_string(),
+                });
+                continue;
+            }
+
+            let task = build_task(&u, &folder_id, &config, &opts);
+            match enqueue(manager, state, task, false, false).await {
+                EnqueueOutcome::Added {
+                    id,
+                    started,
+                    start_error,
+                } => added.push(AddedTask {
+                    id,
+                    url: u,
+                    folder_id: folder_id.clone(),
+                    started,
+                    start_error,
+                }),
+                EnqueueOutcome::Duplicate => skipped.push(SkippedUrl {
+                    url: u,
+                    reason: "duplicate".to_string(),
+                }),
+            }
+        }
+    }
+
+    Ok((added, skipped))
+}
+
 /// Batch add downloads from file
 async fn handle_batch_add(
     state: &AppState,
@@ -1575,8 +1627,8 @@ async fn handle_batch_add(
     }
 
     let content = std::fs::read_to_string(&file_path)?;
-    let urls: Vec<&str> = content.lines()
-        .map(|line| line.trim())
+    let urls: Vec<String> = content.lines()
+        .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect();
 
@@ -1585,25 +1637,28 @@ async fn handle_batch_add(
         return Ok(error::SUCCESS);
     }
 
-    let config = state.config.read().await;
-    let save_path = config.download.default_directory.clone();
-    drop(config);
-
-    let mut added_count = 0;
-    for url in urls {
-        let mut task = DownloadTask::new(url.to_string(), save_path.clone());
-
-        if let Some(ref folder_id) = folder {
-            task.folder_id = folder_id.clone();
+    let (added, skipped) = match enqueue_urls(state, manager, &urls, folder.as_deref()).await {
+        Ok(result) => result,
+        Err(()) => {
+            eprintln!("Error: unknown folder");
+            return Ok(error::INVALID_INPUT);
         }
+    };
 
-        manager.add_download(task).await;
-        added_count += 1;
+    if !added.is_empty() {
+        manager.save_queue_to_folders().await?;
     }
 
-    manager.save_queue_to_folders().await?;
+    println!("Added {} download(s) from {}", added.len(), file);
+    // Same wording as `render_added`, so `add` and `batch-add` warn identically.
+    for skip in &skipped {
+        if skip.reason == "duplicate" {
+            eprintln!("Skipped duplicate URL: {}", skip.url);
+        } else {
+            eprintln!("Skipping invalid URL: {}", skip.url);
+        }
+    }
 
-    println!("Added {} download(s) from {}", added_count, file);
     Ok(error::SUCCESS)
 }
 
@@ -1919,6 +1974,79 @@ mod tests {
         );
         task.status = status;
         task
+    }
+
+    /// A single-folder config named `name`, so `resolve_target_folder(None)`
+    /// picks it without needing a folder named "default".
+    fn config_with_folder(name: &str, prevent_duplicate: bool) -> (Config, String) {
+        let mut config = Config::default();
+        let mut folder = config
+            .folders
+            .get("default")
+            .cloned()
+            .unwrap_or_default();
+        folder.name = name.to_string();
+        folder.prevent_duplicate_url = prevent_duplicate;
+        config.folders.clear();
+        let folder_id = name.to_string();
+        config.folders.insert(folder_id.clone(), folder);
+        (config, folder_id)
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_applies_folder_save_path_and_default_headers() {
+        let (mut config, folder_id) = config_with_folder("downloads", false);
+        {
+            let folder = config.folders.get_mut(&folder_id).unwrap();
+            folder.save_path = std::path::PathBuf::from("/batch-add-save-path");
+            folder.default_headers.insert("X-Batch".to_string(), "1".to_string());
+        }
+        let state = AppState::new(config, "en");
+        let manager = DownloadManager::new();
+
+        let urls = vec!["https://example.com/f.zip".to_string()];
+        let (added, skipped) = enqueue_urls(&state, &manager, &urls, Some(folder_id.as_str()))
+            .await
+            .expect("known folder");
+
+        assert!(skipped.is_empty());
+        assert_eq!(added.len(), 1);
+        let stored = manager.get_by_id(added[0].id).await.expect("task stored");
+        assert_eq!(stored.save_path, std::path::PathBuf::from("/batch-add-save-path"));
+        assert_eq!(stored.headers.get("X-Batch").map(String::as_str), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_skips_invalid_and_duplicate() {
+        let (config, folder_id) = config_with_folder("downloads", true);
+        let state = AppState::new(config, "en");
+        let manager = DownloadManager::new();
+
+        let urls = vec![
+            "not a url".to_string(),
+            "https://example.com/f.zip".to_string(),
+            "https://example.com/f.zip".to_string(),
+        ];
+        let (added, skipped) = enqueue_urls(&state, &manager, &urls, Some(folder_id.as_str()))
+            .await
+            .expect("known folder");
+
+        assert_eq!(added.len(), 1);
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0].reason, "invalid_url");
+        assert_eq!(skipped[1].reason, "duplicate");
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_unknown_folder_is_err() {
+        let (config, _) = config_with_folder("downloads", false);
+        let state = AppState::new(config, "en");
+        let manager = DownloadManager::new();
+
+        let urls = vec!["https://example.com/f.zip".to_string()];
+        let result = enqueue_urls(&state, &manager, &urls, Some("no-such-folder")).await;
+
+        assert!(result.is_err());
     }
 
     /// A task in retry backoff (live handle, persisted status `Paused`) must
