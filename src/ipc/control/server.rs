@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use super::client::{self, DaemonProbe};
@@ -182,7 +182,20 @@ async fn handle_connection(pipe: NamedPipeServer, handler: Arc<dyn ControlHandle
             }
         };
 
-        let resp = handler.handle(req.clone()).await;
+        let resp = if req.cancel_on_disconnect() {
+            match run_until_disconnect(handler.handle(req.clone()), &mut reader).await {
+                Some(resp) => resp,
+                None => {
+                    // The client is gone and the request was only ever going
+                    // to reply to it, so there is nothing left to write or
+                    // save.
+                    tracing::debug!("control pipe client disconnected while a cancellable request was pending");
+                    break;
+                }
+            }
+        } else {
+            handler.handle(req.clone()).await
+        };
         let write_ok = write_response(&mut writer, &resp).await;
         // Run after_response even if the reply couldn't be delivered: the
         // handler already applied the request in memory (e.g. a mutation
@@ -195,6 +208,27 @@ async fn handle_connection(pipe: NamedPipeServer, handler: Arc<dyn ControlHandle
     }
 
     tracing::debug!("control pipe client disconnected");
+}
+
+/// Races a cancellable handler future against the reader hitting EOF (the
+/// client disconnected). `None` means the client is gone; the caller must
+/// then skip writing a reply and calling `after_response`, because the
+/// request only existed to answer a connection that no longer exists.
+async fn run_until_disconnect<R: AsyncBufRead + Unpin>(
+    fut: BoxFuture<'_, ControlResponse>,
+    reader: &mut R,
+) -> Option<ControlResponse> {
+    let mut fut = fut;
+    let mut watching = true;
+    loop {
+        tokio::select! {
+            resp = &mut fut => return Some(resp),
+            eof = async { reader.fill_buf().await.map(|b| b.is_empty()) }, if watching => match eof {
+                Ok(true) | Err(_) => return None,   // client gone
+                Ok(false) => watching = false,      // pipelined bytes stay buffered for the next read
+            },
+        }
+    }
 }
 
 async fn write_response<W: AsyncWrite + Unpin>(writer: &mut W, resp: &ControlResponse) -> bool {

@@ -142,6 +142,12 @@ impl ControlRequest {
                 | ControlRequest::Priority { .. }
         )
     }
+
+    /// Requests whose only effect is the reply; safe to drop mid-flight when
+    /// the client disconnects.
+    pub fn cancel_on_disconnect(&self) -> bool {
+        matches!(self, ControlRequest::Wait { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -553,5 +559,22 @@ mod tests {
             value: String::new(),
         }
         .is_mutating());
+    }
+
+    #[test]
+    fn cancel_on_disconnect_only_for_wait() {
+        assert!(
+            ControlRequest::Wait {
+                id: Uuid::nil(),
+                timeout_secs: None,
+            }
+            .cancel_on_disconnect()
+        );
+        for req in all_request_variants() {
+            if matches!(req, ControlRequest::Wait { .. }) {
+                continue;
+            }
+            assert!(!req.cancel_on_disconnect(), "unexpected cancel_on_disconnect for {req:?}");
+        }
     }
 }

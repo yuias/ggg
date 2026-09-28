@@ -509,7 +509,9 @@ async fn check_wait_state(id: Uuid, manager: &DownloadManager) -> Option<Control
 /// `timeout_secs = None` waits until the task reaches a final state or the
 /// connection itself is torn down (for example by a daemon shutdown aborting
 /// this task, which just closes the pipe -- the client sees that as a send
-/// error, not a hang).
+/// error, not a hang). A client that disconnects while this is pending (e.g.
+/// Ctrl+C) also ends the wait: `server.rs` races this future against the
+/// connection's EOF and drops it without writing a reply.
 async fn dispatch_wait(id: Uuid, timeout_secs: Option<u64>, ctx: &DaemonContext) -> ControlResponse {
     let mut rx = ctx.manager.subscribe();
     if let Some(resp) = check_wait_state(id, &ctx.manager).await {

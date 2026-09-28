@@ -31,11 +31,28 @@ fn unique_pipe_name() -> String {
     format!(r"\\.\pipe\ggg-daemon-test-{}", uuid::Uuid::new_v4())
 }
 
+/// Fires `notify_one` on the wrapped `Notify` when dropped, so a test can
+/// tell when a pending future was actually cancelled (not just that the
+/// connection loop moved on).
+struct NotifyOnDrop<'a>(&'a Notify);
+
+impl Drop for NotifyOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
 /// Minimal handler with no `AppState`/`DownloadManager` dependency, as the
 /// design intends `serve` to allow for this transport-only test.
 struct TestHandler {
     after_response_notify: Notify,
     after_response_count: AtomicUsize,
+    /// Notified once the `Wait` arm below starts running, so a test can wait
+    /// for the server to have entered the pending future before disconnecting.
+    wait_started: Notify,
+    /// Notified when the `Wait` arm's future is dropped (cancelled), which is
+    /// the outcome under test for an abandoned wait.
+    wait_dropped: Notify,
 }
 
 impl TestHandler {
@@ -43,6 +60,8 @@ impl TestHandler {
         Arc::new(Self {
             after_response_notify: Notify::new(),
             after_response_count: AtomicUsize::new(0),
+            wait_started: Notify::new(),
+            wait_dropped: Notify::new(),
         })
     }
 }
@@ -57,6 +76,14 @@ impl ControlHandler for TestHandler {
                     version: "test".to_string(),
                 },
                 ControlRequest::Shutdown => ControlResponse::Ok { message: "bye".to_string() },
+                ControlRequest::Wait { .. } => {
+                    self.wait_started.notify_one();
+                    let _guard = NotifyOnDrop(&self.wait_dropped);
+                    // Never resolves on its own; only cancellation (dropping
+                    // this future) ends it, which is what this test exercises.
+                    std::future::pending::<()>().await;
+                    unreachable!("wait future must be cancelled, not resolved");
+                }
                 _ => ControlResponse::Error {
                     code: ControlErrorCode::Unsupported,
                     message: "not handled by the test handler".to_string(),
@@ -240,4 +267,46 @@ async fn server_owner_check_passes_for_same_user() {
     // must pass: the server process and the current process are the same
     // token user.
     owner::verify_server_owner(&client).expect("server owner check should pass for same user");
+}
+
+#[tokio::test]
+async fn abandoned_wait_is_cancelled_on_client_disconnect() {
+    let pipe_name = unique_pipe_name();
+    let bound = server::bind(&pipe_name).await.expect("bind");
+    let handler = TestHandler::new();
+    let _serve = server::serve(bound, handler.clone());
+
+    let mut client = tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            match ClientOptions::new().open(&pipe_name) {
+                Ok(c) => break c,
+                Err(e) if e.raw_os_error() == Some(231) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("failed to open {pipe_name}: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("open timed out");
+
+    let req = ControlRequest::Wait { id: uuid::Uuid::nil(), timeout_secs: None };
+    let line = serde_json::to_string(&req).unwrap();
+    client.write_all(line.as_bytes()).await.unwrap();
+    client.write_all(b"\n").await.unwrap();
+    client.flush().await.unwrap();
+
+    tokio::time::timeout(TEST_TIMEOUT, handler.wait_started.notified())
+        .await
+        .expect("wait did not start in time");
+
+    // Drop the client without reading a reply, simulating Ctrl+C. The server
+    // should observe EOF and cancel the pending Wait instead of hanging on it.
+    drop(client);
+
+    tokio::time::timeout(TEST_TIMEOUT, handler.wait_dropped.notified())
+        .await
+        .expect("abandoned wait was not cancelled");
+
+    assert_eq!(handler.after_response_count.load(Ordering::SeqCst), 0);
 }
