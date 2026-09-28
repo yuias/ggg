@@ -75,7 +75,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
 
-    /// Run in headless mode (no GUI)
+    /// Run as a background daemon for this config directory instead of
+    /// launching the TUI. Only takes effect when no subcommand is given;
+    /// other commands route to an already-running daemon automatically and
+    /// ignore this flag.
     #[arg(long, global = true)]
     pub headless: bool,
 
@@ -96,7 +99,8 @@ pub enum Commands {
         /// URL to download
         url: String,
 
-        /// Folder ID to assign (default, images, videos, audio, archives)
+        /// Folder ID to assign (defaults to the "default" folder when
+        /// omitted). Create additional folders with `ggg folder create`.
         #[arg(long)]
         folder: Option<String>,
 
@@ -144,7 +148,13 @@ pub enum Commands {
         /// Download ID (UUID)
         id: String,
 
-        /// Wait for download to complete and show progress
+        /// Wait for the download to reach a final status before exiting,
+        /// printing progress along the way. Like `wait`, the exit code
+        /// reports the outcome, though this can never time out: 0
+        /// completed, 2 removed, 6 failed, 7 paused. Without a running
+        /// daemon, omitting --wait exits (and aborts the download) as soon
+        /// as it starts, so a standalone `start` needs --wait (or a
+        /// running daemon) to actually finish the download.
         #[arg(long)]
         wait: bool,
     },
@@ -275,8 +285,11 @@ pub enum Commands {
     },
 
     /// Clear downloads by status
+    ///
+    /// Refused while a daemon is running for this config directory; stop
+    /// the daemon first (`ggg daemon stop`).
     Clear {
-        /// Comma-separated status list (completed,error,paused)
+        /// Comma-separated status list (completed,error,paused,pending)
         #[arg(long)]
         status: String,
 
@@ -286,6 +299,8 @@ pub enum Commands {
     },
 
     /// Batch add downloads from file
+    ///
+    /// Refused while a daemon is running for this config directory.
     BatchAdd {
         /// File containing URLs (one per line)
         file: String,
@@ -324,6 +339,9 @@ pub enum Commands {
     },
 
     /// Set download priority
+    ///
+    /// Routed to a running daemon for this config directory, so it also
+    /// works while one is running.
     Priority {
         /// Download ID (UUID)
         id: String,
@@ -334,6 +352,9 @@ pub enum Commands {
     },
 
     /// Move download in queue or to another folder
+    ///
+    /// Routed to a running daemon for this config directory, so it also
+    /// works while one is running.
     Move {
         /// Download ID (UUID)
         id: String,
@@ -421,6 +442,12 @@ pub enum ConfigAction {
     },
 
     /// Set a configuration value
+    ///
+    /// Routed to a running daemon for this config directory, so it also
+    /// works while one is running. Only a fixed set of dotted keys is
+    /// settable this way (`config get` reports "Unknown configuration
+    /// key" for anything else); some settings (e.g.
+    /// `download.claim_wait_ms`) are hand-edited in settings.toml instead.
     Set {
         /// Configuration key (e.g., download.max_concurrent)
         key: String,
@@ -506,7 +533,10 @@ pub enum ScriptAction {
         /// Script filename to test
         name: String,
 
-        /// Event to trigger (beforeRequest, headersReceived, completed, error, progress)
+        /// Event to trigger (beforeRequest, headersReceived, completed,
+        /// error, progress). Only "beforeRequest" runs the handler and
+        /// shows the modified context; the others print a note that they
+        /// are not yet supported for testing.
         #[arg(long)]
         event: String,
 
@@ -515,7 +545,11 @@ pub enum ScriptAction {
         url: String,
     },
 
-    /// Reload all scripts (for daemon mode)
+    /// Reload all scripts
+    ///
+    /// Runs against a daemon for this config directory when one is
+    /// running (start one with `ggg --headless`); otherwise prints a
+    /// notice that there is nothing to reload.
     Reload,
 }
 
@@ -530,6 +564,8 @@ pub enum FolderAction {
     },
 
     /// Create a new folder
+    ///
+    /// Refused while a daemon is running for this config directory.
     Create {
         /// Folder ID
         id: String,
@@ -554,6 +590,8 @@ pub enum FolderAction {
     },
 
     /// Update folder configuration
+    ///
+    /// Refused while a daemon is running for this config directory.
     Config {
         /// Folder ID
         id: String,
@@ -564,6 +602,8 @@ pub enum FolderAction {
     },
 
     /// Delete a folder
+    ///
+    /// Refused while a daemon is running for this config directory.
     Delete {
         /// Folder ID
         id: String,
@@ -592,6 +632,8 @@ pub enum ExportAction {
 #[derive(Subcommand, Debug)]
 pub enum ImportAction {
     /// Import queue from file
+    ///
+    /// Refused while a daemon is running for this config directory.
     Queue {
         /// Input file path
         #[arg(long)]
@@ -599,6 +641,8 @@ pub enum ImportAction {
     },
 
     /// Import configuration from file
+    ///
+    /// Refused while a daemon is running for this config directory.
     Config {
         /// Input file path
         #[arg(long)]
@@ -657,6 +701,8 @@ mod tests {
 #[derive(Subcommand, Debug)]
 pub enum TestAction {
     /// Generate test download tasks
+    ///
+    /// Refused while a daemon is running for this config directory.
     GenerateTasks {
         /// Number of tasks to generate
         #[arg(long)]
@@ -668,8 +714,12 @@ pub enum TestAction {
     },
 
     /// Reset queue (delete all downloads)
+    ///
+    /// Refused while a daemon is running for this config directory.
     ResetQueue,
 
     /// Reset configuration to defaults
+    ///
+    /// Refused while a daemon is running for this config directory.
     ResetConfig,
 }
