@@ -7,6 +7,7 @@
 //!
 //! The protocol types are cross-platform; the pipe client is Windows-only.
 
+pub mod owner;
 pub mod protocol;
 
 #[cfg(windows)]
