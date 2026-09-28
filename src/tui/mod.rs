@@ -2,6 +2,7 @@ pub mod app;
 pub mod command_i18n;
 pub mod events;
 pub mod format;
+pub mod item_editor;
 pub mod state;
 pub mod theme;
 pub mod ui;
