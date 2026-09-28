@@ -144,17 +144,17 @@ impl TuiApp {
                 match self.state.ui_mode {
                     UiMode::Normal => self.handle_normal_mode(code, modifiers).await?,
                     UiMode::AddDownload | UiMode::EditingField => self.handle_input_mode(code, modifiers).await?,
-                    UiMode::DownloadPreview => self.handle_download_preview_mode(code).await?,
+                    UiMode::DownloadPreview => self.handle_download_preview_mode(code, modifiers).await?,
                     UiMode::Search => self.handle_search_mode(code).await?,
-                    UiMode::Help => self.handle_help_mode(code),
+                    UiMode::Help => self.handle_help_mode(code, modifiers),
                     UiMode::Settings => self.handle_settings_mode(code, modifiers).await?,
                     UiMode::FolderEdit => self.handle_folder_edit_mode(code, modifiers).await?,
-                    UiMode::ChangeFolder => self.handle_change_folder_for_item_mode(code).await?,
+                    UiMode::ChangeFolder => self.handle_change_folder_for_item_mode(code, modifiers).await?,
                     UiMode::ChangeSavePath => self.handle_change_save_path_mode(code, modifiers).await?,
-                    UiMode::SwitchFolder => self.handle_switch_folder_mode(code).await?,
-                    UiMode::ConfirmDelete => self.handle_confirm_delete_mode(code).await?,
-                    UiMode::ContextMenu => self.handle_context_menu_mode(code).await?,
-                    UiMode::FolderContextMenu => self.handle_folder_context_menu_mode(code).await?,
+                    UiMode::SwitchFolder => self.handle_switch_folder_mode(code, modifiers).await?,
+                    UiMode::ConfirmDelete => self.handle_confirm_delete_mode(code, modifiers).await?,
+                    UiMode::ContextMenu => self.handle_context_menu_mode(code, modifiers).await?,
+                    UiMode::FolderContextMenu => self.handle_folder_context_menu_mode(code, modifiers).await?,
                 }
             }
             Event::Paste(text) => {
@@ -1070,9 +1070,14 @@ impl TuiApp {
     }
 
     /// Handle help mode
-    fn handle_help_mode(&mut self, key: KeyCode) {
-        // Only close on Esc or q, not on ? to avoid toggle issues with Shift+/
-        if matches!(key, KeyCode::Esc | KeyCode::Char('q')) {
+    fn handle_help_mode(&mut self, key: KeyCode, mods: KeyModifiers) {
+        let action = self.state.keybinding_resolver.resolve_in(KeyContext::Help, key, mods);
+
+        // Back (Esc/q) and OpenHelp (?) both close; a bare Esc that resolves
+        // to nothing (e.g. Back rebound away from it) must not trap the user.
+        if matches!(action, Some(KeyAction::Back) | Some(KeyAction::OpenHelp))
+            || matches!((action, key), (None, KeyCode::Esc))
+        {
             self.state.ui_mode = UiMode::Normal;
         }
     }
@@ -1870,41 +1875,29 @@ impl TuiApp {
     }
 
     /// Handle change folder mode (folder picker for changing item's application folder)
-    /// Shared j/k (and arrow) navigation for the folder-picker dialogs.
-    fn navigate_folder_picker(&mut self, key: KeyCode, folder_count: usize) {
-        if folder_count == 0 {
-            return;
-        }
-        match key {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.state.folder_picker_index =
-                    (self.state.folder_picker_index + 1) % folder_count;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.state.folder_picker_index = if self.state.folder_picker_index == 0 {
-                    folder_count - 1
-                } else {
-                    self.state.folder_picker_index - 1
-                };
-            }
-            _ => {}
-        }
-    }
-
-    async fn handle_change_folder_for_item_mode(&mut self, key: KeyCode) -> Result<()> {
+    async fn handle_change_folder_for_item_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
         let config = self.state.app_state.config.read().await;
         let folder_entries = config.sorted_folder_entries();
         let folder_count = folder_entries.len();
         drop(config);
 
-        match key {
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
-                self.navigate_folder_picker(key, folder_count);
-            }
-            KeyCode::Enter => {
+        let action = self.state.keybinding_resolver.resolve_in(KeyContext::Dialog, key, mods);
+
+        match action {
+            Some(KeyAction::MoveDown) => self.state.move_folder_picker_down(folder_count),
+            Some(KeyAction::MoveUp) => self.state.move_folder_picker_up(folder_count),
+            Some(KeyAction::MoveToTop) => self.state.move_folder_picker_to_top(),
+            Some(KeyAction::MoveToBottom) => self.state.move_folder_picker_to_bottom(folder_count),
+            Some(KeyAction::PageUp) => self.state.folder_picker_page_up(),
+            Some(KeyAction::PageDown) => self.state.folder_picker_page_down(folder_count),
+            Some(KeyAction::SelectItem) => {
                 self.commit_change_folder_selection(&folder_entries).await?;
             }
-            KeyCode::Esc => {
+            Some(KeyAction::Back) => {
+                self.state.ui_mode = UiMode::Normal;
+            }
+            // Safety net: a remap that unbinds Back must not trap the user.
+            None if matches!(key, KeyCode::Esc) => {
                 self.state.ui_mode = UiMode::Normal;
             }
             _ => {}
@@ -2003,18 +1996,23 @@ impl TuiApp {
     }
 
     /// Handle switch folder mode (folder picker dialog)
-    async fn handle_switch_folder_mode(&mut self, key: KeyCode) -> Result<()> {
+    async fn handle_switch_folder_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
         // Get folder list (sorted by display name)
         let config = self.state.app_state.config.read().await;
         let folder_entries = config.sorted_folder_entries();
         let folder_count = folder_entries.len();
         drop(config);
 
-        match key {
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
-                self.navigate_folder_picker(key, folder_count);
-            }
-            KeyCode::Enter => {
+        let action = self.state.keybinding_resolver.resolve_in(KeyContext::Dialog, key, mods);
+
+        match action {
+            Some(KeyAction::MoveDown) => self.state.move_folder_picker_down(folder_count),
+            Some(KeyAction::MoveUp) => self.state.move_folder_picker_up(folder_count),
+            Some(KeyAction::MoveToTop) => self.state.move_folder_picker_to_top(),
+            Some(KeyAction::MoveToBottom) => self.state.move_folder_picker_to_bottom(folder_count),
+            Some(KeyAction::PageUp) => self.state.folder_picker_page_up(),
+            Some(KeyAction::PageDown) => self.state.folder_picker_page_down(folder_count),
+            Some(KeyAction::SelectItem) => {
                 // Select folder by UUID
                 if folder_count > 0 && self.state.folder_picker_index < folder_count {
                     let (folder_id, display_name) = &folder_entries[self.state.folder_picker_index];
@@ -2023,7 +2021,11 @@ impl TuiApp {
                 }
                 self.state.ui_mode = UiMode::Normal;
             }
-            KeyCode::Esc => {
+            Some(KeyAction::Back) => {
+                self.state.ui_mode = UiMode::Normal;
+            }
+            // Safety net: a remap that unbinds Back must not trap the user.
+            None if matches!(key, KeyCode::Esc) => {
                 self.state.ui_mode = UiMode::Normal;
             }
             _ => {}
@@ -2032,9 +2034,11 @@ impl TuiApp {
     }
 
     /// Handle confirm delete mode
-    async fn handle_confirm_delete_mode(&mut self, key: KeyCode) -> Result<()> {
-        match key {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
+    async fn handle_confirm_delete_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
+        let action = self.state.keybinding_resolver.resolve_in(KeyContext::Dialog, key, mods);
+
+        match action {
+            Some(KeyAction::SelectItem) | Some(KeyAction::ConfirmYes) => {
                 match self.state.take_delete_target() {
                     DeleteTarget::Downloads => {
                         self.delete_download().await?;
@@ -2046,8 +2050,15 @@ impl TuiApp {
                     }
                 }
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            Some(KeyAction::ConfirmNo) | Some(KeyAction::Back) => {
                 // Cancel - return to whichever screen the dialog was opened from
+                self.state.ui_mode = match self.state.take_delete_target() {
+                    DeleteTarget::Downloads => UiMode::Normal,
+                    DeleteTarget::Folder(_) => UiMode::Settings,
+                };
+            }
+            // Safety net: a remap that unbinds Back must not trap the user.
+            None if matches!(key, KeyCode::Esc) => {
                 self.state.ui_mode = match self.state.take_delete_target() {
                     DeleteTarget::Downloads => UiMode::Normal,
                     DeleteTarget::Folder(_) => UiMode::Settings,
@@ -2059,52 +2070,62 @@ impl TuiApp {
     }
 
     /// Handle context menu mode
-    async fn handle_context_menu_mode(&mut self, key: KeyCode) -> Result<()> {
+    async fn handle_context_menu_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
         use super::state::ContextMenuAction;
 
-        match key {
-            // Navigation
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.state.context_menu_move_down();
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.state.context_menu_move_up();
-            }
+        let action = self.state.keybinding_resolver.resolve_in(KeyContext::Menu, key, mods);
 
-            // Execute selected action
-            KeyCode::Enter => {
+        match action {
+            // Navigation
+            Some(KeyAction::MoveDown) => self.state.context_menu_move_down(),
+            Some(KeyAction::MoveUp) => self.state.context_menu_move_up(),
+
+            // Execute the highlighted row
+            Some(KeyAction::SelectItem) => {
                 if let Some(action) = self.state.get_selected_menu_action() {
                     self.execute_menu_action(action).await?;
                 }
             }
 
-            // Direct keybindings for quick actions
-            KeyCode::Char(' ') => {
+            // Direct keybindings for quick actions. ToggleSelection (Space) is
+            // not resolved in the Menu context (see KeyAction::contexts), so
+            // it no longer starts/pauses here.
+            Some(KeyAction::ToggleDownload) => {
                 self.execute_menu_action(ContextMenuAction::StartPause).await?;
             }
-            KeyCode::Char('r') => {
+            Some(KeyAction::RetryDownload) => {
                 self.execute_menu_action(ContextMenuAction::Retry).await?;
             }
-            KeyCode::Char('d') => {
+            Some(KeyAction::DeleteDownload) => {
                 self.execute_menu_action(ContextMenuAction::Delete).await?;
             }
-            KeyCode::Char('f') => {
-                self.execute_menu_action(ContextMenuAction::ChangeFolder).await?;
-            }
-            KeyCode::Char('p') => {
+            Some(KeyAction::EditItem) => {
                 self.execute_menu_action(ContextMenuAction::ChangeSavePath).await?;
-            }
-            KeyCode::Char('c') => {
-                self.execute_menu_action(ContextMenuAction::CopyUrl).await?;
-            }
-            KeyCode::Char('o') => {
-                self.execute_menu_action(ContextMenuAction::OpenFolder).await?;
             }
 
             // Cancel menu
-            KeyCode::Esc => {
+            Some(KeyAction::Back) => {
                 self.state.ui_mode = UiMode::Normal;
             }
+
+            // Local accelerators with no global action; must not collide with
+            // any key resolved above (see KeybindingResolver defaults).
+            None => match key {
+                KeyCode::Char('f') => {
+                    self.execute_menu_action(ContextMenuAction::ChangeFolder).await?;
+                }
+                KeyCode::Char('c') => {
+                    self.execute_menu_action(ContextMenuAction::CopyUrl).await?;
+                }
+                KeyCode::Char('o') => {
+                    self.execute_menu_action(ContextMenuAction::OpenFolder).await?;
+                }
+                // Safety net: a remap that unbinds Back must not trap the user.
+                KeyCode::Esc => {
+                    self.state.ui_mode = UiMode::Normal;
+                }
+                _ => {}
+            },
 
             _ => {}
         }
@@ -2188,50 +2209,58 @@ impl TuiApp {
     }
 
     /// Handle folder context menu mode keys
-    async fn handle_folder_context_menu_mode(&mut self, key: KeyCode) -> Result<()> {
+    async fn handle_folder_context_menu_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
         use super::state::FolderContextMenuAction;
 
         let is_completed = self.state.is_viewing_completed_node();
+        let action = self.state.keybinding_resolver.resolve_in(KeyContext::Menu, key, mods);
 
-        match key {
+        match action {
             // Navigation
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.state.folder_context_menu_move_down(is_completed);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.state.folder_context_menu_move_up();
-            }
+            Some(KeyAction::MoveDown) => self.state.folder_context_menu_move_down(is_completed),
+            Some(KeyAction::MoveUp) => self.state.folder_context_menu_move_up(),
 
             // Execute selected action
-            KeyCode::Enter => {
+            Some(KeyAction::SelectItem) => {
                 if let Some(action) = self.state.get_selected_folder_menu_action(is_completed) {
                     self.execute_folder_menu_action(action).await?;
                 }
             }
 
             // Direct keybindings
-            KeyCode::Char('s') if !is_completed => {
+            Some(KeyAction::ToggleDownload) if !is_completed => {
                 self.execute_folder_menu_action(FolderContextMenuAction::StartAll)
                     .await?;
             }
-            KeyCode::Char('p') if !is_completed => {
-                self.execute_folder_menu_action(FolderContextMenuAction::StopAll)
-                    .await?;
-            }
-            KeyCode::Char('d') if !is_completed => {
+            Some(KeyAction::DeleteDownload) if !is_completed => {
                 self.execute_folder_menu_action(FolderContextMenuAction::DeleteAll)
-                    .await?;
-            }
-            KeyCode::Char('c') if is_completed => {
-                self.execute_folder_menu_action(FolderContextMenuAction::ClearHistory)
                     .await?;
             }
 
             // Cancel menu
-            KeyCode::Esc => {
+            Some(KeyAction::Back) => {
                 self.state.ui_mode = UiMode::Normal;
                 self.state.reset_folder_context_menu();
             }
+
+            // Local accelerators with no global action (StopAll, ClearHistory);
+            // must not collide with any key resolved above.
+            None => match key {
+                KeyCode::Char('p') if !is_completed => {
+                    self.execute_folder_menu_action(FolderContextMenuAction::StopAll)
+                        .await?;
+                }
+                KeyCode::Char('c') if is_completed => {
+                    self.execute_folder_menu_action(FolderContextMenuAction::ClearHistory)
+                        .await?;
+                }
+                // Safety net: a remap that unbinds Back must not trap the user.
+                KeyCode::Esc => {
+                    self.state.ui_mode = UiMode::Normal;
+                    self.state.reset_folder_context_menu();
+                }
+                _ => {}
+            },
 
             _ => {}
         }
@@ -2464,9 +2493,12 @@ impl TuiApp {
     }
 
     /// Handle download preview mode
-    async fn handle_download_preview_mode(&mut self, key: KeyCode) -> Result<()> {
-        match key {
-            KeyCode::Enter => {
+    async fn handle_download_preview_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
+        // Only SelectItem/Back apply here; move actions (also valid in Dialog,
+        // for the folder pickers) have no meaning on this single-item preview.
+        let action = self.state.keybinding_resolver.resolve_in(KeyContext::Dialog, key, mods);
+        match action {
+            Some(KeyAction::SelectItem) => {
                 // Confirm and add download
                 if !self.state.input_buffer.is_empty() {
                     let url = self.state.input_buffer.clone();
@@ -2488,8 +2520,13 @@ impl TuiApp {
                 self.state.input_buffer.clear();
                 self.state.preview_info = None;
             }
-            KeyCode::Esc => {
+            Some(KeyAction::Back) => {
                 // Cancel and return to add download mode
+                self.state.ui_mode = UiMode::AddDownload;
+                self.state.preview_info = None;
+            }
+            // Safety net: a remap that unbinds Back must not trap the user.
+            None if matches!(key, KeyCode::Esc) => {
                 self.state.ui_mode = UiMode::AddDownload;
                 self.state.preview_info = None;
             }

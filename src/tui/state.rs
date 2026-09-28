@@ -382,19 +382,37 @@ impl ContextMenuAction {
         }
     }
 
-    /// Get keybinding hint
-    pub fn key_hint(&self) -> &str {
+    /// Keybinding hint shown next to the label. Resolver-backed items show the
+    /// first configured key for their `KeyAction` so a remap is reflected here
+    /// too; the local accelerators (`f`, `c`, `o`) have no global action and
+    /// stay literal.
+    pub fn key_hint(&self, resolver: &crate::app::keybindings::KeybindingResolver) -> String {
+        use crate::app::keybindings::KeyAction;
+
         match self {
-            Self::StartPause => "Space",
-            Self::Retry => "r",
-            Self::Delete => "d",
-            Self::ChangeFolder => "f",
-            Self::ChangeSavePath => "p",
-            Self::CopyUrl => "c",
-            Self::OpenFolder => "o",
-            Self::Cancel => "Esc",
+            Self::StartPause => first_key_or(resolver, KeyAction::ToggleDownload, "s"),
+            Self::Retry => first_key_or(resolver, KeyAction::RetryDownload, "r"),
+            Self::Delete => first_key_or(resolver, KeyAction::DeleteDownload, "d"),
+            Self::ChangeFolder => "f".to_string(),
+            Self::ChangeSavePath => first_key_or(resolver, KeyAction::EditItem, "e"),
+            Self::CopyUrl => "c".to_string(),
+            Self::OpenFolder => "o".to_string(),
+            Self::Cancel => first_key_or(resolver, KeyAction::Back, "Esc"),
         }
     }
+}
+
+/// The first configured key string for `action`, or `fallback` if unbound.
+fn first_key_or(
+    resolver: &crate::app::keybindings::KeybindingResolver,
+    action: crate::app::keybindings::KeyAction,
+    fallback: &str,
+) -> String {
+    resolver
+        .keys_for(action)
+        .first()
+        .cloned()
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 
@@ -430,14 +448,16 @@ impl FolderContextMenuAction {
         }
     }
 
-    /// Get keybinding hint
-    pub fn key_hint(&self) -> &str {
+    /// Keybinding hint shown next to the label. See `ContextMenuAction::key_hint`.
+    pub fn key_hint(&self, resolver: &crate::app::keybindings::KeybindingResolver) -> String {
+        use crate::app::keybindings::KeyAction;
+
         match self {
-            Self::StartAll => "s",
-            Self::StopAll => "p",
-            Self::DeleteAll => "d",
-            Self::ClearHistory => "c",
-            Self::Cancel => "Esc",
+            Self::StartAll => first_key_or(resolver, KeyAction::ToggleDownload, "s"),
+            Self::StopAll => "p".to_string(),
+            Self::DeleteAll => first_key_or(resolver, KeyAction::DeleteDownload, "d"),
+            Self::ClearHistory => "c".to_string(),
+            Self::Cancel => first_key_or(resolver, KeyAction::Back, "Esc"),
         }
     }
 }
@@ -1008,6 +1028,46 @@ impl TuiState {
             tree_page_down_index(self.settings_folder_index, folder_count, TREE_PAGE_SIZE);
     }
 
+    /// Move the folder-picker dialog selection down, wrapping at the end
+    /// (ChangeFolder / SwitchFolder).
+    pub fn move_folder_picker_down(&mut self, folder_count: usize) {
+        if folder_count > 0 {
+            self.folder_picker_index = (self.folder_picker_index + 1) % folder_count;
+        }
+    }
+
+    /// Move the folder-picker dialog selection up, wrapping at the start.
+    pub fn move_folder_picker_up(&mut self, folder_count: usize) {
+        if folder_count > 0 {
+            self.folder_picker_index = if self.folder_picker_index == 0 {
+                folder_count - 1
+            } else {
+                self.folder_picker_index - 1
+            };
+        }
+    }
+
+    /// Move the folder-picker dialog selection to the first row.
+    pub fn move_folder_picker_to_top(&mut self) {
+        self.folder_picker_index = tree_top_index(0);
+    }
+
+    /// Move the folder-picker dialog selection to the last row.
+    pub fn move_folder_picker_to_bottom(&mut self, folder_count: usize) {
+        self.folder_picker_index = tree_bottom_index(folder_count);
+    }
+
+    /// Page the folder-picker dialog selection up.
+    pub fn folder_picker_page_up(&mut self) {
+        self.folder_picker_index = tree_page_up_index(self.folder_picker_index, TREE_PAGE_SIZE);
+    }
+
+    /// Page the folder-picker dialog selection down, clamped to `folder_count` rows.
+    pub fn folder_picker_page_down(&mut self, folder_count: usize) {
+        self.folder_picker_index =
+            tree_page_down_index(self.folder_picker_index, folder_count, TREE_PAGE_SIZE);
+    }
+
     /// Reset settings screen state
     pub fn reset_settings_state(&mut self) {
         self.selected_folder_id = None;
@@ -1476,5 +1536,46 @@ mod tree_navigation_tests {
         assert_eq!(tree_page_down_index(0, 1, 10), 0);
         assert_eq!(tree_page_down_index(0, 15, 10), 10);
         assert_eq!(tree_page_down_index(8, 15, 10), 14);
+    }
+}
+
+#[cfg(test)]
+mod menu_accelerator_tests {
+    use super::*;
+    use crate::app::keybindings::{KeyAction, KeyContext, KeybindingResolver, KeybindingsConfig};
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// Local menu accelerators with no `KeyAction` of their own (see
+    /// `handle_context_menu_mode` / `handle_folder_context_menu_mode`). None
+    /// of these may collide with a default key resolved in `KeyContext::Menu`,
+    /// or the accelerator would be unreachable.
+    const LOCAL_ACCELERATORS: &[char] = &['f', 'c', 'o', 'p'];
+
+    #[test]
+    fn local_accelerators_do_not_collide_with_default_menu_keys() {
+        let resolver = KeybindingResolver::from_config(&KeybindingsConfig::default());
+
+        for &c in LOCAL_ACCELERATORS {
+            let resolved = resolver.resolve_in(KeyContext::Menu, KeyCode::Char(c), KeyModifiers::empty());
+            assert_eq!(
+                resolved, None,
+                "local accelerator '{}' collides with default Menu action {:?}",
+                c, resolved
+            );
+        }
+    }
+
+    #[test]
+    fn context_menu_key_hint_reflects_a_remap() {
+        let mut bindings = std::collections::HashMap::new();
+        bindings.insert(
+            KeyAction::ToggleDownload,
+            crate::app::keybindings::KeyBindingSpec::Single("t".into()),
+        );
+        let resolver = KeybindingResolver::from_config(&KeybindingsConfig { bindings });
+
+        assert_eq!(ContextMenuAction::StartPause.key_hint(&resolver), "t");
+        // Local accelerators are unaffected by a resolver remap.
+        assert_eq!(ContextMenuAction::ChangeFolder.key_hint(&resolver), "f");
     }
 }

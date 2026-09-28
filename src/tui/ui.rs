@@ -2083,7 +2083,7 @@ fn render_confirm_delete_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
     lines.extend([
         Line::from(""),
         Line::from(Span::styled(
-            "Press Y to confirm, N or Esc to cancel",
+            "Press Enter or Y to confirm, N or Esc to cancel",
             Style::default().fg(Color::Cyan),
         )),
         Line::from(""),
@@ -2237,7 +2237,11 @@ fn render_context_menu(app: &TuiApp, f: &mut Frame, area: Rect) {
     // Calculate menu dimensions
     let max_label_width = menu_items
         .iter()
-        .map(|item| app.state.t(item.label_key()).len() + item.key_hint().len() + 6) // +6 for spacing and brackets
+        .map(|item| {
+            app.state.t(item.label_key()).len()
+                + item.key_hint(&app.state.keybinding_resolver).len()
+                + 6 // +6 for spacing and brackets
+        })
         .max()
         .unwrap_or(40);
 
@@ -2271,7 +2275,10 @@ fn render_context_menu(app: &TuiApp, f: &mut Frame, area: Rect) {
             Span::styled(prefix, style),
             Span::styled(app.state.t(action.label_key()), style),
             Span::raw("  "),
-            Span::styled(format!("[{}]", action.key_hint()), key_hint_style),
+            Span::styled(
+                format!("[{}]", action.key_hint(&app.state.keybinding_resolver)),
+                key_hint_style,
+            ),
         ]));
     }
 
@@ -2333,7 +2340,9 @@ fn render_folder_context_menu(app: &TuiApp, f: &mut Frame, area: Rect) {
     let max_label_width = menu_items
         .iter()
         .map(|item| {
-            app.state.t(item.label_key()).len() + item.key_hint().len() + 6
+            app.state.t(item.label_key()).len()
+                + item.key_hint(&app.state.keybinding_resolver).len()
+                + 6
         })
         .max()
         .unwrap_or(40);
@@ -2368,7 +2377,10 @@ fn render_folder_context_menu(app: &TuiApp, f: &mut Frame, area: Rect) {
             Span::styled(prefix, style),
             Span::styled(app.state.t(action.label_key()), style),
             Span::raw("  "),
-            Span::styled(format!("[{}]", action.key_hint()), key_hint_style),
+            Span::styled(
+                format!("[{}]", action.key_hint(&app.state.keybinding_resolver)),
+                key_hint_style,
+            ),
         ]));
     }
 
