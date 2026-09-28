@@ -1,21 +1,26 @@
 //! Client side of the daemon control pipe: `probe`, used by `bind` itself to
 //! tell a live daemon apart from a stale pipe name and by CLI routing to
 //! decide remote vs. standalone, and `send`, used by CLI routing to carry out
-//! a routed request. `send` runs the same `owner::verify_server_owner` check
-//! as `probe` does here: right after opening the pipe and before its first
-//! write, returning `Err(anyhow!(owner::OWNER_MISMATCH_MSG))` on mismatch so
-//! `route` exits 5.
+//! a routed request. `send` runs the same `owner::check_server_owner` as
+//! `probe` does here: right after opening the pipe and before its first
+//! write, returning `Err(anyhow!(msg))` on an untrusted owner so `route`
+//! exits 5. An open that fails with access denied (os error 5) gets its own
+//! message, because that is the common shape of an elevation mismatch: the
+//! elevated daemon's default DACL denies a non-elevated caller before the
+//! owner check ever runs.
 
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 
-use super::owner::{self, OWNER_MISMATCH_MSG};
+use super::owner;
 use super::protocol::{validate_pipe_name, ControlRequest, ControlResponse, CONTROL_PROTOCOL_VERSION};
 
 /// `ERROR_PIPE_BUSY`: every instance is currently connected to another client.
 const ERROR_PIPE_BUSY: i32 = 231;
+/// Windows `ERROR_ACCESS_DENIED`.
+const ERROR_ACCESS_DENIED: i32 = 5;
 /// How long `probe` retries a busy pipe before giving up.
 const PIPE_BUSY_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const PIPE_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -26,6 +31,17 @@ const MAX_PROBE_RESPONSE_BYTES: u64 = 64 * 1024;
 /// Caps a single `send` response line; larger than the probe cap because a
 /// `Tasks`/`List` response can carry many `DownloadTask`s.
 const MAX_SEND_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maps an open failure that looks like an elevation mismatch (an elevated
+/// server's default DACL denying a non-elevated caller) to a message that
+/// names the likely cause; other open errors are reported as-is by the
+/// caller.
+fn open_access_denied_message(e: &std::io::Error) -> Option<String> {
+    (e.raw_os_error() == Some(ERROR_ACCESS_DENIED)).then(|| {
+        "access denied opening the daemon pipe (the daemon may be running elevated while this command is not)"
+            .to_string()
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonProbe {
@@ -52,13 +68,17 @@ pub async fn probe(pipe_name: &str) -> DaemonProbe {
                 }
                 tokio::time::sleep(PIPE_BUSY_RETRY_INTERVAL).await;
             }
-            Err(e) => return DaemonProbe::Unreachable(format!("failed to open pipe: {e}")),
+            Err(e) => {
+                return DaemonProbe::Unreachable(
+                    open_access_denied_message(&e)
+                        .unwrap_or_else(|| format!("failed to open pipe: {e}")),
+                )
+            }
         }
     };
 
-    if let Err(detail) = owner::verify_server_owner(&client) {
-        tracing::warn!("control pipe {pipe_name} failed server owner check: {detail}");
-        return DaemonProbe::Unreachable(OWNER_MISMATCH_MSG.to_string());
+    if let Err(msg) = owner::check_server_owner(&client) {
+        return DaemonProbe::Unreachable(msg);
     }
 
     match tokio::time::timeout(PING_TIMEOUT, ping(client)).await {
@@ -111,9 +131,8 @@ pub async fn send(
 ) -> anyhow::Result<ControlResponse> {
     let client = open_for_send(pipe_name).await?;
 
-    if let Err(detail) = owner::verify_server_owner(&client) {
-        tracing::warn!("control pipe {pipe_name} failed server owner check: {detail}");
-        return Err(anyhow::anyhow!(OWNER_MISMATCH_MSG));
+    if let Err(msg) = owner::check_server_owner(&client) {
+        return Err(anyhow::anyhow!(msg));
     }
 
     let round_trip = send_request(client, req);
@@ -139,7 +158,10 @@ async fn open_for_send(pipe_name: &str) -> anyhow::Result<NamedPipeClient> {
                 }
                 tokio::time::sleep(PIPE_BUSY_RETRY_INTERVAL).await;
             }
-            Err(e) => return Err(anyhow::anyhow!("failed to open control pipe: {e}")),
+            Err(e) => {
+                return Err(anyhow::anyhow!(open_access_denied_message(&e)
+                    .unwrap_or_else(|| format!("failed to open control pipe: {e}"))))
+            }
         }
     }
 }
@@ -171,4 +193,22 @@ async fn send_request(
     }
     let resp: ControlResponse = serde_json::from_str(String::from_utf8_lossy(&buf).trim())?;
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_access_denied_message_mentions_elevation() {
+        let e = std::io::Error::from_raw_os_error(ERROR_ACCESS_DENIED);
+        let msg = open_access_denied_message(&e).expect("os error 5 should map to a message");
+        assert!(msg.contains("elevated"), "message should mention elevation: {msg}");
+    }
+
+    #[test]
+    fn open_other_errors_are_not_mapped() {
+        let e = std::io::Error::from_raw_os_error(2); // ERROR_FILE_NOT_FOUND
+        assert_eq!(open_access_denied_message(&e), None);
+    }
 }

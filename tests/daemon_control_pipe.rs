@@ -263,10 +263,10 @@ async fn server_owner_check_passes_for_same_user() {
     .await
     .expect("open timed out");
 
-    // Both ends of this pipe are this same test process, so the owner check
-    // must pass: the server process and the current process are the same
-    // token user.
-    owner::verify_server_owner(&client).expect("server owner check should pass for same user");
+    // This test process both created the pipe and opened this client handle
+    // to it, so the pipe's owner SID is this process's own TokenUser SID and
+    // the check must pass.
+    owner::check_server_owner(&client).expect("server owner check should pass for same user");
 }
 
 #[tokio::test]
