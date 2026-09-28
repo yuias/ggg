@@ -166,19 +166,26 @@ impl AppState {
             return;
         };
 
-        let flushed = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let (response_tx, response_rx) = mpsc::channel();
             if sender.send(ScriptRequest::Flush { response: response_tx }).is_err() {
                 // Executor thread is gone; nothing to wait for.
-                return true;
+                return Ok(());
             }
-            response_rx.recv_timeout(timeout).is_ok()
+            response_rx.recv_timeout(timeout)
         })
-        .await
-        .unwrap_or(false);
+        .await;
 
-        if !flushed {
-            tracing::warn!("Timed out waiting for script executor to flush");
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(mpsc::RecvTimeoutError::Timeout)) => {
+                tracing::warn!("Timed out waiting for script executor to flush");
+            }
+            // The executor dropped the reply sender, i.e. it exited mid-flush.
+            Ok(Err(mpsc::RecvTimeoutError::Disconnected)) => {
+                tracing::warn!("Script executor stopped before answering the flush");
+            }
+            Err(e) => tracing::warn!("Script flush task failed: {e}"),
         }
     }
 }
