@@ -152,9 +152,10 @@ pub enum Commands {
         /// printing progress along the way. Like `wait`, the exit code
         /// reports the outcome, though this can never time out: 0
         /// completed, 2 removed, 6 failed, 7 paused. Without a running
-        /// daemon, omitting --wait exits (and aborts the download) as soon
-        /// as it starts, so a standalone `start` needs --wait (or a
-        /// running daemon) to actually finish the download.
+        /// daemon, this process exits right after starting the download and
+        /// would kill it immediately, so standalone `start` refuses to run
+        /// without --wait and leaves the task untouched (exit code 5); pass
+        /// --wait or run a daemon (`ggg --headless`).
         #[arg(long)]
         wait: bool,
     },
@@ -256,6 +257,10 @@ pub enum Commands {
     },
 
     /// Start all downloads
+    ///
+    /// Standalone `start-all` has no --wait to keep the process alive, so it
+    /// refuses to run without a daemon and leaves every task untouched (exit
+    /// code 5); run a daemon (`ggg --headless`) first.
     StartAll {
         /// Filter by folder ID
         #[arg(long)]

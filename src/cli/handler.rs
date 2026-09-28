@@ -241,6 +241,18 @@ async fn handle_start(
     manager: &DownloadManager,
     wait: bool,
 ) -> Result<i32> {
+    // This handler only runs standalone (a routed `start` goes through
+    // `remote::send_and_render` instead); the process exits right after this
+    // function returns, so without --wait a spawned download would be killed
+    // immediately. Refuse up front, before touching the task, rather than
+    // starting a download nothing will finish.
+    if !wait {
+        eprintln!(
+            "Error: standalone `start` needs --wait, or a running daemon (`ggg --headless`)"
+        );
+        return Ok(error::DAEMON_UNREACHABLE);
+    }
+
     let id = parse_task_id(&id_str)?;
 
     // Check if download exists
@@ -257,28 +269,25 @@ async fn handle_start(
         StartOutcome::Busy => println!("Download is busy (being started or modified): {}", task.filename),
     }
 
-    if wait {
-        let (outcome, task) =
-            wait_until_final(id, manager, tokio::time::Duration::from_millis(500)).await;
-        // The failure path (max retries exceeded) never saves the terminal
-        // `Error` status on its own; every other terminal path already went
-        // through a queue write, so this is a harmless extra save for them.
-        // A failed save must not mask the outcome's exit code.
-        if let Err(e) = manager.save_queue_to_folders().await {
-            tracing::error!("Failed to save queue after wait: {e}");
-        }
-        let scripts_timeout = state.config.read().await.scripts.timeout;
-        state
-            .flush_scripts(
-                tokio::time::Duration::from_secs(scripts_timeout)
-                    .saturating_add(tokio::time::Duration::from_secs(5)),
-            )
-            .await;
-        remote::render_waited(outcome, task, false);
-        return Ok(remote::exit_code_for_wait(outcome));
+    // The early return above means `wait` is always true here.
+    let (outcome, task) =
+        wait_until_final(id, manager, tokio::time::Duration::from_millis(500)).await;
+    // The failure path (max retries exceeded) never saves the terminal
+    // `Error` status on its own; every other terminal path already went
+    // through a queue write, so this is a harmless extra save for them.
+    // A failed save must not mask the outcome's exit code.
+    if let Err(e) = manager.save_queue_to_folders().await {
+        tracing::error!("Failed to save queue after wait: {e}");
     }
-
-    Ok(error::SUCCESS)
+    let scripts_timeout = state.config.read().await.scripts.timeout;
+    state
+        .flush_scripts(
+            tokio::time::Duration::from_secs(scripts_timeout)
+                .saturating_add(tokio::time::Duration::from_secs(5)),
+        )
+        .await;
+    remote::render_waited(outcome, task, false);
+    Ok(remote::exit_code_for_wait(outcome))
 }
 
 /// Polls until `id` reaches a state `daemon_ops::wait_state` treats as
@@ -1448,44 +1457,17 @@ async fn resolve_optional_folder_standalone(
     }
 }
 
-/// Start all downloads
+/// Start all downloads. Standalone only (a routed `start-all` goes through
+/// `remote::send_and_render` instead), and `start-all` has no `--wait`: the
+/// process exits right after this function returns, which would kill every
+/// download it just spawned. Refuse instead of starting anything.
 async fn handle_start_all(
-    state: &AppState,
-    manager: &DownloadManager,
-    folder: Option<String>,
+    _state: &AppState,
+    _manager: &DownloadManager,
+    _folder: Option<String>,
 ) -> Result<i32> {
-    // Resolved the same way `list --folder`/`add --folder` are, so a display
-    // name matches its tasks instead of matching nothing (a raw string
-    // compare against `task.folder_id` only ever matches the UUID key).
-    let Some(folder_id) = resolve_optional_folder_standalone(state, &folder).await else {
-        eprintln!("Error: unknown folder");
-        return Ok(error::INVALID_INPUT);
-    };
-
-    let tasks = manager.get_all_downloads().await;
-
-    let mut started_count = 0;
-    for task in tasks {
-        if let Some(ref f) = folder_id {
-            if task.folder_id != *f {
-                continue;
-            }
-        }
-
-        // Only start pending or paused tasks
-        if matches!(task.status, DownloadStatus::Pending | DownloadStatus::Paused) {
-            match manager.start_download(task.id, state.script_sender.clone(), state.config.clone()).await {
-                Ok(StartOutcome::Started) => started_count += 1,
-                Ok(_) => {}
-                Err(e) => tracing::warn!("Failed to start {}: {}", task.filename, e),
-            }
-        }
-    }
-
-    manager.save_queue_to_folders().await?;
-
-    println!("Started {} download(s)", started_count);
-    Ok(error::SUCCESS)
+    eprintln!("Error: standalone `start-all` needs a running daemon (`ggg --headless`)");
+    Ok(error::DAEMON_UNREACHABLE)
 }
 
 /// Pause all downloads
@@ -2125,5 +2107,39 @@ mod tests {
         assert_eq!(outcome, WaitOutcome::Paused);
         assert_eq!(task.map(|t| t.status), Some(DownloadStatus::Paused));
         assert_eq!(remote::exit_code_for_wait(WaitOutcome::Paused), error::TASK_PAUSED);
+    }
+
+    #[tokio::test]
+    async fn standalone_start_without_wait_is_refused() {
+        let state = AppState::new(Config::default());
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Pending);
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let code = handle_start(id.to_string(), &state, &manager, false)
+            .await
+            .expect("refusal is not an error result");
+
+        assert_eq!(code, error::DAEMON_UNREACHABLE);
+        let stored = manager.get_by_id(id).await.expect("task still present");
+        assert_eq!(stored.status, DownloadStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn standalone_start_all_is_refused() {
+        let state = AppState::new(Config::default());
+        let manager = DownloadManager::new();
+        let task = task_with_status(DownloadStatus::Pending);
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let code = handle_start_all(&state, &manager, None)
+            .await
+            .expect("refusal is not an error result");
+
+        assert_eq!(code, error::DAEMON_UNREACHABLE);
+        let stored = manager.get_by_id(id).await.expect("task still present");
+        assert_eq!(stored.status, DownloadStatus::Pending);
     }
 }
