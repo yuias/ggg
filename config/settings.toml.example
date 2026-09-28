@@ -75,6 +75,12 @@ bandwidth_limit = 0
 #   Custom value: { type = "custom", value = "https://example.com" }
 # referrer_policy = "none"
 
+# How long pause/remove/move wait for a task's claim (usually a start
+# running its beforeRequest script) before reporting the task busy, in
+# milliseconds (default: 2000). Read once at startup; hand-edit this file
+# to change it, it is not exposed in `ggg config`/the settings UI.
+# claim_wait_ms = 2000
+
 
 # ============================================================================
 # Network Settings
@@ -173,6 +179,25 @@ switch_folder = "F"
 quit = ["q", "Ctrl+c"]
 undo = "Ctrl+z"
 refresh = "R"
+
+# Cross-context (Settings tabs, menus, dialogs, the help screen)
+back = ["Escape", "q"]
+confirm_yes = "y"
+confirm_no = "n"
+reload_config = "R"
+
+# Rules for this table:
+#   - Unknown action names are ignored (with a warning in the log), so an
+#     older/newer settings.toml never fails to load over a renamed action.
+#   - A partial table only overrides the actions it lists; every action left
+#     out keeps its default binding above.
+#   - Listing an action replaces its whole default key list, it does not
+#     merge with it: `move_down = "j"` drops the default "Down" binding too.
+#   - If two actions end up bound to the same key in the same screen, the
+#     one that comes first alphabetically by its internal name wins; a
+#     warning is logged for the loser.
+# See docs/KeyBindings.md for which screens ("contexts") each action
+# resolves in, and press `?` in the TUI for the generated help screen.
 
 
 # ============================================================================
