@@ -1077,7 +1077,9 @@ fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
             }
         }
 
-        // Add Scripts section (collapsible; Scripts tab only)
+        // Script file rows (Scripts tab only): flattened right after
+        // ScriptsEnabled, continuing the same row selection index instead of
+        // a collapsible sub-list.
         if current_section == SettingsSection::Scripts {
             lines.push(Line::from(""));
             lines.push(Line::from(""));
@@ -1087,52 +1089,48 @@ fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
             // List all script files (cached; refreshed on tick by the app loop so
             // rendering doesn't block on read_dir every frame).
             let script_files = app.state.cached_script_files.clone();
-            let script_count = script_files.len();
+            let field_count = fields.len();
 
-            // Collapsible header
-            let expand_icon = if app.state.app_scripts_expanded { "▼" } else { "▶" };
+            let header_args = fluent_args! { "count" => script_files.len() };
             lines.push(Line::from(Span::styled(
-                format!("{} Scripts ({} files) - Press 's' to toggle", expand_icon, script_count),
+                app.state.t_with_args("settings-scripts-header", Some(&header_args)),
                 Style::default().fg(section_header_color).add_modifier(Modifier::BOLD),
             )));
+            lines.push(Line::from(""));
 
-            // If expanded, show script files
-            if app.state.app_scripts_expanded {
-                lines.push(Line::from(""));
-                if script_files.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "  No script files found",
-                        Style::default().fg(muted_color),
-                    )));
-                } else {
-                    for (idx, filename) in script_files.iter().enumerate() {
-                        let is_selected = idx == app.state.script_files_index;
-                        let is_enabled = script_files_config.get(filename).copied().unwrap_or(true);
+            if script_files.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", app.state.t("settings-scripts-none")),
+                    Style::default().fg(muted_color),
+                )));
+            } else {
+                for (idx, filename) in script_files.iter().enumerate() {
+                    let is_selected = field_count + idx == app.state.app_settings_field_index;
+                    let is_enabled = script_files_config.get(filename).copied().unwrap_or(true);
 
-                        let prefix = if is_selected { "  ▸ " } else { "    " };
-                        let status = if is_enabled { "✓" } else { "✗" };
+                    let prefix = if is_selected { "▸ " } else { "  " };
+                    let status = if is_enabled { "✓" } else { "✗" };
 
-                        let style = if is_selected {
-                            Style::default().fg(selected_color).add_modifier(Modifier::BOLD)
-                        } else if is_enabled {
-                            Style::default().fg(success_color)
-                        } else {
-                            Style::default().fg(error_color)
-                        };
+                    let style = if is_selected {
+                        Style::default().fg(selected_color).add_modifier(Modifier::BOLD)
+                    } else if is_enabled {
+                        Style::default().fg(success_color)
+                    } else {
+                        Style::default().fg(error_color)
+                    };
 
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix, style),
-                            Span::styled(format!("{} ", status), style),
-                            Span::styled(filename.clone(), style),
-                        ]));
-                    }
-
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        app.state.t("help-script-toggle"),
-                        Style::default().fg(muted_color),
-                    )));
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, style),
+                        Span::styled(format!("{} ", status), style),
+                        Span::styled(filename.clone(), style),
+                    ]));
                 }
+
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    app.state.t("help-script-toggle"),
+                    Style::default().fg(muted_color),
+                )));
             }
         }
     } else {
@@ -1286,6 +1284,8 @@ fn render_folder_list(app: &TuiApp, f: &mut Frame, area: Rect) {
 
 /// Render folder details/editor (right panel)
 fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
+    use super::state::SettingsField;
+
     let config = app.state.app_state.config.try_read();
     let is_edit_mode = app.state.ui_mode == UiMode::FolderEdit;
     let field_index = app.state.settings_field_index;
@@ -1427,7 +1427,9 @@ fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
                     }
                 }
 
-                // Add Scripts section (collapsible)
+                // Script file rows (folder override): flattened right after
+                // the fixed fields, continuing the same row selection index
+                // instead of a collapsible sub-list.
                 detail_lines.push(Line::from(""));
                 detail_lines.push(Line::from(""));
 
@@ -1437,76 +1439,72 @@ fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
                 // List all script files (cached; refreshed on tick by the app
                 // loop so rendering doesn't block on read_dir every frame).
                 let script_files = app.state.cached_script_files.clone();
-                let script_count = script_files.len();
+                let field_count = SettingsField::all().len();
 
-                // Collapsible header
-                let expand_icon = if app.state.folder_scripts_expanded { "▼" } else { "▶" };
+                let header_args = fluent_args! { "count" => script_files.len() };
                 detail_lines.push(Line::from(Span::styled(
-                    format!("{} Scripts ({} files) - Press 's' to toggle", expand_icon, script_count),
+                    app.state.t_with_args("settings-scripts-header", Some(&header_args)),
                     Style::default().fg(section_header_color).add_modifier(Modifier::BOLD),
                 )));
+                detail_lines.push(Line::from(""));
 
-                // If expanded, show script files
-                if app.state.folder_scripts_expanded {
-                    detail_lines.push(Line::from(""));
-                    if script_files.is_empty() {
-                        detail_lines.push(Line::from(Span::styled(
-                            "  No script files found",
-                            Style::default().fg(muted_color),
-                        )));
-                    } else {
-                        for (idx, filename) in script_files.iter().enumerate() {
-                            let is_selected = idx == app.state.script_files_index;
+                if script_files.is_empty() {
+                    detail_lines.push(Line::from(Span::styled(
+                        format!("  {}", app.state.t("settings-scripts-none")),
+                        Style::default().fg(muted_color),
+                    )));
+                } else {
+                    for (idx, filename) in script_files.iter().enumerate() {
+                        let is_selected = is_edit_mode && field_count + idx == field_index;
 
-                            // Determine effective status (with inheritance)
-                            let (status_char, status_text, style_color) = if let Some(folder_files) = folder_script_files {
-                                if let Some(&enabled) = folder_files.get(filename) {
-                                    // Folder override
-                                    if enabled {
-                                        ("✓", filename.clone(), success_color)
-                                    } else {
-                                        ("✗", filename.clone(), error_color)
-                                    }
+                        // Determine effective status (with inheritance)
+                        let (status_char, status_text, style_color) = if let Some(folder_files) = folder_script_files {
+                            if let Some(&enabled) = folder_files.get(filename) {
+                                // Folder override
+                                if enabled {
+                                    ("✓", filename.clone(), success_color)
                                 } else {
-                                    // Inherit from Application
-                                    let app_enabled = app_script_files.get(filename).copied().unwrap_or(true);
-                                    if app_enabled {
-                                        ("○", format!("{} (inherit)", filename), muted_color)
-                                    } else {
-                                        ("○", format!("{} (inherit)", filename), theme::TEXT_DIM)
-                                    }
+                                    ("✗", filename.clone(), error_color)
                                 }
                             } else {
-                                // No folder override, all inherit
+                                // Inherit from Application
                                 let app_enabled = app_script_files.get(filename).copied().unwrap_or(true);
                                 if app_enabled {
                                     ("○", format!("{} (inherit)", filename), muted_color)
                                 } else {
                                     ("○", format!("{} (inherit)", filename), theme::TEXT_DIM)
                                 }
-                            };
-
-                            let prefix = if is_selected { "  ▸ " } else { "    " };
-
-                            let style = if is_selected {
-                                Style::default().fg(selected_color).add_modifier(Modifier::BOLD)
+                            }
+                        } else {
+                            // No folder override, all inherit
+                            let app_enabled = app_script_files.get(filename).copied().unwrap_or(true);
+                            if app_enabled {
+                                ("○", format!("{} (inherit)", filename), muted_color)
                             } else {
-                                Style::default().fg(style_color)
-                            };
+                                ("○", format!("{} (inherit)", filename), theme::TEXT_DIM)
+                            }
+                        };
 
-                            detail_lines.push(Line::from(vec![
-                                Span::styled(prefix, style),
-                                Span::styled(format!("{} ", status_char), style),
-                                Span::styled(status_text, style),
-                            ]));
-                        }
+                        let prefix = if is_selected { "▸ " } else { "  " };
 
-                        detail_lines.push(Line::from(""));
-                        detail_lines.push(Line::from(Span::styled(
-                            app.state.t("help-script-toggle"),
-                            Style::default().fg(muted_color),
-                        )));
+                        let style = if is_selected {
+                            Style::default().fg(selected_color).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(style_color)
+                        };
+
+                        detail_lines.push(Line::from(vec![
+                            Span::styled(prefix, style),
+                            Span::styled(format!("{} ", status_char), style),
+                            Span::styled(status_text, style),
+                        ]));
                     }
+
+                    detail_lines.push(Line::from(""));
+                    detail_lines.push(Line::from(Span::styled(
+                        app.state.t("help-script-toggle"),
+                        Style::default().fg(muted_color),
+                    )));
                 }
 
                 detail_lines.push(Line::from(""));

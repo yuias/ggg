@@ -76,6 +76,10 @@ settings-referrer-custom = カスタム
 settings-new-folder = 新しいフォルダ
 settings-no-folders = フォルダが設定されていません
 
+# Script file rows (Scripts tab and folder editor)
+settings-scripts-header = スクリプト ({ $count } 件)
+settings-scripts-none = スクリプトファイルが見つかりません
+
 # Settings tabs
 settings-tab-general = 一般
 settings-tab-downloads = ダウンロード

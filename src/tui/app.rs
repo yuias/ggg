@@ -75,10 +75,11 @@ impl TuiApp {
                 let now = std::time::Instant::now();
                 if now.duration_since(self.last_update_time) >= Duration::from_millis(250) {
                     self.state.update_downloads(&self.manager).await;
-                    // Refresh the script-file cache only while settings is open,
+                    // Refresh the script-file cache only while settings or the
+                    // folder editor is open (both show a script-file row list),
                     // so render/input paths can read it instead of scanning the
                     // directory on every frame.
-                    if matches!(self.state.ui_mode, UiMode::Settings) {
+                    if matches!(self.state.ui_mode, UiMode::Settings | UiMode::FolderEdit) {
                         self.refresh_script_files_cache().await;
                     }
                     self.last_update_time = now;
@@ -118,6 +119,17 @@ impl TuiApp {
             config.scripts.directory.clone()
         };
         self.state.cached_script_files = scan_script_files(&dir);
+
+        // The script rows are flattened onto the end of the field list, so a
+        // shrunk file list can leave the selected row index past the end.
+        let app_row_count = self.state.app_settings_row_count();
+        if app_row_count > 0 && self.state.app_settings_field_index >= app_row_count {
+            self.state.app_settings_field_index = app_row_count - 1;
+        }
+        let folder_row_count = self.state.folder_settings_row_count();
+        if folder_row_count > 0 && self.state.settings_field_index >= folder_row_count {
+            self.state.settings_field_index = folder_row_count - 1;
+        }
     }
 
     /// Handle keyboard input
@@ -1026,7 +1038,7 @@ impl TuiApp {
 
     /// Handle settings mode
     async fn handle_settings_mode(&mut self, key: KeyCode) -> Result<()> {
-        use super::state::{ApplicationSettingsField, SettingsSection};
+        use super::state::SettingsSection;
 
         // Close settings screen
         if matches!(key, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x')) {
@@ -1035,11 +1047,16 @@ impl TuiApp {
             return Ok(());
         }
 
-        // Reload configuration from disk (Shift+R)
+        // Reload (Shift+R): scripts on the Scripts tab, config everywhere else
         if matches!(key, KeyCode::Char('R')) {
-            use crate::ui::commands::{Command, handle_command};
+            use crate::ui::commands::{Command, CommandResponse, handle_command};
 
-            let command = Command::ReloadConfig;
+            let reload_scripts = self.state.settings_section == SettingsSection::Scripts;
+            let command = if reload_scripts {
+                Command::ReloadScripts
+            } else {
+                Command::ReloadConfig
+            };
             let response = handle_command(
                 command,
                 self.state.app_state.clone(),
@@ -1048,11 +1065,19 @@ impl TuiApp {
             .await;
 
             match response {
-                crate::ui::commands::CommandResponse::Success { .. } => {
-                    tracing::info!("Configuration reloaded successfully");
+                CommandResponse::Success { .. } => {
+                    if reload_scripts {
+                        tracing::info!("Scripts reloaded successfully");
+                    } else {
+                        tracing::info!("Configuration reloaded successfully");
+                    }
                 }
-                crate::ui::commands::CommandResponse::Error(err) => {
-                    tracing::error!("Failed to reload config: {}", err);
+                CommandResponse::Error(err) => {
+                    if reload_scripts {
+                        tracing::error!("Failed to reload scripts: {}", err);
+                    } else {
+                        tracing::error!("Failed to reload config: {}", err);
+                    }
                 }
             }
             return Ok(());
@@ -1071,72 +1096,34 @@ impl TuiApp {
 
         match self.state.settings_section {
             SettingsSection::General | SettingsSection::Downloads | SettingsSection::Scripts => {
-                let on_scripts_tab = self.state.settings_section == SettingsSection::Scripts;
                 match key {
-                    // Toggle scripts section expand/collapse (Scripts tab only)
-                    KeyCode::Char('s') if on_scripts_tab => {
-                        self.state.app_scripts_expanded = !self.state.app_scripts_expanded;
-                        if !self.state.app_scripts_expanded {
-                            self.state.script_files_index = 0;
-                        }
-                    }
-
-                    // Navigation and actions depend on whether scripts section is expanded
+                    // Navigate the rows on the active tab (fields, plus one
+                    // row per script file on the Scripts tab).
                     KeyCode::Char('j') | KeyCode::Down => {
-                        if on_scripts_tab && self.state.app_scripts_expanded {
-                            // Navigate script files (cached; refreshed on tick)
-                            let script_count = self.state.cached_script_files.len();
-
-                            if script_count > 0 {
-                                self.state.script_files_index =
-                                    (self.state.script_files_index + 1) % script_count;
-                            }
-                        } else {
-                            // Navigate the fields on the active tab
-                            let field_count =
-                                ApplicationSettingsField::in_section(self.state.settings_section)
-                                    .len();
-                            if field_count > 0 {
-                                self.state.app_settings_field_index =
-                                    (self.state.app_settings_field_index + 1) % field_count;
-                            }
+                        let row_count = self.state.app_settings_row_count();
+                        if row_count > 0 {
+                            self.state.app_settings_field_index =
+                                (self.state.app_settings_field_index + 1) % row_count;
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        if on_scripts_tab && self.state.app_scripts_expanded {
-                            // Navigate script files (cached; refreshed on tick)
-                            let script_count = self.state.cached_script_files.len();
-
-                            if script_count > 0 {
-                                self.state.script_files_index = if self.state.script_files_index == 0 {
-                                    script_count - 1
-                                } else {
-                                    self.state.script_files_index - 1
-                                };
-                            }
-                        } else {
-                            // Navigate the fields on the active tab
-                            let field_count =
-                                ApplicationSettingsField::in_section(self.state.settings_section)
-                                    .len();
-                            if field_count > 0 {
-                                self.state.app_settings_field_index = if self.state.app_settings_field_index == 0 {
-                                    field_count - 1
+                        let row_count = self.state.app_settings_row_count();
+                        if row_count > 0 {
+                            self.state.app_settings_field_index =
+                                if self.state.app_settings_field_index == 0 {
+                                    row_count - 1
                                 } else {
                                     self.state.app_settings_field_index - 1
                                 };
-                            }
                         }
                     }
 
-                    // Enter or Space
+                    // Enter or Space: toggle a script row, or edit/toggle the
+                    // selected field
                     KeyCode::Enter | KeyCode::Char(' ') => {
-                        if on_scripts_tab && self.state.app_scripts_expanded {
-                            // Toggle script file (cached; refreshed on tick)
+                        if let Some(script_index) = self.state.current_app_script_index() {
                             let script_files = self.state.cached_script_files.clone();
-
-                            if self.state.script_files_index < script_files.len() {
-                                let filename = script_files[self.state.script_files_index].clone();
+                            if let Some(filename) = script_files.get(script_index).cloned() {
                                 use crate::ui::commands::{Command, handle_command};
 
                                 let command = Command::ToggleScriptFile { filename };
@@ -1147,24 +1134,7 @@ impl TuiApp {
                                 ).await;
                             }
                         } else {
-                            // Edit selected application setting
                             self.start_app_settings_edit().await?;
-                        }
-                    }
-
-                    // Reload scripts (Scripts tab only, while expanded)
-                    KeyCode::Char('r') => {
-                        if on_scripts_tab && self.state.app_scripts_expanded {
-                            use crate::ui::commands::{Command, handle_command};
-
-                            let command = Command::ReloadScripts;
-                            handle_command(
-                                command,
-                                self.state.app_state.clone(),
-                                self.manager.clone(),
-                            ).await;
-
-                            tracing::info!("Script reload requested");
                         }
                     }
 
@@ -1233,63 +1203,50 @@ impl TuiApp {
         if matches!(key, KeyCode::Esc | KeyCode::Char('q')) {
             self.state.ui_mode = UiMode::Settings;
             self.state.input_buffer.clear();
-            self.state.folder_scripts_expanded = false;
-            self.state.script_files_index = 0;
+            return Ok(());
+        }
+
+        // Reload scripts (Shift+R)
+        if matches!(key, KeyCode::Char('R')) {
+            use crate::ui::commands::{Command, CommandResponse, handle_command};
+
+            let command = Command::ReloadScripts;
+            let response = handle_command(
+                command,
+                self.state.app_state.clone(),
+                self.manager.clone(),
+            )
+            .await;
+
+            match response {
+                CommandResponse::Success { .. } => {
+                    tracing::info!("Scripts reloaded successfully");
+                }
+                CommandResponse::Error(err) => {
+                    tracing::error!("Failed to reload scripts: {}", err);
+                }
+            }
             return Ok(());
         }
 
         match key {
-            // Toggle scripts section expand/collapse
-            KeyCode::Char('s') => {
-                self.state.folder_scripts_expanded = !self.state.folder_scripts_expanded;
-                if !self.state.folder_scripts_expanded {
-                    self.state.script_files_index = 0;
-                }
-            }
-
-            // Navigation depends on whether scripts section is expanded
+            // Navigate rows (fixed fields, plus one row per script file
+            // override at the end)
             KeyCode::Char('j') | KeyCode::Down => {
-                if self.state.folder_scripts_expanded {
-                    // Navigate script files (cached; refreshed on tick)
-                    let script_count = self.state.cached_script_files.len();
-
-                    if script_count > 0 {
-                        self.state.script_files_index =
-                            (self.state.script_files_index + 1) % script_count;
-                    }
-                } else {
-                    // Navigate fields
-                    let field_count = super::state::SettingsField::all().len();
-                    self.state.move_field_selection_down(field_count);
-                }
+                let row_count = self.state.folder_settings_row_count();
+                self.state.move_field_selection_down(row_count);
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.state.folder_scripts_expanded {
-                    // Navigate script files (cached; refreshed on tick)
-                    let script_count = self.state.cached_script_files.len();
-
-                    if script_count > 0 {
-                        self.state.script_files_index = if self.state.script_files_index == 0 {
-                            script_count - 1
-                        } else {
-                            self.state.script_files_index - 1
-                        };
-                    }
-                } else {
-                    // Navigate fields
-                    self.state.move_field_selection_up();
-                }
+                self.state.move_field_selection_up();
             }
 
-            // Enter or Space
+            // Enter or Space: toggle a script row, or edit the selected field
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if self.state.folder_scripts_expanded {
-                    // Toggle folder script file (cached; refreshed on tick)
+                if let Some(script_index) = self.state.current_folder_script_index() {
                     if let Some(ref folder_id) = self.state.selected_folder_id {
                         let script_files = self.state.cached_script_files.clone();
 
-                        if self.state.script_files_index < script_files.len() {
-                            let filename = script_files[self.state.script_files_index].clone();
+                        if let Some(filename) = script_files.get(script_index).cloned() {
                             use crate::ui::commands::{Command, handle_command};
 
                             let command = Command::ToggleFolderScriptFile {
@@ -1304,24 +1261,7 @@ impl TuiApp {
                         }
                     }
                 } else {
-                    // Edit selected field
                     self.start_field_edit().await?;
-                }
-            }
-
-            // Reload scripts
-            KeyCode::Char('r') => {
-                if self.state.folder_scripts_expanded {
-                    use crate::ui::commands::{Command, handle_command};
-
-                    let command = Command::ReloadScripts;
-                    handle_command(
-                        command,
-                        self.state.app_state.clone(),
-                        self.manager.clone(),
-                    ).await;
-
-                    tracing::info!("Script reload requested");
                 }
             }
 

@@ -185,6 +185,18 @@ impl ApplicationSettingsField {
         Self::all().into_iter().filter(|f| f.section() == section).collect()
     }
 
+    /// Number of selectable rows on `section`: its fixed fields plus, on the
+    /// Scripts tab, one row per script file (the script list is flattened
+    /// into the field list rather than shown as a collapsible sub-list).
+    pub fn row_count(section: SettingsSection, script_file_count: usize) -> usize {
+        let field_count = Self::in_section(section).len();
+        if section == SettingsSection::Scripts {
+            field_count + script_file_count
+        } else {
+            field_count
+        }
+    }
+
     /// Whether changing this field only takes effect after a restart.
     /// `MaxConcurrent` is included until the manager is updated live.
     pub fn requires_restart(&self) -> bool {
@@ -270,6 +282,13 @@ impl SettingsField {
     /// Map a 0-based display index to its field.
     pub fn from_index(index: usize) -> Option<Self> {
         Self::all().into_iter().nth(index)
+    }
+
+    /// Number of selectable rows in the folder editor: the fixed fields plus
+    /// one row per script file (folder override), flattened into the same
+    /// list rather than shown as a collapsible sub-list.
+    pub fn row_count(script_file_count: usize) -> usize {
+        Self::all().len() + script_file_count
     }
 
     /// Get translation key for label
@@ -514,15 +533,6 @@ pub struct TuiState {
     /// Rendering optimization: flag to indicate if UI needs redraw
     pub needs_redraw: bool,
 
-    /// Settings screen: script files list selection index
-    pub script_files_index: usize,
-
-    /// Application tab: scripts section expanded/collapsed
-    pub app_scripts_expanded: bool,
-
-    /// Folder Details: scripts section expanded/collapsed
-    pub folder_scripts_expanded: bool,
-
     /// Multi-selection: set of selected download IDs
     pub selected_downloads: std::collections::HashSet<uuid::Uuid>,
 
@@ -620,9 +630,6 @@ impl TuiState {
             validation_error: None,
             status_message: None,
             needs_redraw: true,  // Initial render needed
-            script_files_index: 0,
-            app_scripts_expanded: false,
-            folder_scripts_expanded: false,
             selected_downloads: std::collections::HashSet::new(),
             context_menu_index: 0,
             delete_history: Vec::new(),
@@ -901,19 +908,54 @@ impl TuiState {
         self.settings_section = SettingsSection::General;
         self.app_settings_field_index = 0;
         self.is_editing_app_setting = false;
-        self.script_files_index = 0;
-        self.app_scripts_expanded = false;
-        self.folder_scripts_expanded = false;
         self.input_buffer.clear();
     }
 
     /// The application settings field currently selected, if any (the field
     /// list depends on the active tab, so this replaces indexing
-    /// `ApplicationSettingsField::all()` directly).
+    /// `ApplicationSettingsField::all()` directly). `None` both when the
+    /// index is out of range and when it points at a flattened script row on
+    /// the Scripts tab; use `current_app_script_index` for the latter.
     pub fn current_app_field(&self) -> Option<ApplicationSettingsField> {
         ApplicationSettingsField::in_section(self.settings_section)
             .get(self.app_settings_field_index)
             .copied()
+    }
+
+    /// Number of selectable rows on the current application settings tab:
+    /// the fixed fields plus, on the Scripts tab, one row per cached script
+    /// file.
+    pub fn app_settings_row_count(&self) -> usize {
+        ApplicationSettingsField::row_count(self.settings_section, self.cached_script_files.len())
+    }
+
+    /// Index into `cached_script_files` for the currently selected row, if
+    /// `app_settings_field_index` points past the fixed fields on the
+    /// Scripts tab.
+    pub fn current_app_script_index(&self) -> Option<usize> {
+        if self.settings_section != SettingsSection::Scripts {
+            return None;
+        }
+        let field_count = ApplicationSettingsField::in_section(self.settings_section).len();
+        self.app_settings_field_index
+            .checked_sub(field_count)
+            .filter(|i| *i < self.cached_script_files.len())
+    }
+
+    /// Number of selectable rows in the folder editor: the fixed
+    /// `SettingsField`s plus one row per cached script file (folder
+    /// override).
+    pub fn folder_settings_row_count(&self) -> usize {
+        SettingsField::row_count(self.cached_script_files.len())
+    }
+
+    /// Index into `cached_script_files` for the currently selected row, if
+    /// `settings_field_index` points past the fixed `SettingsField` rows.
+    pub fn current_folder_script_index(&self) -> Option<usize> {
+        let field_count = SettingsField::all().len();
+        self.settings_field_index
+            .checked_sub(field_count)
+            .filter(|i| *i < self.cached_script_files.len())
     }
 
     /// Move field selection down in folder edit mode
@@ -1143,5 +1185,38 @@ mod settings_tests {
                 assert_ne!(all[i], all[j], "duplicate field in SettingsField::all()");
             }
         }
+    }
+
+    #[test]
+    fn app_settings_row_count_flattens_scripts_on_the_scripts_tab() {
+        let field_count = ApplicationSettingsField::in_section(SettingsSection::Scripts).len();
+        assert_eq!(
+            ApplicationSettingsField::row_count(SettingsSection::Scripts, 0),
+            field_count
+        );
+        assert_eq!(
+            ApplicationSettingsField::row_count(SettingsSection::Scripts, 5),
+            field_count + 5
+        );
+    }
+
+    #[test]
+    fn app_settings_row_count_ignores_script_files_on_other_tabs() {
+        let field_count = ApplicationSettingsField::in_section(SettingsSection::General).len();
+        assert_eq!(
+            ApplicationSettingsField::row_count(SettingsSection::General, 0),
+            field_count
+        );
+        assert_eq!(
+            ApplicationSettingsField::row_count(SettingsSection::General, 5),
+            field_count
+        );
+    }
+
+    #[test]
+    fn folder_settings_row_count_flattens_script_overrides() {
+        let field_count = SettingsField::all().len();
+        assert_eq!(SettingsField::row_count(0), field_count);
+        assert_eq!(SettingsField::row_count(4), field_count + 4);
     }
 }

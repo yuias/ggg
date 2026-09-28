@@ -76,6 +76,10 @@ settings-referrer-custom = Custom
 settings-new-folder = New Folder
 settings-no-folders = No folders configured
 
+# Script file rows (Scripts tab and folder editor)
+settings-scripts-header = Scripts ({ $count } files)
+settings-scripts-none = No script files found
+
 # Settings tabs
 settings-tab-general = General
 settings-tab-downloads = Downloads
