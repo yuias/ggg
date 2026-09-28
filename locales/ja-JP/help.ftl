@@ -1,51 +1,49 @@
 # Help screen strings - Japanese
 # Keybindings and help text
+#
+# The key column is generated from the configured keybindings
+# (KeybindingResolver::keys_for); only the action descriptions live here.
 
 help-title = Help - Keybindings
 
-help-section-primary = Primary Actions:
-help-key-space = s          - Start/Pause 切り替え（フォルダペインでは全アイテム開始）
-help-key-enter = Enter      - Toggle Details Panel
-help-key-a = a          - Add New Download
-help-key-d = d          - Delete Download
-help-key-ctrl-z = Ctrl+Z     - Undo Delete
-help-key-m = m          - Open Context Menu
-help-key-e = e          - Edit (Change Folder)
-help-key-r = r          - Retry Failed Download
-help-key-shift-s = S          - Resume All
-help-key-shift-p = P          - Pause All
+help-section-main = メイン:
+help-section-settings = 設定:
+help-section-menus-dialogs = メニュー・ダイアログ:
+help-section-system = システム:
 
-help-section-multi = Multi-Select:
-help-key-v = Space      - Toggle Selection
-help-key-v-shift = V          - Select All Visible
-help-key-esc-clear = Esc        - Clear All Selections
-help-key-multi-action = s/d        - Apply to All Selected
+help-action-move-up = 上に移動
+help-action-move-down = 下に移動
+help-action-move-to-top = 先頭にジャンプ
+help-action-move-to-bottom = 末尾にジャンプ
+help-action-page-up = ページアップ
+help-action-page-down = ページダウン
+help-action-focus-next-pane = 次のペイン / 設定タブ
+help-action-focus-prev-pane = 前のペイン / 設定タブ
+help-action-focus-left = 左のペインへ移動
+help-action-focus-right = 右のペインへ移動
+help-action-select-item = 選択 / 開く
+help-action-toggle-selection = 現在の項目の選択を切り替え
+help-action-select-all = 表示中の項目をすべて選択
+help-action-deselect-all = 選択 / 検索をクリア
+help-action-add-download = 新規ダウンロードを追加
+help-action-delete-download = ダウンロードを削除
+help-action-toggle-download = ダウンロードの開始/一時停止（フォルダでは全アイテム開始）
+help-action-retry-download = 失敗したダウンロードを再試行
+help-action-resume-all = すべての一時停止中のダウンロードを再開
+help-action-pause-all = すべてのアクティブなダウンロードを一時停止
+help-action-open-context-menu = コンテキストメニューを開く
+help-action-edit-item = 保存先を変更
+help-action-toggle-details = 詳細パネルの表示切り替え
+help-action-cycle-details-position = 詳細パネルの位置を切り替え
+help-action-open-search = 検索を開始
+help-action-open-help = このヘルプを表示
+help-action-open-settings = 設定を開く
+help-action-switch-folder = フォルダを切り替え
+help-action-reload-config = 設定をディスクから再読み込み（スクリプトタブではスクリプト）
+help-action-back = 閉じる / 戻る
+help-action-confirm-yes = 確定
+help-action-confirm-no = キャンセル
+help-action-quit = 終了
+help-action-undo = 直前の削除を取り消し
 
-help-section-navigation = Navigation:
-help-key-jk = j/k, ↓/↑   - Move Down/Up
-help-key-g = g, Home    - Jump to Top
-help-key-g-shift = G, End     - Jump to Bottom
-help-key-ctrl-d = Ctrl+d     - Page Down
-help-key-ctrl-u = Ctrl+u     - Page Up
-
-help-section-panes = Panes:
-help-key-prev-pane = Shift+Tab  - Previous Pane
-help-key-next-pane = Tab        - Next Pane
-
-help-section-search = Search/Filter:
-help-key-slash = /          - Start Search
-help-key-esc-search = Esc        - Clear/Cancel Search
-
-help-section-ui = UI:
-help-key-question = ?          - Help Screen
-help-key-x = x          - Settings
-help-key-i = i          - Toggle Details Panel
-help-key-r-shift = R          - Reload
-
-help-section-settings = Settings:
-help-key-reload-config = Shift+R    - Reload Config from Disk
-
-help-section-system = System:
-help-key-quit = q, Ctrl+c  - Quit
-
-help-footer = Press Esc or q to close
+help-footer = { $keys } で閉じる

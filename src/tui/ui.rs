@@ -4,6 +4,7 @@ use super::format::{
 };
 use super::state::{DeleteTarget, DetailsPosition, FocusPane, FolderTreeItem, UiMode};
 use super::theme;
+use crate::app::keybindings::KeyAction;
 use crate::download::task::{DownloadStatus, LogLevel};
 use crate::download::http_errors::HttpErrorInfo;
 use fluent::fluent_args;
@@ -741,9 +742,67 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
+/// Actions shown on the help screen, grouped by where they normally apply.
+/// `Refresh` stays out of the list since it is a no-op in Normal mode.
+fn help_sections() -> [(&'static str, Vec<KeyAction>); 4] {
+    use KeyAction::*;
+    [
+        (
+            "help-section-main",
+            vec![
+                MoveUp, MoveDown, MoveToTop, MoveToBottom, PageUp, PageDown,
+                FocusNextPane, FocusPrevPane, FocusLeft, FocusRight,
+                SelectItem, ToggleSelection, SelectAll, DeselectAll,
+                AddDownload, DeleteDownload, ToggleDownload, RetryDownload,
+                ResumeAll, PauseAll, OpenContextMenu, EditItem,
+                ToggleDetails, CycleDetailsPosition, OpenSearch, OpenHelp,
+                OpenSettings, SwitchFolder,
+            ],
+        ),
+        ("help-section-settings", vec![ReloadConfig]),
+        ("help-section-menus-dialogs", vec![Back, ConfirmYes, ConfirmNo]),
+        ("help-section-system", vec![Quit, Undo]),
+    ]
+}
+
+/// Fluent message id for an action's help-screen description, e.g.
+/// `MoveToTop` -> `help-action-move-to-top`.
+fn help_action_message_id(action: KeyAction) -> String {
+    format!("help-action-{}", to_kebab_case(&format!("{:?}", action)))
+}
+
+/// `CamelCase` to `kebab-case`.
+fn to_kebab_case(name: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i != 0 {
+                out.push('-');
+            }
+            out.extend(ch.to_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Short, human-friendly form of a configured key string, for on-screen
+/// display only (help screen, status-bar and dialog hints). The resolver's
+/// own key strings stay unabbreviated since they double as the parseable
+/// config format; do not use this for parsing.
+pub(crate) fn format_key_for_display(key: &str) -> String {
+    match key {
+        "Escape" => "Esc".to_string(),
+        "BackTab" => "Shift+Tab".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Render help screen overlay as centered popup
 fn render_help(app: &TuiApp, f: &mut Frame, area: Rect) {
     let t = |key: &str| app.state.t(key);
+    let resolver = &app.state.keybinding_resolver;
 
     // Define popup dimensions
     let dialog_width = 80;
@@ -765,52 +824,26 @@ fn render_help(app: &TuiApp, f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(t("help-section-primary"), Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(format!("  {}", t("help-key-space"))),
-        Line::from(format!("  {}", t("help-key-enter"))),
-        Line::from(format!("  {}", t("help-key-a"))),
-        Line::from(format!("  {}", t("help-key-d"))),
-        Line::from(format!("  {}", t("help-key-ctrl-z"))),
-        Line::from(format!("  {}", t("help-key-m"))),
-        Line::from(format!("  {}", t("help-key-e"))),
-        Line::from(format!("  {}", t("help-key-r"))),
-        Line::from(format!("  {}", t("help-key-shift-s"))),
-        Line::from(format!("  {}", t("help-key-shift-p"))),
-        Line::from(""),
-        Line::from(Span::styled(t("help-section-multi"), Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(format!("  {}", t("help-key-v"))),
-        Line::from(format!("  {}", t("help-key-v-shift"))),
-        Line::from(format!("  {}", t("help-key-esc-clear"))),
-        Line::from(format!("  {}", t("help-key-multi-action"))),
-        Line::from(""),
-        Line::from(Span::styled(t("help-section-navigation"), Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(format!("  {}", t("help-key-jk"))),
-        Line::from(format!("  {}", t("help-key-g"))),
-        Line::from(format!("  {}", t("help-key-g-shift"))),
-        Line::from(format!("  {}", t("help-key-ctrl-d"))),
-        Line::from(format!("  {}", t("help-key-ctrl-u"))),
-        Line::from(""),
-        Line::from(Span::styled(t("help-section-panes"), Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(format!("  {}", t("help-key-prev-pane"))),
-        Line::from(format!("  {}", t("help-key-next-pane"))),
-        Line::from(""),
-        Line::from(Span::styled(t("help-section-search"), Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(format!("  {}", t("help-key-slash"))),
-        Line::from(format!("  {}", t("help-key-esc-search"))),
-        Line::from(""),
-        Line::from(Span::styled(t("help-section-ui"), Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(format!("  {}", t("help-key-question"))),
-        Line::from(format!("  {}", t("help-key-x"))),
-        Line::from(format!("  {}", t("help-key-i"))),
-        Line::from(format!("  {}", t("help-key-r-shift"))),
-        Line::from(""),
-        Line::from(Span::styled(t("help-section-settings"), Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(format!("  {}", t("help-key-reload-config"))),
-        Line::from(""),
-        Line::from(Span::styled(t("help-section-system"), Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(format!("  {}", t("help-key-quit"))),
-        Line::from(""),
     ];
+
+    for (section_key, actions) in help_sections() {
+        help_text.push(Line::from(Span::styled(
+            t(section_key),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for action in actions {
+            let keys = resolver
+                .keys_for(action)
+                .iter()
+                .map(|k| format_key_for_display(k))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let keys = if keys.is_empty() { "-".to_string() } else { keys };
+            let description = t(&help_action_message_id(action));
+            help_text.push(Line::from(format!("  {:<14} {}", keys, description)));
+        }
+        help_text.push(Line::from(""));
+    }
 
     // Show IPC pipe name on Windows
     #[cfg(windows)]
@@ -823,8 +856,17 @@ fn render_help(app: &TuiApp, f: &mut Frame, area: Rect) {
         help_text.push(Line::from(""));
     }
 
+    // Help closes on Back (Esc/q) or a second OpenHelp (?) press; generate the
+    // footer from the resolver so a remap of either is reflected here too.
+    let close_keys = [KeyAction::Back, KeyAction::OpenHelp]
+        .iter()
+        .flat_map(|action| resolver.keys_for(*action))
+        .map(|k| format_key_for_display(k))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let footer_args = fluent_args! { "keys" => close_keys };
     help_text.push(Line::from(Span::styled(
-        t("help-footer"),
+        app.state.t_with_args("help-footer", Some(&footer_args)),
         Style::default().fg(Color::Green),
     )));
 
@@ -2429,5 +2471,91 @@ fn render_folder_context_menu(app: &TuiApp, f: &mut Frame, area: Rect) {
         let mut regions = app.state.click_regions.borrow_mut();
         regions.context_menu = Some(menu_area);
         regions.context_menu_items = menu_item_rects;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluent::FluentResource;
+    use fluent_bundle::concurrent::FluentBundle;
+    use std::sync::Arc;
+
+    fn load_bundle(path: &str) -> FluentBundle<Arc<FluentResource>> {
+        let content = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+        let resource = FluentResource::try_new(content)
+            .unwrap_or_else(|(_, errors)| panic!("failed to parse {path}: {errors:?}"));
+        let lang_id: unic_langid::LanguageIdentifier = "en-US".parse().unwrap();
+        let mut bundle = FluentBundle::new_concurrent(vec![lang_id]);
+        bundle
+            .add_resource(Arc::new(resource))
+            .unwrap_or_else(|errors| panic!("failed to add resource {path}: {errors:?}"));
+        bundle
+    }
+
+    /// Every action shown on the help screen must have a description in both
+    /// locales, and every non-`Refresh` action must appear in exactly one
+    /// help section (a new `KeyAction` variant added elsewhere would
+    /// otherwise silently vanish from the help screen).
+    #[test]
+    fn help_covers_every_action_in_both_locales() {
+        let en = load_bundle(concat!(env!("CARGO_MANIFEST_DIR"), "/locales/en-US/help.ftl"));
+        let ja = load_bundle(concat!(env!("CARGO_MANIFEST_DIR"), "/locales/ja-JP/help.ftl"));
+
+        let mut shown: Vec<KeyAction> = Vec::new();
+        for (section_key, actions) in help_sections() {
+            assert!(en.get_message(section_key).is_some(), "missing en-US {section_key}");
+            assert!(ja.get_message(section_key).is_some(), "missing ja-JP {section_key}");
+            shown.extend(actions);
+        }
+
+        for action in KeyAction::all() {
+            if action == KeyAction::Refresh {
+                assert!(
+                    !shown.contains(&action),
+                    "Refresh is a no-op and must stay out of the help screen"
+                );
+                continue;
+            }
+            assert_eq!(
+                shown.iter().filter(|a| **a == action).count(),
+                1,
+                "{action:?} must appear in exactly one help section"
+            );
+            let id = help_action_message_id(action);
+            assert!(en.get_message(&id).is_some(), "missing en-US {id} for {action:?}");
+            assert!(ja.get_message(&id).is_some(), "missing ja-JP {id} for {action:?}");
+        }
+    }
+
+    #[test]
+    fn help_footer_and_title_present_in_both_locales() {
+        let en = load_bundle(concat!(env!("CARGO_MANIFEST_DIR"), "/locales/en-US/help.ftl"));
+        let ja = load_bundle(concat!(env!("CARGO_MANIFEST_DIR"), "/locales/ja-JP/help.ftl"));
+        for id in ["help-title", "help-footer"] {
+            assert!(en.get_message(id).is_some(), "missing en-US {id}");
+            assert!(ja.get_message(id).is_some(), "missing ja-JP {id}");
+        }
+    }
+
+    #[test]
+    fn format_key_for_display_shortens_known_names() {
+        assert_eq!(format_key_for_display("Escape"), "Esc");
+        assert_eq!(format_key_for_display("BackTab"), "Shift+Tab");
+        assert_eq!(format_key_for_display("j"), "j");
+        assert_eq!(format_key_for_display("Ctrl+u"), "Ctrl+u");
+    }
+
+    #[test]
+    fn kebab_case_matches_action_ids() {
+        assert_eq!(
+            help_action_message_id(KeyAction::MoveToTop),
+            "help-action-move-to-top"
+        );
+        assert_eq!(
+            help_action_message_id(KeyAction::ConfirmYes),
+            "help-action-confirm-yes"
+        );
     }
 }

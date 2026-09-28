@@ -1,51 +1,49 @@
 # Help screen strings - English
 # Keybindings and help text
+#
+# The key column is generated from the configured keybindings
+# (KeybindingResolver::keys_for); only the action descriptions live here.
 
 help-title = Help - Keybindings
 
-help-section-primary = Primary Actions:
-help-key-space = s          - Toggle download (start/pause); on folder pane, start all in folder
-help-key-enter = Enter      - Toggle details panel
-help-key-a = a          - Add new download
-help-key-d = d          - Delete download
-help-key-ctrl-z = Ctrl+Z     - Undo last delete
-help-key-m = m          - Open context menu (actions)
-help-key-e = e          - Edit (change folder)
-help-key-r = r          - Retry failed download
-help-key-shift-s = S          - Resume all paused downloads
-help-key-shift-p = P          - Pause all active downloads
-
-help-section-multi = Multi-Selection:
-help-key-v = Space      - Toggle selection for current item
-help-key-v-shift = V          - Select all visible items
-help-key-esc-clear = Esc        - Clear all selections
-help-key-multi-action = s/d        - Apply action to all selected items
-
-help-section-navigation = Navigation:
-help-key-jk = j/k, ↓/↑   - Move down/up
-help-key-g = g, Home    - Jump to top
-help-key-g-shift = G, End     - Jump to bottom
-help-key-ctrl-d = Ctrl+d     - Page down
-help-key-ctrl-u = Ctrl+u     - Page up
-
-help-section-panes = Pane Switching:
-help-key-prev-pane = Shift+Tab  - Previous pane
-help-key-next-pane = Tab        - Next pane
-
-help-section-search = Search/Filter:
-help-key-slash = /          - Start search
-help-key-esc-search = Esc        - Clear search/cancel
-
-help-section-ui = UI:
-help-key-question = ?          - Help screen
-help-key-x = x          - Settings
-help-key-i = i          - Toggle details panel
-help-key-r-shift = R          - Refresh
-
+help-section-main = Main:
 help-section-settings = Settings:
-help-key-reload-config = Shift+R    - Reload config from disk
-
+help-section-menus-dialogs = Menus & Dialogs:
 help-section-system = System:
-help-key-quit = q, Ctrl+c  - Quit
 
-help-footer = Press Esc or q to close
+help-action-move-up = Move up
+help-action-move-down = Move down
+help-action-move-to-top = Jump to top
+help-action-move-to-bottom = Jump to bottom
+help-action-page-up = Page up
+help-action-page-down = Page down
+help-action-focus-next-pane = Next pane / settings tab
+help-action-focus-prev-pane = Previous pane / settings tab
+help-action-focus-left = Focus left
+help-action-focus-right = Focus right
+help-action-select-item = Select / open item
+help-action-toggle-selection = Toggle selection for current item
+help-action-select-all = Select all visible items
+help-action-deselect-all = Clear selection / search
+help-action-add-download = Add new download
+help-action-delete-download = Delete download
+help-action-toggle-download = Toggle download (start/pause); start all in folder
+help-action-retry-download = Retry failed download
+help-action-resume-all = Resume all paused downloads
+help-action-pause-all = Pause all active downloads
+help-action-open-context-menu = Open context menu (actions)
+help-action-edit-item = Change save path
+help-action-toggle-details = Toggle details panel
+help-action-cycle-details-position = Cycle details panel position
+help-action-open-search = Start search
+help-action-open-help = Show this help
+help-action-open-settings = Open settings
+help-action-switch-folder = Switch folder
+help-action-reload-config = Reload config from disk (scripts on the Scripts tab)
+help-action-back = Close / go back
+help-action-confirm-yes = Confirm
+help-action-confirm-no = Cancel
+help-action-quit = Quit
+help-action-undo = Undo last delete
+
+help-footer = Press { $keys } to close
