@@ -1,6 +1,6 @@
 use super::events::TuiEvent;
 use super::state::{DeleteTarget, DetailsPosition, FocusPane, TuiState, UiMode};
-use crate::app::keybindings::KeyAction;
+use crate::app::keybindings::{KeyAction, KeyContext};
 use crate::app::state::AppState;
 use crate::download::enqueue::{enqueue, EnqueueOutcome};
 use crate::download::manager::DownloadManager;
@@ -147,7 +147,7 @@ impl TuiApp {
                     UiMode::DownloadPreview => self.handle_download_preview_mode(code).await?,
                     UiMode::Search => self.handle_search_mode(code).await?,
                     UiMode::Help => self.handle_help_mode(code),
-                    UiMode::Settings => self.handle_settings_mode(code).await?,
+                    UiMode::Settings => self.handle_settings_mode(code, modifiers).await?,
                     UiMode::FolderEdit => self.handle_folder_edit_mode(code, modifiers).await?,
                     UiMode::ChangeFolder => self.handle_change_folder_for_item_mode(code).await?,
                     UiMode::ChangeSavePath => self.handle_change_save_path_mode(code, modifiers).await?,
@@ -1078,18 +1078,20 @@ impl TuiApp {
     }
 
     /// Handle settings mode
-    async fn handle_settings_mode(&mut self, key: KeyCode) -> Result<()> {
+    async fn handle_settings_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
         use super::state::SettingsSection;
 
+        let action = self.state.keybinding_resolver.resolve_in(KeyContext::Settings, key, mods);
+
         // Close settings screen
-        if matches!(key, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x')) {
+        if matches!(action, Some(KeyAction::Back) | Some(KeyAction::OpenSettings)) {
             self.state.reset_settings_state();
             self.state.ui_mode = UiMode::Normal;
             return Ok(());
         }
 
-        // Reload (Shift+R): scripts on the Scripts tab, config everywhere else
-        if matches!(key, KeyCode::Char('R')) {
+        // Reload: scripts on the Scripts tab, config everywhere else
+        if matches!(action, Some(KeyAction::ReloadConfig)) {
             use crate::ui::commands::{Command, CommandResponse, handle_command};
 
             let reload_scripts = self.state.settings_section == SettingsSection::Scripts;
@@ -1134,11 +1136,11 @@ impl TuiApp {
         }
 
         // Switch tabs
-        if matches!(key, KeyCode::Tab) {
+        if matches!(action, Some(KeyAction::FocusNextPane)) {
             self.state.settings_section = self.state.settings_section.next();
             self.state.app_settings_field_index = 0;
             return Ok(());
-        } else if matches!(key, KeyCode::BackTab) {
+        } else if matches!(action, Some(KeyAction::FocusPrevPane)) {
             self.state.settings_section = self.state.settings_section.prev();
             self.state.app_settings_field_index = 0;
             return Ok(());
@@ -1146,31 +1148,18 @@ impl TuiApp {
 
         match self.state.settings_section {
             SettingsSection::General | SettingsSection::Downloads | SettingsSection::Scripts => {
-                match key {
+                match action {
                     // Navigate the rows on the active tab (fields, plus one
                     // row per script file on the Scripts tab).
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        let row_count = self.state.app_settings_row_count();
-                        if row_count > 0 {
-                            self.state.app_settings_field_index =
-                                (self.state.app_settings_field_index + 1) % row_count;
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        let row_count = self.state.app_settings_row_count();
-                        if row_count > 0 {
-                            self.state.app_settings_field_index =
-                                if self.state.app_settings_field_index == 0 {
-                                    row_count - 1
-                                } else {
-                                    self.state.app_settings_field_index - 1
-                                };
-                        }
-                    }
+                    Some(KeyAction::MoveDown) => self.state.move_app_settings_down(),
+                    Some(KeyAction::MoveUp) => self.state.move_app_settings_up(),
+                    Some(KeyAction::MoveToTop) => self.state.move_app_settings_to_top(),
+                    Some(KeyAction::MoveToBottom) => self.state.move_app_settings_to_bottom(),
+                    Some(KeyAction::PageUp) => self.state.app_settings_page_up(),
+                    Some(KeyAction::PageDown) => self.state.app_settings_page_down(),
 
-                    // Enter or Space: toggle a script row, or edit/toggle the
-                    // selected field
-                    KeyCode::Enter | KeyCode::Char(' ') => {
+                    // Toggle a script row, or edit/toggle the selected field
+                    Some(KeyAction::SelectItem) | Some(KeyAction::ToggleSelection) => {
                         if let Some(script_index) = self.state.current_app_script_index() {
                             let script_files = self.state.cached_script_files.clone();
                             if let Some(filename) = script_files.get(script_index).cloned() {
@@ -1188,6 +1177,13 @@ impl TuiApp {
                         }
                     }
 
+                    // Safety net: an unbound Esc (e.g. a config that rebinds
+                    // Back away from it) must not trap the user here.
+                    None if matches!(key, KeyCode::Esc) => {
+                        self.state.reset_settings_state();
+                        self.state.ui_mode = UiMode::Normal;
+                    }
+
                     _ => {}
                 }
             }
@@ -1199,17 +1195,45 @@ impl TuiApp {
                 let folder_count = folder_entries.len();
                 drop(config);
 
-                match key {
+                match action {
                     // Navigate folder list
-                    KeyCode::Char('j') | KeyCode::Down => {
+                    Some(KeyAction::MoveDown) => {
                         self.state.move_folder_selection_down(folder_count);
                         if folder_count > 0 {
                             self.state.selected_folder_id =
                                 Some(folder_entries[self.state.settings_folder_index].0.clone());
                         }
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
+                    Some(KeyAction::MoveUp) => {
                         self.state.move_folder_selection_up();
+                        if folder_count > 0 {
+                            self.state.selected_folder_id =
+                                Some(folder_entries[self.state.settings_folder_index].0.clone());
+                        }
+                    }
+                    Some(KeyAction::MoveToTop) => {
+                        self.state.move_folder_selection_to_top();
+                        if folder_count > 0 {
+                            self.state.selected_folder_id =
+                                Some(folder_entries[self.state.settings_folder_index].0.clone());
+                        }
+                    }
+                    Some(KeyAction::MoveToBottom) => {
+                        self.state.move_folder_selection_to_bottom(folder_count);
+                        if folder_count > 0 {
+                            self.state.selected_folder_id =
+                                Some(folder_entries[self.state.settings_folder_index].0.clone());
+                        }
+                    }
+                    Some(KeyAction::PageUp) => {
+                        self.state.folder_selection_page_up();
+                        if folder_count > 0 {
+                            self.state.selected_folder_id =
+                                Some(folder_entries[self.state.settings_folder_index].0.clone());
+                        }
+                    }
+                    Some(KeyAction::PageDown) => {
+                        self.state.folder_selection_page_down(folder_count);
                         if folder_count > 0 {
                             self.state.selected_folder_id =
                                 Some(folder_entries[self.state.settings_folder_index].0.clone());
@@ -1217,13 +1241,13 @@ impl TuiApp {
                     }
 
                     // Create new folder
-                    KeyCode::Char('n') => {
+                    Some(KeyAction::AddDownload) => {
                         self.create_new_folder().await?;
                     }
 
                     // Ask for confirmation before deleting a folder (the default
                     // folder is refused here so it never reaches the dialog).
-                    KeyCode::Char('d') => {
+                    Some(KeyAction::DeleteDownload) => {
                         if let Some(ref folder_id) = self.state.selected_folder_id {
                             let is_default = {
                                 let config = self.state.app_state.config.read().await;
@@ -1237,10 +1261,23 @@ impl TuiApp {
                     }
 
                     // Enter folder edit mode
-                    KeyCode::Enter => {
-                        if self.state.selected_folder_id.is_some() {
-                            self.state.settings_field_index = 0;
-                            self.state.ui_mode = UiMode::FolderEdit;
+                    Some(KeyAction::SelectItem) | Some(KeyAction::FocusRight)
+                        if self.state.selected_folder_id.is_some() =>
+                    {
+                        self.state.settings_field_index = 0;
+                        self.state.ui_mode = UiMode::FolderEdit;
+                    }
+
+                    None => {
+                        if matches!(key, KeyCode::Esc) {
+                            // Safety net: a bad remap must not trap the user here.
+                            self.state.reset_settings_state();
+                            self.state.ui_mode = UiMode::Normal;
+                        } else if matches!(key, KeyCode::Char('n')) {
+                            // Hard-coded alias for "new folder" on this tab only;
+                            // a remap that claims 'n' for another action (matched
+                            // above) takes priority over this fallback.
+                            self.create_new_folder().await?;
                         }
                     }
 
@@ -1254,20 +1291,25 @@ impl TuiApp {
 
     /// Handle folder edit mode
     async fn handle_folder_edit_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
-        // If currently editing a field, handle text input
+        // If currently editing a field, handle text input before the resolver
+        // ever sees the key (otherwise typing e.g. 'j' into the Name field
+        // would move the row selection instead of entering the letter).
         if self.state.settings_edit_field.is_some() {
             return self.handle_field_text_input(key, mods).await;
         }
 
-        // Return to settings mode
-        if matches!(key, KeyCode::Esc | KeyCode::Char('q')) {
+        let action = self.state.keybinding_resolver.resolve_in(KeyContext::Settings, key, mods);
+
+        // Return to settings mode: Back, or FocusLeft leaving the editor for
+        // the folder list (the Folders tab's list/editor pair).
+        if matches!(action, Some(KeyAction::Back) | Some(KeyAction::FocusLeft)) {
             self.state.ui_mode = UiMode::Settings;
             self.state.input_buffer.clear();
             return Ok(());
         }
 
-        // Reload scripts (Shift+R)
-        if matches!(key, KeyCode::Char('R')) {
+        // Reload scripts
+        if matches!(action, Some(KeyAction::ReloadConfig)) {
             use crate::ui::commands::{Command, CommandResponse, handle_command};
 
             let command = Command::ReloadScripts;
@@ -1289,19 +1331,27 @@ impl TuiApp {
             return Ok(());
         }
 
-        match key {
+        match action {
             // Navigate rows (fixed fields, plus one row per script file
             // override at the end)
-            KeyCode::Char('j') | KeyCode::Down => {
+            Some(KeyAction::MoveDown) => {
                 let row_count = self.state.folder_settings_row_count();
                 self.state.move_field_selection_down(row_count);
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.state.move_field_selection_up();
+            Some(KeyAction::MoveUp) => self.state.move_field_selection_up(),
+            Some(KeyAction::MoveToTop) => self.state.move_field_selection_to_top(),
+            Some(KeyAction::MoveToBottom) => {
+                let row_count = self.state.folder_settings_row_count();
+                self.state.move_field_selection_to_bottom(row_count);
+            }
+            Some(KeyAction::PageUp) => self.state.field_selection_page_up(),
+            Some(KeyAction::PageDown) => {
+                let row_count = self.state.folder_settings_row_count();
+                self.state.field_selection_page_down(row_count);
             }
 
-            // Enter or Space: toggle a script row, or edit the selected field
-            KeyCode::Enter | KeyCode::Char(' ') => {
+            // Toggle a script row, or edit the selected field
+            Some(KeyAction::SelectItem) | Some(KeyAction::ToggleSelection) => {
                 if let Some(script_index) = self.state.current_folder_script_index() {
                     if let Some(ref folder_id) = self.state.selected_folder_id {
                         let script_files = self.state.cached_script_files.clone();
@@ -1323,6 +1373,12 @@ impl TuiApp {
                 } else {
                     self.start_field_edit().await?;
                 }
+            }
+
+            // Safety net: an unbound Esc must not trap the user here.
+            None if matches!(key, KeyCode::Esc) => {
+                self.state.ui_mode = UiMode::Settings;
+                self.state.input_buffer.clear();
             }
 
             _ => {}

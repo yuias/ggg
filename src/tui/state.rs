@@ -606,14 +606,16 @@ fn load_translations(language: &str) -> Arc<LocalizationManager> {
 }
 
 /// Row count moved per PageUp/PageDown, kept equal to the download list's page size.
+/// Shared by the folder tree and every other row-indexed list (settings rows,
+/// the Folders list, the folder editor fields) so paging feels consistent.
 const TREE_PAGE_SIZE: usize = 10;
 
-/// Index after jumping to the top of a `count`-row tree.
+/// Index after jumping to the top of a `count`-row list.
 fn tree_top_index(_count: usize) -> usize {
     0
 }
 
-/// Index after jumping to the bottom of a `count`-row tree.
+/// Index after jumping to the bottom of a `count`-row list.
 fn tree_bottom_index(count: usize) -> usize {
     count.saturating_sub(1)
 }
@@ -985,6 +987,27 @@ impl TuiState {
         }
     }
 
+    /// Move folder selection to the first row.
+    pub fn move_folder_selection_to_top(&mut self) {
+        self.settings_folder_index = tree_top_index(0);
+    }
+
+    /// Move folder selection to the last row.
+    pub fn move_folder_selection_to_bottom(&mut self, folder_count: usize) {
+        self.settings_folder_index = tree_bottom_index(folder_count);
+    }
+
+    /// Page the folder selection up.
+    pub fn folder_selection_page_up(&mut self) {
+        self.settings_folder_index = tree_page_up_index(self.settings_folder_index, TREE_PAGE_SIZE);
+    }
+
+    /// Page the folder selection down, clamped to `folder_count` rows.
+    pub fn folder_selection_page_down(&mut self, folder_count: usize) {
+        self.settings_folder_index =
+            tree_page_down_index(self.settings_folder_index, folder_count, TREE_PAGE_SIZE);
+    }
+
     /// Reset settings screen state
     pub fn reset_settings_state(&mut self) {
         self.selected_folder_id = None;
@@ -1013,6 +1036,51 @@ impl TuiState {
     /// file.
     pub fn app_settings_row_count(&self) -> usize {
         ApplicationSettingsField::row_count(self.settings_section, self.cached_script_files.len())
+    }
+
+    /// Move the application settings row selection down, wrapping at the end.
+    pub fn move_app_settings_down(&mut self) {
+        let row_count = self.app_settings_row_count();
+        if row_count > 0 {
+            self.app_settings_field_index = (self.app_settings_field_index + 1) % row_count;
+        }
+    }
+
+    /// Move the application settings row selection up, wrapping at the start.
+    pub fn move_app_settings_up(&mut self) {
+        let row_count = self.app_settings_row_count();
+        if row_count > 0 {
+            self.app_settings_field_index = if self.app_settings_field_index == 0 {
+                row_count - 1
+            } else {
+                self.app_settings_field_index - 1
+            };
+        }
+    }
+
+    /// Move the application settings row selection to the first row.
+    pub fn move_app_settings_to_top(&mut self) {
+        self.app_settings_field_index = tree_top_index(0);
+    }
+
+    /// Move the application settings row selection to the last row.
+    pub fn move_app_settings_to_bottom(&mut self) {
+        self.app_settings_field_index = tree_bottom_index(self.app_settings_row_count());
+    }
+
+    /// Page the application settings row selection up.
+    pub fn app_settings_page_up(&mut self) {
+        self.app_settings_field_index =
+            tree_page_up_index(self.app_settings_field_index, TREE_PAGE_SIZE);
+    }
+
+    /// Page the application settings row selection down.
+    pub fn app_settings_page_down(&mut self) {
+        self.app_settings_field_index = tree_page_down_index(
+            self.app_settings_field_index,
+            self.app_settings_row_count(),
+            TREE_PAGE_SIZE,
+        );
     }
 
     /// Index into `cached_script_files` for the currently selected row, if
@@ -1056,6 +1124,27 @@ impl TuiState {
         if self.settings_field_index > 0 {
             self.settings_field_index -= 1;
         }
+    }
+
+    /// Move field selection to the first row in folder edit mode.
+    pub fn move_field_selection_to_top(&mut self) {
+        self.settings_field_index = tree_top_index(0);
+    }
+
+    /// Move field selection to the last row in folder edit mode.
+    pub fn move_field_selection_to_bottom(&mut self, field_count: usize) {
+        self.settings_field_index = tree_bottom_index(field_count);
+    }
+
+    /// Page field selection up in folder edit mode.
+    pub fn field_selection_page_up(&mut self) {
+        self.settings_field_index = tree_page_up_index(self.settings_field_index, TREE_PAGE_SIZE);
+    }
+
+    /// Page field selection down in folder edit mode, clamped to `field_count` rows.
+    pub fn field_selection_page_down(&mut self, field_count: usize) {
+        self.settings_field_index =
+            tree_page_down_index(self.settings_field_index, field_count, TREE_PAGE_SIZE);
     }
 
     /// Toggle selection for current download
