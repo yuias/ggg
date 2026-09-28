@@ -1206,11 +1206,6 @@ impl TuiApp {
                         self.delete_selected_folder().await?;
                     }
 
-                    // Rename selected folder
-                    KeyCode::Char('r') => {
-                        self.start_rename_folder().await;
-                    }
-
                     // Enter folder edit mode
                     KeyCode::Enter => {
                         if self.state.selected_folder_id.is_some() {
@@ -1229,11 +1224,6 @@ impl TuiApp {
 
     /// Handle folder edit mode
     async fn handle_folder_edit_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
-        // If renaming a folder, handle text input for rename
-        if self.state.renaming_folder_id.is_some() {
-            return self.handle_rename_text_input(key, mods).await;
-        }
-
         // If currently editing a field, handle text input
         if self.state.settings_edit_field.is_some() {
             return self.handle_field_text_input(key, mods).await;
@@ -1389,6 +1379,34 @@ impl TuiApp {
         };
 
         match field {
+            SettingsField::FolderName => {
+                let value = self.state.input_buffer.clone();
+                let command = Command::UpdateFolderName { folder_id: folder_id.clone(), value };
+                let response =
+                    handle_command(command, self.state.app_state.clone(), self.manager.clone()).await;
+                match response {
+                    CommandResponse::Success { .. } => {
+                        self.state.validation_error = None;
+                        tracing::info!("Updated name for folder '{}'", folder_id);
+                        // The folder list is sorted by display name, so a rename can
+                        // move this folder to a different row; resync the selected
+                        // index or the editor would show a different folder's fields.
+                        let config = self.state.app_state.config.read().await;
+                        if let Some(pos) = config
+                            .sorted_folder_entries()
+                            .iter()
+                            .position(|(id, _)| id == &folder_id)
+                        {
+                            self.state.settings_folder_index = pos;
+                        }
+                    }
+                    CommandResponse::Error(err) => {
+                        tracing::error!("Failed to update folder name: {}", err);
+                        self.state.validation_error =
+                            Some(crate::tui::localize_command_error(&self.state, &err));
+                    }
+                }
+            }
             SettingsField::FolderSavePath => {
                 let value = PathBuf::from(&self.state.input_buffer);
                 let command = Command::UpdateFolderSavePath { folder_id: folder_id.clone(), value };
@@ -1501,7 +1519,8 @@ impl TuiApp {
                 self.cycle_scripts_enabled().await?;
                 self.state.settings_edit_field = None;
             }
-            SettingsField::FolderSavePath
+            SettingsField::FolderName
+            | SettingsField::FolderSavePath
             | SettingsField::FolderMaxConcurrent
             | SettingsField::FolderUserAgent => {
                 // Text/number input - populate input buffer with current value
@@ -1760,6 +1779,7 @@ impl TuiApp {
             let config = self.state.app_state.config.read().await;
             if let Some(folder) = config.folders.get(folder_id) {
                 self.state.input_buffer = match field {
+                    SettingsField::FolderName => folder.name.clone(),
                     SettingsField::FolderSavePath => {
                         folder.save_path.to_string_lossy().to_string()
                     }
@@ -2415,98 +2435,6 @@ impl TuiApp {
             }
         }
 
-        Ok(())
-    }
-
-    /// Handle text input during folder rename (within FolderEdit mode)
-    async fn handle_rename_text_input(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
-        // Handle Ctrl+u to clear buffer
-        if matches!(key, KeyCode::Char('u')) && mods.contains(KeyModifiers::CONTROL) {
-            self.state.input_buffer.clear();
-            return Ok(());
-        }
-
-        match key {
-            KeyCode::Char(c) => {
-                if self.state.input_buffer.len() < MAX_INPUT_LENGTH {
-                    self.state.input_buffer.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                self.state.input_buffer.pop();
-            }
-            KeyCode::Enter => {
-                self.apply_rename_folder().await?;
-                self.state.input_buffer.clear();
-                // Stay in Settings/Folder mode
-                self.state.ui_mode = UiMode::Settings;
-            }
-            KeyCode::Esc => {
-                self.state.renaming_folder_id = None;
-                self.state.input_buffer.clear();
-                self.state.ui_mode = UiMode::Settings;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Start renaming the selected folder (stays in FolderEdit mode with text input)
-    async fn start_rename_folder(&mut self) {
-        if let Some(ref folder_id) = self.state.selected_folder_id {
-            // Get current display name for the input buffer
-            let current_name = {
-                let config = self.state.app_state.config.read().await;
-                config.folder_name(folder_id)
-            };
-            self.state.renaming_folder_id = Some(folder_id.clone());
-            self.state.input_buffer = current_name;
-            self.state.input_title = "Rename Folder".to_string();
-            self.state.input_prompt = "New name:".to_string();
-            // Stay in FolderEdit mode — the rename input is handled there
-            self.state.ui_mode = UiMode::FolderEdit;
-        }
-    }
-
-    /// Apply folder rename: only updates the display name (folder_id is immutable UUID)
-    async fn apply_rename_folder(&mut self) -> Result<()> {
-        let folder_id = match self.state.renaming_folder_id.take() {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-        let new_name = self.state.input_buffer.trim().to_string();
-
-        // Validate new name
-        if new_name.is_empty() {
-            return Ok(());
-        }
-
-        // Check for duplicate display names
-        {
-            let config = self.state.app_state.config.read().await;
-            let current_name = config.folder_name(&folder_id);
-            if new_name == current_name {
-                return Ok(());
-            }
-            if config.folders.values().any(|f| f.name == new_name) {
-                self.state.validation_error = Some(format!("Folder '{}' already exists", new_name));
-                self.state.renaming_folder_id = Some(folder_id);
-                return Ok(());
-            }
-        }
-
-        // Update only the display name — UUID key, directory, and task folder_ids stay the same
-        {
-            let mut config = self.state.app_state.config.write().await;
-            if let Some(folder_config) = config.folders.get_mut(&folder_id) {
-                folder_config.name = new_name.clone();
-            }
-            if let Err(e) = config.save() {
-                tracing::error!("Failed to save config after folder rename: {}", e);
-            }
-        }
-
-        tracing::info!("Renamed folder '{}' display name to '{}'", folder_id, new_name);
         Ok(())
     }
 

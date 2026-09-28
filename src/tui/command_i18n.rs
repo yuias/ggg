@@ -16,6 +16,11 @@ pub(crate) fn localize_command_error(state: &TuiState, err: &CommandError) -> St
         CommandError::InvalidConfig => state.t("cmd-error-invalid-config"),
         CommandError::ScriptsDisabled => state.t("cmd-error-scripts-disabled"),
         CommandError::ReloadActiveDownloads => state.t("cmd-error-reload-active-downloads"),
+        CommandError::EmptyFolderName => state.t("cmd-error-empty-folder-name"),
+        CommandError::DuplicateFolderName { name } => state.t_with_args(
+            "cmd-error-duplicate-folder-name",
+            Some(&fluent_args!["name" => name.clone()]),
+        ),
         CommandError::StartDownload { error } => state.t_with_args(
             "cmd-error-start-download",
             Some(&fluent_args!["error" => error.clone()]),

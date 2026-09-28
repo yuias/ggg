@@ -237,6 +237,7 @@ impl ApplicationSettingsField {
 /// Folder-level settings fields
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsField {
+    FolderName,
     FolderSavePath,
     FolderAutoDate,
     FolderAutoStart,
@@ -253,6 +254,7 @@ impl SettingsField {
     /// index mapping used by the folder settings handlers.
     pub fn all() -> Vec<Self> {
         vec![
+            Self::FolderName,
             Self::FolderSavePath,
             Self::FolderAutoDate,
             Self::FolderAutoStart,
@@ -273,6 +275,7 @@ impl SettingsField {
     /// Get translation key for label
     pub fn label_key(&self) -> &str {
         match self {
+            Self::FolderName => "settings-folder-name",
             Self::FolderSavePath => "settings-folder-save-path",
             Self::FolderAutoDate => "settings-folder-auto-date",
             Self::FolderAutoStart => "settings-folder-auto-start",
@@ -288,6 +291,7 @@ impl SettingsField {
     /// Get translation key for description
     pub fn description_key(&self) -> &str {
         match self {
+            Self::FolderName => "settings-folder-name-desc",
             Self::FolderSavePath => "settings-folder-save-path-desc",
             Self::FolderAutoDate => "settings-folder-auto-date-desc",
             Self::FolderAutoStart => "settings-folder-auto-start-desc",
@@ -499,9 +503,6 @@ pub struct TuiState {
     /// Settings screen: currently editing application setting
     pub is_editing_app_setting: bool,
 
-    /// Settings screen: renaming a folder (old name stored here)
-    pub renaming_folder_id: Option<String>,
-
     /// Validation/error message to display (None = no error)
     pub validation_error: Option<String>,
 
@@ -616,7 +617,6 @@ impl TuiState {
             settings_section: SettingsSection::General,
             app_settings_field_index: 0,
             is_editing_app_setting: false,
-            renaming_folder_id: None,
             validation_error: None,
             status_message: None,
             needs_redraw: true,  // Initial render needed
@@ -1128,5 +1128,20 @@ mod settings_tests {
         assert_eq!(SettingsSection::Folders.prev(), SettingsSection::Scripts);
         assert_eq!(SettingsSection::Scripts.prev(), SettingsSection::Downloads);
         assert_eq!(SettingsSection::Downloads.prev(), SettingsSection::General);
+    }
+
+    #[test]
+    fn folder_settings_field_index_zero_is_name() {
+        assert_eq!(SettingsField::from_index(0), Some(SettingsField::FolderName));
+    }
+
+    #[test]
+    fn folder_settings_field_all_has_no_duplicates() {
+        let all = SettingsField::all();
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "duplicate field in SettingsField::all()");
+            }
+        }
     }
 }

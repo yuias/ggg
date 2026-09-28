@@ -26,6 +26,8 @@ settings-app-referrer-policy = リファラーポリシー
 settings-app-referrer-policy-desc = ダウンロードのデフォルトReferrerヘッダーポリシー
 
 # Folder Settings Fields
+settings-folder-name = 名前
+settings-folder-name-desc = このフォルダの表示名
 settings-folder-save-path = 保存パス
 settings-folder-save-path-desc = ダウンロードファイルの保存先ディレクトリ
 settings-folder-auto-date = 日付ディレクトリ自動作成

@@ -856,60 +856,6 @@ fn render_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
             render_folder_details(app, f, folder_chunks[1]);
         }
     }
-
-    // Overlay: rename input dialog (when renaming a folder in settings)
-    if app.state.renaming_folder_id.is_some() {
-        render_rename_dialog(app, f, area);
-    }
-}
-
-/// Render folder rename input dialog as overlay on settings screen
-fn render_rename_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
-    let dialog_width = 50u16.min(area.width.saturating_sub(4));
-    let dialog_height = 5u16;
-
-    let dialog_area = Rect {
-        x: (area.width.saturating_sub(dialog_width)) / 2 + area.x,
-        y: (area.height.saturating_sub(dialog_height)) / 2 + area.y,
-        width: dialog_width,
-        height: dialog_height,
-    };
-
-    // Clear background
-    f.render_widget(Clear, dialog_area);
-
-    let title = &app.state.input_title;
-    let input_text = format!("{}_", &app.state.input_buffer);
-
-    let block = Block::default()
-        .title(Span::styled(
-            format!(" {} ", title),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT_SECTION));
-
-    let inner = block.inner(dialog_area);
-    f.render_widget(block, dialog_area);
-
-    // Prompt and input
-    let prompt_line = Line::from(vec![
-        Span::styled(
-            format!("{} ", &app.state.input_prompt),
-            Style::default().fg(theme::TEXT_NORMAL),
-        ),
-        Span::styled(input_text, Style::default().fg(Color::White)),
-    ]);
-
-    let hint_line = Line::from(Span::styled(
-        "Enter: confirm | Esc: cancel",
-        Style::default().fg(Color::DarkGray),
-    ));
-
-    let text = Paragraph::new(vec![prompt_line, Line::from(""), hint_line]);
-    f.render_widget(text, inner);
 }
 
 /// Render settings section tabs
@@ -1387,60 +1333,67 @@ fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
                     Line::from(Span::styled(format!("{}{}: {}", prefix, label, value), style))
                 };
 
-                // Field 0: Save Path
+                // Field 0: Name
                 detail_lines.push(make_field_line(
                     0,
+                    &app.state.t("settings-folder-name"),
+                    display_name.clone(),
+                ));
+
+                // Field 1: Save Path
+                detail_lines.push(make_field_line(
+                    1,
                     &app.state.t("settings-folder-save-path"),
                     folder_config.save_path.display().to_string(),
                 ));
 
-                // Field 1: Auto-Date Directory
+                // Field 2: Auto-Date Directory
                 let auto_date_str = if folder_config.auto_date_directory {
                     app.state.t("settings-value-enabled")
                 } else {
                     app.state.t("settings-value-disabled")
                 };
-                detail_lines.push(make_field_line(1, &app.state.t("settings-folder-auto-date"), auto_date_str));
+                detail_lines.push(make_field_line(2, &app.state.t("settings-folder-auto-date"), auto_date_str));
 
-                // Field 2: Auto-Start Downloads
+                // Field 3: Auto-Start Downloads
                 let auto_start_str = if folder_config.auto_start_downloads {
                     app.state.t("settings-value-enabled")
                 } else {
                     app.state.t("settings-value-disabled")
                 };
-                detail_lines.push(make_field_line(2, &app.state.t("settings-folder-auto-start"), auto_start_str));
+                detail_lines.push(make_field_line(3, &app.state.t("settings-folder-auto-start"), auto_start_str));
 
-                // Field 3: Prevent Duplicate URL
+                // Field 4: Prevent Duplicate URL
                 let prevent_dup_str = if folder_config.prevent_duplicate_url {
                     app.state.t("settings-value-enabled")
                 } else {
                     app.state.t("settings-value-disabled")
                 };
-                detail_lines.push(make_field_line(3, &app.state.t("settings-folder-prevent-duplicate-url"), prevent_dup_str));
+                detail_lines.push(make_field_line(4, &app.state.t("settings-folder-prevent-duplicate-url"), prevent_dup_str));
 
-                // Field 4: Scripts
+                // Field 5: Scripts
                 let scripts_status = match folder_config.scripts_enabled {
                     Some(true) => app.state.t("settings-value-enabled-override"),
                     Some(false) => app.state.t("settings-value-disabled-override"),
                     None => app.state.t("settings-value-inherit"),
                 };
-                detail_lines.push(make_field_line(4, &app.state.t("settings-folder-scripts"), scripts_status));
+                detail_lines.push(make_field_line(5, &app.state.t("settings-folder-scripts"), scripts_status));
 
-                // Field 5: Max Concurrent
+                // Field 6: Max Concurrent
                 let max_concurrent_str = folder_config
                     .max_concurrent
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| app.state.t("settings-value-inherit"));
-                detail_lines.push(make_field_line(5, &app.state.t("settings-folder-max-concurrent"), max_concurrent_str));
+                detail_lines.push(make_field_line(6, &app.state.t("settings-folder-max-concurrent"), max_concurrent_str));
 
-                // Field 6: User Agent
+                // Field 7: User Agent
                 let user_agent_str = folder_config
                     .user_agent
                     .clone()
                     .unwrap_or_else(|| app.state.t("settings-value-inherit"));
-                detail_lines.push(make_field_line(6, &app.state.t("settings-folder-user-agent"), user_agent_str));
+                detail_lines.push(make_field_line(7, &app.state.t("settings-folder-user-agent"), user_agent_str));
 
-                // Field 7: Referrer Policy
+                // Field 8: Referrer Policy
                 let referrer_policy_str = match &folder_config.referrer_policy {
                     Some(policy) => {
                         use crate::app::config::ReferrerPolicy;
@@ -1453,15 +1406,15 @@ fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
                     }
                     None => app.state.t("settings-value-inherit"),
                 };
-                detail_lines.push(make_field_line(7, &app.state.t("settings-folder-referrer-policy"), referrer_policy_str));
+                detail_lines.push(make_field_line(8, &app.state.t("settings-folder-referrer-policy"), referrer_policy_str));
 
-                // Field 8: Headers
+                // Field 9: Headers
                 let headers_str = if folder_config.default_headers.is_empty() {
                     app.state.t("settings-value-not-set")
                 } else {
                     format!("{} headers", folder_config.default_headers.len())
                 };
-                detail_lines.push(make_field_line(8, &app.state.t("settings-folder-headers"), headers_str));
+                detail_lines.push(make_field_line(9, &app.state.t("settings-folder-headers"), headers_str));
 
                 // Show headers details if not empty
                 if !folder_config.default_headers.is_empty() {
@@ -1630,7 +1583,8 @@ fn render_folder_details(app: &TuiApp, f: &mut Frame, area: Rect) {
     if let Some(field) = app.state.settings_edit_field {
         use super::state::SettingsField;
         match field {
-            SettingsField::FolderSavePath
+            SettingsField::FolderName
+            | SettingsField::FolderSavePath
             | SettingsField::FolderMaxConcurrent
             | SettingsField::FolderUserAgent => {
                 render_field_edit_dialog(app, f, area, field);

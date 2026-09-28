@@ -26,6 +26,8 @@ settings-app-referrer-policy = Referrer Policy
 settings-app-referrer-policy-desc = Default Referrer header policy for downloads
 
 # Folder Settings Fields
+settings-folder-name = Name
+settings-folder-name-desc = Display name for this folder
 settings-folder-save-path = Save Path
 settings-folder-save-path-desc = Directory where downloaded files are saved
 settings-folder-auto-date = Auto-Date Directory

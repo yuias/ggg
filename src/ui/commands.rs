@@ -30,6 +30,7 @@ pub enum Command {
     UpdateReferrerPolicy { policy: ReferrerPolicy },
 
     // Folder-level settings
+    UpdateFolderName { folder_id: String, value: String },
     UpdateFolderSavePath { folder_id: String, value: std::path::PathBuf },
     UpdateFolderMaxConcurrent { folder_id: String, value: Option<usize> },
     UpdateFolderUserAgent { folder_id: String, value: Option<String> },
@@ -68,6 +69,10 @@ pub enum CommandError {
     ScriptsDisabled,
     /// A config reload was requested while downloads are still active.
     ReloadActiveDownloads,
+    /// A folder name edit resolved to an empty (or whitespace-only) value.
+    EmptyFolderName,
+    /// A folder name edit collided with another folder's display name.
+    DuplicateFolderName { name: String },
     StartDownload { error: String },
     PauseDownload { error: String },
     RemoveDownload { error: String },
@@ -91,6 +96,10 @@ impl std::fmt::Display for CommandError {
             CommandError::ScriptsDisabled => write!(f, "Scripting is disabled"),
             CommandError::ReloadActiveDownloads => {
                 write!(f, "Cannot reload configuration while downloads are active")
+            }
+            CommandError::EmptyFolderName => write!(f, "Folder name cannot be empty"),
+            CommandError::DuplicateFolderName { name } => {
+                write!(f, "A folder named '{name}' already exists")
             }
             CommandError::StartDownload { error } => write!(f, "Failed to start download: {error}"),
             CommandError::PauseDownload { error } => write!(f, "Failed to pause download: {error}"),
@@ -401,6 +410,38 @@ pub async fn handle_command(
             .await
             {
                 Ok(()) => CommandResponse::ok(),
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
+        Command::UpdateFolderName { folder_id, value } => {
+            let new_name = value.trim().to_string();
+            if new_name.is_empty() {
+                return CommandResponse::Error(CommandError::EmptyFolderName);
+            }
+
+            let result = commit_config_edit(&state, |config| {
+                if config
+                    .folders
+                    .iter()
+                    .any(|(id, f)| id.as_str() != folder_id.as_str() && f.name == new_name)
+                {
+                    return Err(CommandError::DuplicateFolderName { name: new_name.clone() });
+                }
+
+                let folder_config = config
+                    .folders
+                    .entry(folder_id.clone())
+                    .or_insert_with(crate::app::config::FolderConfig::default);
+                folder_config.name = new_name.clone();
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id, "value": new_name}),
+                },
                 Err(e) => CommandResponse::Error(e),
             }
         }
@@ -772,6 +813,58 @@ mod tests {
         assert_eq!(config.folders.get("folder-1").and_then(|f| f.max_concurrent), Some(2));
     }
 
+    #[tokio::test]
+    async fn update_folder_name_rejects_empty_name() {
+        let mut config = Config::default();
+        config.folders.insert(
+            "folder-1".to_string(),
+            FolderConfig { name: "Downloads".to_string(), ..FolderConfig::default() },
+        );
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::UpdateFolderName { folder_id: "folder-1".to_string(), value: "   ".to_string() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+
+        match response {
+            CommandResponse::Error(CommandError::EmptyFolderName) => {}
+            other => panic!("expected EmptyFolderName, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert_eq!(config.folders.get("folder-1").map(|f| f.name.clone()), Some("Downloads".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_folder_name_rejects_duplicate_name() {
+        let mut config = Config::default();
+        config.folders.insert(
+            "folder-1".to_string(),
+            FolderConfig { name: "Downloads".to_string(), ..FolderConfig::default() },
+        );
+        config.folders.insert(
+            "folder-2".to_string(),
+            FolderConfig { name: "Movies".to_string(), ..FolderConfig::default() },
+        );
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::UpdateFolderName { folder_id: "folder-2".to_string(), value: "Downloads".to_string() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+
+        match response {
+            CommandResponse::Error(CommandError::DuplicateFolderName { .. }) => {}
+            other => panic!("expected DuplicateFolderName, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert_eq!(config.folders.get("folder-2").map(|f| f.name.clone()), Some("Movies".to_string()));
+    }
+
     // Exercises the real `Config::save()`/load path, so it needs an isolated
     // config directory; `#[serial]` keeps it from racing other tests that
     // touch the same process-global override.
@@ -861,5 +954,35 @@ mod tests {
         unsafe { std::env::remove_var("GGG_TEST_MODE") };
 
         assert_eq!(reloaded.folders.get(&folder_id).map(|f| f.save_path.clone()), Some(new_path));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_folder_name_persists_to_disk() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        let folder_id = Config::generate_folder_id();
+        let mut config = Config::default();
+        config.folders.insert(folder_id.clone(), FolderConfig::default());
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::UpdateFolderName { folder_id: folder_id.clone(), value: "Renamed".to_string() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(response, CommandResponse::Success { .. }), "response: {response:?}");
+
+        // The folder id (UUID key) stays the same across a rename; only the
+        // display name changes.
+        let reloaded = Config::load().expect("reloaded config");
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert_eq!(reloaded.folders.get(&folder_id).map(|f| f.name.clone()), Some("Renamed".to_string()));
     }
 }
