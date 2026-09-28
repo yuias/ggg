@@ -143,6 +143,7 @@ mod tests {
             logs: Vec::new(),
             retry_count: 0,
             last_status_code: Some(200),
+            filename_settled: false,
         };
 
         let entry = CompletedEntry::from(&task);
@@ -207,6 +208,7 @@ mod tests {
             logs: Vec::new(),
             retry_count: 0,
             last_status_code: Some(200),
+            filename_settled: false,
         };
 
         // Should not panic (may fail if permissions issue)

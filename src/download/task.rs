@@ -69,6 +69,15 @@ pub struct DownloadTask {
     pub logs: Vec<LogEntry>,
     pub retry_count: u32,
     pub last_status_code: Option<u16>,
+    /// True once some attempt resolved and deduped `filename` for this
+    /// task's current `folder_id`/`save_path` -- i.e. `filename` is verified
+    /// to identify this task's own on-disk file, not one borrowed from an
+    /// unrelated file that happens to share the name a server/redirect would
+    /// otherwise re-derive. A retry may only treat itself as resuming when
+    /// this is true; `#[serde(default)]` makes an older queue.toml (missing
+    /// the field) default to `false`, the safe choice.
+    #[serde(default)]
+    pub filename_settled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +134,7 @@ impl DownloadTask {
             logs: Vec::new(),
             retry_count: 0,
             last_status_code: None,
+            filename_settled: false,
         };
         task.logs.push(LogEntry::info("Download task created"));
         task
@@ -175,6 +185,7 @@ impl DownloadTask {
             logs: Vec::new(),
             retry_count: 0,
             last_status_code: None,
+            filename_settled: false,
         };
         task.logs.push(LogEntry::info(format!("Download task created in folder '{}'", folder_id)));
         task

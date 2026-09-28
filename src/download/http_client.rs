@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH, ETAG, LAST_MODIFIED, RANGE, REFERER, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_LENGTH, ETAG, IF_RANGE, LAST_MODIFIED, RANGE, REFERER, USER_AGENT};
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -264,6 +264,7 @@ impl HttpClient {
         path: &Path,
         headers: &HeaderMap,
         resume_from: Option<u64>,
+        if_range: Option<&str>,
         progress_callback: Option<F>,
     ) -> Result<DownloadInfo>
     where
@@ -273,11 +274,19 @@ impl HttpClient {
 
         let mut request = self.client.get(url).headers(headers.clone());
 
-        // Add Range header for resume support
+        // Add Range header for resume support. If-Range ties the range
+        // request to the version we already have bytes from: the server
+        // returns 206 for that exact version and 200 (full body) for any
+        // other, so a resource that changed since the partial file was
+        // written is caught by the 200-instead-of-206 handling below instead
+        // of corrupting the file by appending mismatched ranges.
         let mut actual_resume_from = resume_from;
         if let Some(offset) = resume_from {
             tracing::trace!("Adding Range header for resume: bytes={}-", offset);
             request = request.header(RANGE, format!("bytes={}-", offset));
+            if let Some(validator) = if_range {
+                request = request.header(IF_RANGE, validator);
+            }
         }
 
         tracing::trace!("Sending HTTP request to {}", url);
@@ -367,6 +376,16 @@ impl HttpClient {
         const MIN_PROGRESS_BYTES: u64 = 1024 * 1024; // 1 MB
         const MIN_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+        // For a 206 resume, `size` (this response's own Content-Length) is
+        // only the *remaining* bytes, not the file's full size. Report the
+        // resume offset plus that length instead, so a consumer that persists
+        // this value (e.g. `DownloadTask::size`) keeps the true total instead
+        // of silently shrinking it to the partial length on every resume.
+        let total_for_progress = match actual_resume_from {
+            Some(offset) => size.map(|partial| offset + partial),
+            None => size,
+        };
+
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             file.write_all(&chunk).await?;
@@ -379,7 +398,7 @@ impl HttpClient {
                 let time_since_update = now.duration_since(last_progress_update);
 
                 if bytes_since_update >= MIN_PROGRESS_BYTES || time_since_update >= MIN_PROGRESS_INTERVAL {
-                    callback(downloaded, size);
+                    callback(downloaded, total_for_progress);
                     last_progress_bytes = downloaded;
                     last_progress_update = now;
                 }
@@ -388,7 +407,7 @@ impl HttpClient {
 
         // Final progress update to ensure 100% is reported
         if let Some(ref callback) = progress_callback {
-            callback(downloaded, size);
+            callback(downloaded, total_for_progress);
         }
 
         file.flush().await?;
@@ -397,12 +416,8 @@ impl HttpClient {
         // a length and the connection closed early, the byte stream simply ends
         // without an error, which would otherwise be reported as a successful
         // download of a partial file. Returning an error lets the retry/resume
-        // path recover. For a 206 resume, `size` is the partial body length, so
-        // the expected total is the resume offset plus that length.
-        let expected_total = match actual_resume_from {
-            Some(offset) => size.map(|partial| offset + partial),
-            None => size,
-        };
+        // path recover.
+        let expected_total = total_for_progress;
         if let Some(expected) = expected_total {
             if downloaded < expected {
                 return Err(anyhow!(
@@ -604,7 +619,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("downloaded.txt");
 
-        client.download_to_file(&url, &file_path, &Default::default(), None, None::<fn(u64, Option<u64>)>)
+        client.download_to_file(&url, &file_path, &Default::default(), None, None, None::<fn(u64, Option<u64>)>)
             .await
             .unwrap();
 
@@ -639,6 +654,7 @@ mod tests {
             &url,
             &file_path,
             &Default::default(),
+            None,
             None,
             Some(move |downloaded, total| {
                 *callback_count_clone.lock().unwrap() += 1;
@@ -678,7 +694,7 @@ mod tests {
         // Create initial partial file
         std::fs::write(&file_path, &full_data[..resume_offset as usize]).unwrap();
 
-        client.download_to_file(&url, &file_path, &Default::default(), Some(resume_offset), None::<fn(u64, Option<u64>)>)
+        client.download_to_file(&url, &file_path, &Default::default(), Some(resume_offset), None, None::<fn(u64, Option<u64>)>)
             .await
             .unwrap();
 
@@ -710,7 +726,7 @@ mod tests {
         // Pre-existing partial file that must NOT be appended to
         std::fs::write(&file_path, b"Complete").unwrap();
 
-        client.download_to_file(&url, &file_path, &Default::default(), Some(8), None::<fn(u64, Option<u64>)>)
+        client.download_to_file(&url, &file_path, &Default::default(), Some(8), None, None::<fn(u64, Option<u64>)>)
             .await
             .unwrap();
 
@@ -734,7 +750,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("error.txt");
 
-        let result = client.download_to_file(&url, &file_path, &Default::default(), None, None::<fn(u64, Option<u64>)>)
+        let result = client.download_to_file(&url, &file_path, &Default::default(), None, None, None::<fn(u64, Option<u64>)>)
             .await;
 
         assert!(result.is_err());
@@ -942,7 +958,7 @@ mod tests {
         let file_path = temp_dir.path().join("out.bin");
 
         let info = client
-            .download_to_file(&url, &file_path, &Default::default(), None, None::<fn(u64, Option<u64>)>)
+            .download_to_file(&url, &file_path, &Default::default(), None, None, None::<fn(u64, Option<u64>)>)
             .await
             .unwrap();
 

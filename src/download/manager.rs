@@ -628,8 +628,19 @@ impl DownloadManager {
 
             // Retry loop
             loop {
+                // A download that started fresh (Pending) has `is_resuming ==
+                // false`, but once an attempt has resolved and deduped the
+                // on-disk filename (`filename_settled`), every following
+                // attempt in this loop is a resume of that file, not a new
+                // download. Deliberately not bare `retry_count > 0`: a
+                // failure before filename resolution (e.g. `get_info` itself
+                // erroring) bumps `retry_count` without ever having verified
+                // that `current_task.filename` is this task's own file, and
+                // treating that as resumable could adopt an unrelated file
+                // of the same name as this task's partial.
+                let attempt_is_resuming = is_resuming || current_task.filename_settled;
                 // Clone Arc-wrapped types (cheap) and task for retry attempt
-                match Self::download_task(current_task.clone(), http_client.clone(), queue.clone(), script_sender.clone(), config.clone(), is_resuming, manager_for_cleanup.event_tx.clone()).await {
+                match Self::download_task(current_task.clone(), http_client.clone(), queue.clone(), script_sender.clone(), config.clone(), attempt_is_resuming, manager_for_cleanup.event_tx.clone()).await {
                     Ok(completed_task) => {
                         // Add completed task to history for display in CompletedNode
                         history.write().await.add(completed_task);
@@ -643,6 +654,19 @@ impl DownloadManager {
                     }
                     Err(e) => {
                         tracing::error!("Download failed for {}: {}", current_task.filename, e);
+
+                        // `download_task` resolves and persists (via
+                        // `queue.update`) the filename/etag/size/resume
+                        // support for this attempt on its own local clone of
+                        // the task, but never hands the mutation back to this
+                        // loop. Re-read it so the next attempt looks for the
+                        // file this attempt actually left on disk, instead of
+                        // the values `current_task` started this attempt
+                        // with.
+                        if let Some(refreshed) = queue.get_by_id(current_task.id).await {
+                            current_task = refreshed;
+                        }
+
                         current_task.error_message = Some(e.to_string());
                         current_task.retry_count += 1;
                         current_task.log_error(format!("Download failed (attempt {}): {}", current_task.retry_count, e));
@@ -809,8 +833,18 @@ impl DownloadManager {
             &task.headers,
         )?;
 
-        // Get download info
+        // Get download info. Always resolved from `task.url` (the original
+        // URL), never a cached redirect target, so an expired signed URL
+        // (e.g. a time-limited CDN link behind a 302) is re-resolved on every
+        // attempt instead of being reused past its expiry.
         let mut info = http_client.get_info(&task.url, &headers).await?;
+
+        // Snapshot the values this task resumed with (if any) before they are
+        // overwritten below, so a resume can tell whether the resource changed
+        // since the attempt that produced the on-disk partial file.
+        let previous_etag = task.etag.clone();
+        let previous_last_modified = task.last_modified.clone();
+        let previous_size = task.size;
 
         // Update task with server info
         task.size = info.size;
@@ -823,24 +857,32 @@ impl DownloadManager {
         let size_str = info.size.map(|s| format!("{} bytes", s)).unwrap_or("unknown".to_string());
         task.log_info(format!("Server info: size={}, resume={}", size_str, info.resume_supported));
 
-        // Use filename from Content-Disposition if available (highest priority)
-        if let Some(server_filename) = info.filename {
-            task.filename = sanitize_filename(&server_filename);
-            task.log_info(format!("Filename from server: {}", task.filename));
-        } else if let Some(ref final_url) = info.final_url {
-            // Fallback: extract filename from redirect destination URL
-            if final_url != &task.url {
-                let redirect_filename = final_url
-                    .split('/')
-                    .last()
-                    .unwrap_or("")
-                    .split('?')
-                    .next()
-                    .unwrap_or("");
-                if !redirect_filename.is_empty() {
-                    let sanitized = sanitize_filename(redirect_filename);
-                    task.log_info(format!("Filename from redirect: {} -> {}", task.filename, sanitized));
-                    task.filename = sanitized;
+        // Use filename from Content-Disposition if available (highest
+        // priority) -- but only on a non-resuming attempt. Resuming keeps
+        // whatever filename is already stored: it may carry a unique-name
+        // suffix from an earlier attempt's dedup (see below), and
+        // re-deriving it from the server/redirect here on every attempt
+        // would silently discard that dedup and point the resume at an
+        // unrelated file that happens to have the original name.
+        if !is_resuming {
+            if let Some(server_filename) = info.filename {
+                task.filename = sanitize_filename(&server_filename);
+                task.log_info(format!("Filename from server: {}", task.filename));
+            } else if let Some(ref final_url) = info.final_url {
+                // Fallback: extract filename from redirect destination URL
+                if final_url != &task.url {
+                    let redirect_filename = final_url
+                        .split('/')
+                        .last()
+                        .unwrap_or("")
+                        .split('?')
+                        .next()
+                        .unwrap_or("");
+                    if !redirect_filename.is_empty() {
+                        let sanitized = sanitize_filename(redirect_filename);
+                        task.log_info(format!("Filename from redirect: {} -> {}", task.filename, sanitized));
+                        task.filename = sanitized;
+                    }
                 }
             }
         }
@@ -984,12 +1026,35 @@ impl DownloadManager {
         // Ensure directory exists (handles auto-date subdirectories)
         tokio::fs::create_dir_all(&resolved_save_path).await?;
 
-        // Resume: only for interrupted tasks (Paused/Error) with an existing
-        // partial file. A single async `metadata` call avoids the exists()+
-        // metadata() TOCTOU and the blocking std::fs call on the runtime;
-        // any error (missing/unreadable) means "start fresh".
-        let mut file_path = resolved_save_path.join(&task.filename);
-        let resume_from = if is_resuming && task.resume_supported {
+        // A resume is only valid if the resource on the server is still the
+        // one the on-disk partial file came from. Compare against the values
+        // this task carried into this attempt (captured above, before they
+        // were overwritten by the fresh `get_info` response): prefer etag,
+        // fall back to size + last-modified when the server sends no etag.
+        // With nothing to compare against (first ever attempt), treat it as
+        // unchanged.
+        let resource_changed = is_resuming
+            && match &previous_etag {
+                Some(prev) => info.etag.as_deref() != Some(prev.as_str()),
+                None => {
+                    previous_size.is_some()
+                        && (info.size != previous_size || info.last_modified != previous_last_modified)
+                }
+            };
+        if resource_changed {
+            task.log_warn(
+                "Resource changed since the last attempt (etag/size/last-modified mismatch); \
+                 restarting into the same file".to_string(),
+            );
+        }
+
+        // Resume: for interrupted tasks (Paused/Error) or a retry that already
+        // produced a partial file, with an existing partial file and an
+        // unchanged resource. A single async `metadata` call avoids the
+        // exists()+metadata() TOCTOU and the blocking std::fs call on the
+        // runtime; any error (missing/unreadable) means "start fresh".
+        let file_path = resolved_save_path.join(&task.filename);
+        let resume_from = if is_resuming && task.resume_supported && !resource_changed {
             match tokio::fs::metadata(&file_path).await {
                 Ok(meta) => Some(meta.len()),
                 Err(_) => None,
@@ -1002,6 +1067,16 @@ impl DownloadManager {
             task.downloaded = offset;
             task.log_info(format!("Resuming download from {} bytes", offset));
             queue.update(task.clone()).await;
+        } else if is_resuming {
+            // A retry (or a manually resumed task) keeps its filename: no
+            // resume is possible (unsupported, no partial file, or the
+            // resource changed), so the file is truncated and rewritten from
+            // scratch rather than diverted into a `[UnixTime]`-suffixed
+            // sibling, which used to happen on every retry after a
+            // mid-stream failure.
+            task.downloaded = 0;
+            task.log_info("Starting fresh download (same file)".to_string());
+            queue.update(task.clone()).await;
         } else {
             // New download: ensure unique filename to avoid overwriting existing files
             let unique_name = crate::file::naming::ensure_unique_filename(
@@ -1010,11 +1085,19 @@ impl DownloadManager {
             if unique_name != task.filename {
                 task.log_info(format!("Filename conflict resolved: {} -> {}", task.filename, unique_name));
                 task.filename = unique_name;
-                file_path = resolved_save_path.join(&task.filename);
                 queue.update(task.clone()).await;
             }
             task.log_info("Starting fresh download".to_string());
         }
+        // From here, `task.filename` is verified to identify this task's own
+        // file (deduped against unrelated files on a fresh start, kept
+        // as-is on a resume): a later attempt may now safely treat itself as
+        // resuming this one. Persisted so the retry loop's refresh (after a
+        // failure) can see it even though this attempt itself may still
+        // fail below.
+        task.filename_settled = true;
+        queue.update(task.clone()).await;
+        let file_path = resolved_save_path.join(&task.filename);
 
         // Progress is delivered over a bounded channel to a single consumer
         // task, rather than spawning a task per update. The sync callback uses
@@ -1102,20 +1185,46 @@ impl DownloadManager {
             &task.headers,
         )?;
 
-        // Perform download
-        let download_info = http_client
+        // On a genuine resume, validate the ranged GET against the same
+        // version whose bytes are already on disk (the stored etag, or
+        // last-modified when there is no etag), so a resource that changed
+        // between the `get_info` above and this request still falls back to
+        // a full 200 response instead of splicing mismatched ranges together.
+        // A weak etag (`W/"..."`) is excluded: RFC 7233 requires strong
+        // comparison for If-Range, so a weak etag there always fails the
+        // precondition and the server would fall back to 200 on every
+        // resume; last-modified (or no validator at all) is used instead.
+        let if_range = if resume_from.is_some() {
+            previous_etag
+                .as_deref()
+                .filter(|etag| !etag.starts_with("W/"))
+                .or(previous_last_modified.as_deref())
+        } else {
+            None
+        };
+
+        // Perform download. Uses `task.url` (the original URL, never a
+        // cached redirect target), matching the `get_info` call above.
+        let download_result = http_client
             .download_to_file(
                 &task.url,
                 &file_path,
                 &headers,
                 resume_from,
+                if_range,
                 Some(progress_callback),
             )
-            .await?;
+            .await;
 
         // The callback (and its sender) is now dropped; drain the remaining
-        // progress updates so the final value is applied before finalizing.
+        // progress updates so the final `downloaded`/`size` are applied
+        // before finalizing -- on error too (not just success), so a
+        // concurrent reader of this task (the retry loop's refresh after
+        // this attempt fails) observes a settled value instead of racing
+        // the consumer's last update.
         let _ = progress_consumer.await;
+
+        let download_info = download_result?;
 
         // Apply last modified time if available
         if let Some(ref last_modified) = download_info.last_modified {
@@ -1587,6 +1696,10 @@ impl DownloadManager {
             if must_stop {
                 task.status = DownloadStatus::Pending;
                 task.downloaded = 0;
+                // The destination folder's save_path may differ, so whatever
+                // filename resolution/dedup an earlier attempt settled on no
+                // longer applies.
+                task.filename_settled = false;
                 task.log_info(format!(
                     "Re-queued as pending after moving to folder '{}'",
                     new_folder_id
@@ -1675,7 +1788,12 @@ impl DownloadManager {
                 return Err(ChangeSavePathError::InvalidStatus);
             }
             return queue
-                .modify(id, move |task| task.save_path = new_path)
+                .modify(id, move |task| {
+                    task.save_path = new_path;
+                    // A resolved/deduped filename was only verified against
+                    // the old save_path.
+                    task.filename_settled = false;
+                })
                 .await
                 .map(|_| ())
                 .ok_or(ChangeSavePathError::NotFound);
@@ -2201,6 +2319,7 @@ impl DownloadManager {
         task.error_message = None;
         task.logs.clear();
         task.retry_count = 0;
+        task.filename_settled = false;
         task.started_at = None;
         task.completed_at = None;
 
@@ -3068,6 +3187,570 @@ mod tests {
         assert!(manager.is_in_flight(id).await);
 
         manager.abort_active_handle_for_test(id).await;
+    }
+
+    /// wiremock validates that a response's body matches its declared
+    /// `Content-Length` (it panics rather than hand the client a body
+    /// shorter than advertised), so there is no way to make it cut a live
+    /// stream mid-transfer the way a dropped connection would. This
+    /// reproduces the reported scenario the other faithful way available: a
+    /// partial file already on disk, as a real earlier attempt would leave
+    /// one, for a task whose `retry_count` is already nonzero while its
+    /// persisted status is still `Pending` (never reached `Paused`) -- the
+    /// exact combination that made every retry after a mid-stream failure
+    /// treat itself as a brand new download instead of a resume.
+    #[tokio::test]
+    async fn retry_resumes_partial_file_into_same_name() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let full_data = b"0123456789ABCDEFGHIJ";
+        let split_at = 8usize;
+
+        Mock::given(method("HEAD"))
+            .and(path("/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("Content-Length", full_data.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v1\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // The only GET this test expects: a ranged request for the bytes
+        // still missing from the partial file created below.
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .set_body_bytes(full_data[split_at..].to_vec())
+                    .append_header("Content-Length", (full_data.len() - split_at).to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v1\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Partial bytes an earlier, already-failed attempt left behind.
+        std::fs::write(temp_dir.path().join("file.bin"), &full_data[..split_at]).unwrap();
+
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/file.bin", mock_server.uri()),
+            temp_dir.path().to_path_buf(),
+        );
+        task.folder_id = "folder1".to_string();
+        // Status Pending (never persisted as Paused), but a prior attempt in
+        // this task's lifetime already resolved/deduped the filename and
+        // produced the partial file above -- the case the fix's
+        // `is_resuming || filename_settled` rule covers.
+        task.retry_count = 2;
+        task.filename_settled = true;
+        task.resume_supported = true;
+        task.etag = Some("\"v1\"".to_string());
+        task.size = Some(full_data.len() as u64);
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let mut events = manager.subscribe();
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+
+        let wait_for_completed = async {
+            loop {
+                match events.recv().await {
+                    Ok(DownloadEvent::Completed { task_id }) if task_id == id => return,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel closed before Completed: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), wait_for_completed)
+            .await
+            .expect("did not observe Completed within timeout");
+
+        let content = std::fs::read(temp_dir.path().join("file.bin")).expect("final file exists");
+        assert_eq!(content, full_data);
+
+        let siblings: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            siblings,
+            vec!["file.bin".to_string()],
+            "a retry-eligible task must not create a [UnixTime]-suffixed sibling"
+        );
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        let get_request = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::GET)
+            .expect("GET request recorded");
+        assert_eq!(
+            get_request.headers.get("range").and_then(|v| v.to_str().ok()),
+            Some(format!("bytes={split_at}-").as_str())
+        );
+        assert_eq!(
+            get_request.headers.get("if-range").and_then(|v| v.to_str().ok()),
+            Some("\"v1\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_restarts_into_same_file_when_resource_changed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let new_data = b"NEW-CONTENT-AFTER-CHANGE!!";
+
+        Mock::given(method("HEAD"))
+            .and(path("/changed.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("Content-Length", new_data.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v2\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/changed.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(new_data.to_vec())
+                    .append_header("Content-Length", new_data.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v2\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Stale partial file left by an earlier attempt against the old
+        // version of the resource.
+        std::fs::write(temp_dir.path().join("changed.bin"), b"stale-old-bytes").unwrap();
+
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/changed.bin", mock_server.uri()),
+            temp_dir.path().to_path_buf(),
+        );
+        task.folder_id = "folder1".to_string();
+        // A previously interrupted task, resumable in principle, whose
+        // stored etag no longer matches what the server has now.
+        task.status = DownloadStatus::Paused;
+        task.resume_supported = true;
+        task.etag = Some("\"v1\"".to_string());
+        task.size = Some(15);
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let mut events = manager.subscribe();
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+
+        let wait_for_completed = async {
+            loop {
+                match events.recv().await {
+                    Ok(DownloadEvent::Completed { task_id }) if task_id == id => return,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel closed before Completed: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), wait_for_completed)
+            .await
+            .expect("did not observe Completed within timeout");
+
+        let content = std::fs::read(temp_dir.path().join("changed.bin")).expect("final file exists");
+        assert_eq!(
+            content, new_data,
+            "a changed resource must be rewritten in full, not appended to the stale partial"
+        );
+
+        let siblings: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            siblings,
+            vec!["changed.bin".to_string()],
+            "an etag mismatch must restart into the same file, not a [UnixTime]-suffixed sibling"
+        );
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        let get_request = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::GET)
+            .expect("GET request recorded");
+        assert!(
+            get_request.headers.get("range").is_none(),
+            "a detected resource change must not attempt a ranged resume"
+        );
+    }
+
+    /// Regression coverage for the loop's queue refresh: `download_task`
+    /// resolves the unique-name-deduped filename on its own local clone and
+    /// persists it via `queue.update`, but never hands that back to the
+    /// loop. Without re-reading the task after a failed attempt, a retry
+    /// would keep looking for the pre-dedupe name and, on finding an
+    /// unrelated same-named file, treat retrying into a wrong resume offset
+    /// and then (on the server ignoring the resulting Range) truncate and
+    /// overwrite that unrelated file.
+    #[tokio::test]
+    async fn retry_uses_previous_attempts_resolved_filename() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let full_data = b"complete file contents";
+
+        Mock::given(method("HEAD"))
+            .and(path("/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("Content-Length", full_data.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v1\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // First attempt fails outright, before any bytes are written.
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // The retry: a plain 200 (as if the server ignored any Range sent),
+        // which is what would splice into / truncate whatever file the
+        // request ends up naming.
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(full_data.to_vec())
+                    .append_header("Content-Length", full_data.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v1\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        // An unrelated file that happens to have the name this download
+        // would get before the first attempt's unique-name dedupe renames
+        // it out of the way.
+        std::fs::write(temp_dir.path().join("file.bin"), b"unrelated existing content").unwrap();
+
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/file.bin", mock_server.uri()),
+            temp_dir.path().to_path_buf(),
+        );
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let mut events = manager.subscribe();
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+
+        let wait_for_completed = async {
+            loop {
+                match events.recv().await {
+                    Ok(DownloadEvent::Completed { task_id }) if task_id == id => return,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel closed before Completed: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), wait_for_completed)
+            .await
+            .expect("did not observe Completed within timeout");
+
+        let unrelated = std::fs::read(temp_dir.path().join("file.bin")).expect("unrelated file exists");
+        assert_eq!(
+            unrelated, b"unrelated existing content",
+            "the retry must not touch the unrelated file its pre-dedupe name collided with"
+        );
+
+        let siblings: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "file.bin")
+            .collect();
+        assert_eq!(
+            siblings.len(),
+            1,
+            "expected exactly one deduped sibling holding the download, got {siblings:?}"
+        );
+        let content = std::fs::read(temp_dir.path().join(&siblings[0])).unwrap();
+        assert_eq!(content, full_data);
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        let get_count = requests
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::GET)
+            .count();
+        assert_eq!(get_count, 2, "expected a failed first attempt and one retry");
+    }
+
+    /// Content-Disposition variant of the regression above: a server (like
+    /// Hugging Face's `resolve/main` redirect) names the file via
+    /// Content-Disposition on every `HEAD`, not just the first. That must
+    /// not be allowed to override an earlier attempt's unique-name dedup on
+    /// a resuming retry -- otherwise it silently re-targets the retry at an
+    /// unrelated file that happens to have the server's name.
+    #[tokio::test]
+    async fn retry_keeps_deduped_name_despite_content_disposition_every_attempt() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let full_data = b"complete file contents";
+
+        // The URL itself gives no filename hint; the server always supplies
+        // one via Content-Disposition, on every HEAD.
+        Mock::given(method("HEAD"))
+            .and(path("/download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("Content-Length", full_data.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v1\"")
+                    .append_header("Content-Disposition", "attachment; filename=\"file.bin\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // First attempt fails outright, before any bytes are written.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // The retry succeeds with the full body.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(full_data.to_vec())
+                    .append_header("Content-Length", full_data.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v1\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        // An unrelated file already occupying the Content-Disposition name.
+        std::fs::write(temp_dir.path().join("file.bin"), b"unrelated existing content").unwrap();
+
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/download", mock_server.uri()),
+            temp_dir.path().to_path_buf(),
+        );
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let mut events = manager.subscribe();
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+
+        let wait_for_completed = async {
+            loop {
+                match events.recv().await {
+                    Ok(DownloadEvent::Completed { task_id }) if task_id == id => return,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel closed before Completed: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), wait_for_completed)
+            .await
+            .expect("did not observe Completed within timeout");
+
+        let unrelated = std::fs::read(temp_dir.path().join("file.bin")).expect("unrelated file exists");
+        assert_eq!(
+            unrelated, b"unrelated existing content",
+            "a Content-Disposition name repeated on the retry must not override the earlier dedup"
+        );
+
+        let siblings: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "file.bin")
+            .collect();
+        assert_eq!(
+            siblings.len(),
+            1,
+            "expected exactly one deduped sibling holding the download, got {siblings:?}"
+        );
+        let content = std::fs::read(temp_dir.path().join(&siblings[0])).unwrap();
+        assert_eq!(content, full_data);
+    }
+
+    /// The other route into the same hazard: an earlier attempt fails before
+    /// it ever resolves a filename for this task (e.g. `get_info` erroring
+    /// on a DNS/timeout/connection failure, which happens before any
+    /// `queue.update`). `retry_count` is already nonzero, but
+    /// `filename_settled` never became true. A live connection failure
+    /// isn't reproducible against wiremock (there is no matched-but-broken
+    /// state to mount), so this presets the task fields a real attempt in
+    /// that situation would have left behind -- the same kind of
+    /// state-preset simulation already used for the mid-stream-failure
+    /// tests above.
+    #[tokio::test]
+    async fn retry_without_settled_filename_does_not_adopt_unrelated_file() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let full_data = b"complete file contents";
+
+        Mock::given(method("HEAD"))
+            .and(path("/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("Content-Length", full_data.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v1\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/file.bin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(full_data.to_vec())
+                    .append_header("Content-Length", full_data.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v1\""),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("file.bin"), b"unrelated existing content").unwrap();
+
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/file.bin", mock_server.uri()),
+            temp_dir.path().to_path_buf(),
+        );
+        task.folder_id = "folder1".to_string();
+        // Left behind by an earlier attempt that failed before resolving a
+        // filename: `retry_count` advanced, `filename_settled` did not.
+        task.retry_count = 2;
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let mut events = manager.subscribe();
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+
+        let wait_for_completed = async {
+            loop {
+                match events.recv().await {
+                    Ok(DownloadEvent::Completed { task_id }) if task_id == id => return,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel closed before Completed: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), wait_for_completed)
+            .await
+            .expect("did not observe Completed within timeout");
+
+        let unrelated = std::fs::read(temp_dir.path().join("file.bin")).expect("unrelated file exists");
+        assert_eq!(
+            unrelated, b"unrelated existing content",
+            "a retry whose earlier attempt never settled a filename must not adopt the unrelated file as its partial"
+        );
+
+        let siblings: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "file.bin")
+            .collect();
+        assert_eq!(
+            siblings.len(),
+            1,
+            "expected exactly one deduped sibling holding the download, got {siblings:?}"
+        );
+        let content = std::fs::read(temp_dir.path().join(&siblings[0])).unwrap();
+        assert_eq!(content, full_data);
+
+        let requests = mock_server
+            .received_requests()
+            .await
+            .expect("request recording enabled");
+        let get_request = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::GET)
+            .expect("GET request recorded");
+        assert!(
+            get_request.headers.get("range").is_none(),
+            "an unsettled retry must not send a ranged resume against the unrelated file"
+        );
     }
 
     #[tokio::test]
