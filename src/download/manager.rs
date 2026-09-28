@@ -10,6 +10,10 @@ use crate::script::message::ScriptRequest;
 use crate::script::sender;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::future::Future;
+#[cfg(test)]
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::{broadcast, RwLock, Semaphore};
@@ -183,6 +187,13 @@ pub struct DownloadManager {
     /// another operation's claim before giving up as `TaskBusy`. Overridden
     /// at startup from `download.claim_wait_ms` via `set_claim_wait_budget`.
     claim_wait_budget: std::time::Duration,
+    /// Test-only injection point in `change_folder`, run once (if set) right
+    /// after the pause step and before the queue-removal lookup. Lets a test
+    /// construct the "paused, then missing from every queue" race that the
+    /// public API cannot produce on its own -- see
+    /// `change_folder_reports_ok_when_task_vanishes_after_pause`.
+    #[cfg(test)]
+    move_hook: Arc<Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>>,
 }
 
 /// RAII guard for an in-flight `start_download` call. Removes its id from the
@@ -295,6 +306,8 @@ impl DownloadManager {
                 released: tokio::sync::Notify::new(),
             }),
             claim_wait_budget: CLAIM_WAIT_BUDGET,
+            #[cfg(test)]
+            move_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1296,8 +1309,9 @@ impl DownloadManager {
     }
 
     /// Marks `id` `Paused` and updates counts/events. A missing task is a
-    /// no-op.
-    async fn write_paused_status(&self, id: Uuid) {
+    /// no-op. Returns whether a task was actually found and written, so a
+    /// caller can tell an applied pause from one that found nothing to do.
+    async fn write_paused_status(&self, id: Uuid) -> bool {
         if let Some(mut task) = self.get_by_id(id).await {
             let folder_id = task.folder_id.clone();
             task.status = DownloadStatus::Paused;
@@ -1309,16 +1323,20 @@ impl DownloadManager {
             // Release the folder activation slot if nothing else is active.
             self.deactivate_folder_if_empty(&folder_id).await;
             self.emit(DownloadEvent::Paused { task_id: id });
+            true
+        } else {
+            false
         }
     }
 
     /// Stops `id`'s live handle (including retry backoff) and marks it
     /// `Paused`. A caller already holding the claim must call this, not
     /// `pause_download`, which would wait on its own claim. A missing task
-    /// is a no-op.
-    async fn pause_claimed(&self, id: Uuid, _claim: &StartClaim) {
+    /// is a no-op. Returns whether the task was found and actually written
+    /// `Paused` (see `write_paused_status`).
+    async fn pause_claimed(&self, id: Uuid, _claim: &StartClaim) -> bool {
         self.stop_handle(id).await;
-        self.write_paused_status(id).await;
+        self.write_paused_status(id).await
     }
 
     /// Pauses `id`: stops its live handle (downloading or retry backoff) and
@@ -1484,8 +1502,18 @@ impl DownloadManager {
         // Stop it first: that aborts the spawned future (or the retry sleep)
         // and settles the source queue's counts before the move.
         let must_stop = current.status == DownloadStatus::Downloading || self.is_running(id).await;
-        if must_stop {
-            self.pause_claimed(id, &claim).await;
+        // Whether `pause_claimed` actually found the task and wrote `Paused`
+        // -- i.e. whether this call has already changed persisted state by
+        // the time the lookup below runs. Used to pick the right response if
+        // that lookup then finds nothing (see the comment on that branch).
+        let paused = must_stop && self.pause_claimed(id, &claim).await;
+
+        #[cfg(test)]
+        {
+            let hook = self.move_hook.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(hook) = hook {
+                hook.await;
+            }
         }
 
         // Find and remove from old folder queue. Snapshot the queues (cheap Arc
@@ -1574,6 +1602,25 @@ impl DownloadManager {
             // destination folder from ever being activated and its tasks stay
             // `Pending`.
             self.deactivate_folder_if_empty(&old_folder_id).await;
+            Ok(())
+        } else if paused {
+            // `pause_claimed` above found the task and wrote it `Paused` into
+            // its source queue, yet the queue lookup just above found no
+            // queue holding `id` at all. That combination should be
+            // unreachable through the public API: every mutator that can
+            // remove a task from a queue without going through this call's
+            // claim is gated the same way, except the download body's own
+            // completion path -- and that path removes the handle before
+            // pausing here could observe it, so `paused` would be `false` in
+            // that race, not `true` (see `write_paused_status`). Treat this
+            // as a bug rather than "nothing changed": returning the same
+            // not-found error as the truly-missing case below would make
+            // `dispatch`'s caller skip the queue save even though the pause
+            // above was in fact persisted, breaking the "Error means nothing
+            // changed" contract that save relies on.
+            tracing::warn!(
+                "change_folder: task {id} was paused for a move to folder '{new_folder_id}' but is now in no folder queue; nothing left to move"
+            );
             Ok(())
         } else {
             Err(anyhow::anyhow!("Task not found"))
@@ -1998,6 +2045,16 @@ impl DownloadManager {
         if let Some(entry) = self.active_downloads.read().await.get(&id) {
             entry.in_backoff.store(on, Ordering::Relaxed);
         }
+    }
+
+    /// Arms `change_folder`'s test-only hook: `fut` runs once, right after
+    /// the pause step and before the queue-removal lookup, so a test can
+    /// remove `id` from its queue at that exact point -- a window no caller
+    /// outside this module can otherwise hit (see the field doc on
+    /// `move_hook`).
+    #[cfg(test)]
+    pub(crate) fn set_move_hook_for_test(&self, fut: impl Future<Output = ()> + Send + 'static) {
+        *self.move_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::pin(fut));
     }
 
     /// True while some operation holds `id`'s claim: a `start_download` call
@@ -2815,6 +2872,39 @@ mod tests {
         );
 
         drop(claim);
+    }
+
+    // Reproduces the invariant-violation path `change_folder` must not
+    // surface as a plain not-found: the task is found, gets paused (a real
+    // state change), and only then goes missing from every folder queue.
+    // The public API cannot construct this window on its own (every other
+    // claimless remover is gated the same way `change_folder` is), so the
+    // test uses `set_move_hook_for_test` to remove the task directly from
+    // its queue at that exact point.
+    #[tokio::test]
+    async fn change_folder_reports_ok_when_task_vanishes_after_pause() {
+        let manager = DownloadManager::new();
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        task.status = DownloadStatus::Downloading;
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let source_queue = manager.get_folder_queue("folder1").await.expect("queue must exist");
+        manager.set_move_hook_for_test(async move {
+            source_queue.remove(id).await;
+        });
+
+        let result = manager.change_folder(id, "folder2".to_string(), None).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        // The hook, not some other path, must be what removed the task --
+        // otherwise this test would pass without exercising the race at all.
+        assert!(
+            manager.get_by_id(id).await.is_none(),
+            "hook must have removed the task from every queue"
+        );
     }
 
     #[tokio::test]
