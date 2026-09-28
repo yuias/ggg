@@ -270,6 +270,31 @@ async fn server_owner_check_passes_for_same_user() {
 }
 
 #[tokio::test]
+async fn bind_rejects_invalid_pipe_name() {
+    let start = std::time::Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(1), server::bind("not-a-pipe-name"))
+        .await
+        .expect("bind timed out")
+        .expect_err("bind should reject an invalid pipe name");
+    assert!(start.elapsed() < Duration::from_secs(1), "bind should fail without probing or retrying");
+    match err {
+        BindError::InvalidName(_) => {}
+        other => panic!("expected InvalidName, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn probe_invalid_name_is_unreachable() {
+    let result = tokio::time::timeout(TEST_TIMEOUT, client::probe("not-a-pipe-name"))
+        .await
+        .expect("probe timed out");
+    match result {
+        DaemonProbe::Unreachable(msg) => assert!(msg.contains("invalid pipe name"), "unexpected message: {msg}"),
+        other => panic!("expected Unreachable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn abandoned_wait_is_cancelled_on_client_disconnect() {
     let pipe_name = unique_pipe_name();
     let bound = server::bind(&pipe_name).await.expect("bind");

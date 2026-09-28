@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWr
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 use super::client::{self, DaemonProbe};
-use super::protocol::{ControlErrorCode, ControlRequest, ControlResponse};
+use super::protocol::{validate_pipe_name, ControlErrorCode, ControlRequest, ControlResponse};
 
 /// Caps a single request line, matching the bridge pipe's cap
 /// (`pipe_server.rs`).
@@ -34,6 +34,8 @@ pub trait ControlHandler: Send + Sync + 'static {
 #[derive(Debug)]
 pub enum BindError {
     AlreadyRunning { pid: Option<u32> },
+    /// `pipe_name` (usually from `GGG_DAEMON_PIPE`) fails `validate_pipe_name`.
+    InvalidName(String),
     Io(std::io::Error),
 }
 
@@ -70,13 +72,19 @@ fn is_already_claimed(e: &std::io::Error) -> bool {
 }
 
 /// Binds the first instance of `pipe_name`, the single-instance claim for a
-/// config directory. If the name is already claimed, probes the holder to
-/// tell an active daemon apart from a pipe left behind by a process that
-/// died without cleanup, giving the latter one retry before giving up.
+/// config directory. Validates the name first, so a bad `GGG_DAEMON_PIPE`
+/// fails fast instead of looking like another daemon already holding it. If
+/// the first create fails because the name is already claimed, probes the
+/// holder to tell an active daemon apart from a pipe left behind by a
+/// process that died without cleanup, giving the latter one retry before
+/// giving up. Any other first-create error is not retried.
 pub async fn bind(pipe_name: &str) -> Result<BoundPipe, BindError> {
+    if let Err(reason) = validate_pipe_name(pipe_name) {
+        return Err(BindError::InvalidName(reason));
+    }
     match create_first_instance(pipe_name) {
         Ok(first) => Ok(BoundPipe { name: pipe_name.to_string(), first }),
-        Err(_) => {
+        Err(e) if is_already_claimed(&e) => {
             if let DaemonProbe::Running { pid, .. } = client::probe(pipe_name).await {
                 return Err(BindError::AlreadyRunning { pid: Some(pid) });
             }
@@ -87,6 +95,7 @@ pub async fn bind(pipe_name: &str) -> Result<BoundPipe, BindError> {
                 Err(e2) => Err(BindError::Io(e2)),
             }
         }
+        Err(e) => Err(BindError::Io(e)),
     }
 }
 

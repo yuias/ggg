@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 
 use super::owner::{self, OWNER_MISMATCH_MSG};
-use super::protocol::{ControlRequest, ControlResponse, CONTROL_PROTOCOL_VERSION};
+use super::protocol::{validate_pipe_name, ControlRequest, ControlResponse, CONTROL_PROTOCOL_VERSION};
 
 /// `ERROR_PIPE_BUSY`: every instance is currently connected to another client.
 const ERROR_PIPE_BUSY: i32 = 231;
@@ -38,6 +38,9 @@ pub enum DaemonProbe {
 /// opening the pipe and requiring a valid `Ping`/`Pong` round trip; a pipe
 /// name that exists but never answers is `Unreachable`, not `Running`.
 pub async fn probe(pipe_name: &str) -> DaemonProbe {
+    if let Err(reason) = validate_pipe_name(pipe_name) {
+        return DaemonProbe::Unreachable(format!("invalid pipe name: {reason}"));
+    }
     let deadline = Instant::now() + PIPE_BUSY_RETRY_BUDGET;
     let client = loop {
         match ClientOptions::new().open(pipe_name) {
@@ -123,6 +126,9 @@ pub async fn send(
 }
 
 async fn open_for_send(pipe_name: &str) -> anyhow::Result<NamedPipeClient> {
+    if let Err(reason) = validate_pipe_name(pipe_name) {
+        return Err(anyhow::anyhow!("invalid pipe name: {reason}"));
+    }
     let deadline = Instant::now() + PIPE_BUSY_RETRY_BUDGET;
     loop {
         match ClientOptions::new().open(pipe_name) {

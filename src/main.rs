@@ -102,6 +102,11 @@ async fn main() -> Result<()> {
                     drop(log_guard);
                     std::process::exit(ggg::cli::error::DAEMON_RUNNING);
                 }
+                Err(ggg::ipc::control::server::BindError::InvalidName(reason)) => {
+                    eprintln!("invalid daemon pipe name {pipe_name:?}: {reason} (check GGG_DAEMON_PIPE)");
+                    drop(log_guard);
+                    std::process::exit(ggg::cli::error::ERROR);
+                }
                 Err(ggg::ipc::control::server::BindError::Io(e)) => {
                     eprintln!("failed to bind daemon control pipe: {e}");
                     drop(log_guard);

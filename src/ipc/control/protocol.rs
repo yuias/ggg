@@ -44,6 +44,34 @@ pub fn control_pipe_name(config_dir: &std::path::Path) -> String {
     hashed_pipe_name(normalized)
 }
 
+/// `\\.\pipe\` (ASCII case-insensitive) + a non-empty name without `\`,
+/// total length <= 256 UTF-16 units (`CreateNamedPipe`'s limit). Used to
+/// reject a `GGG_DAEMON_PIPE` override that cannot be a valid pipe name
+/// before wasting time on `CreateNamedPipe`/`ClientOptions::open`.
+pub fn validate_pipe_name(name: &str) -> Result<(), String> {
+    const PREFIX: &str = r"\\.\pipe\";
+    let bytes = name.as_bytes();
+    if bytes.len() < PREFIX.len() || !bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX.as_bytes()) {
+        return Err(format!(r"must start with \\.\pipe\ (case-insensitive), got {name:?}"));
+    }
+    // The prefix matched byte-for-byte against an all-ASCII constant, so
+    // byte `PREFIX.len()` falls on a char boundary; slicing here cannot panic.
+    let rest = &name[PREFIX.len()..];
+    if rest.is_empty() {
+        return Err("pipe name is empty after the prefix".to_string());
+    }
+    if rest.contains('\\') {
+        return Err(format!(r"pipe name must not contain \ after the prefix, got {name:?}"));
+    }
+    let utf16_len = name.encode_utf16().count();
+    if utf16_len > 256 {
+        return Err(format!(
+            "pipe name is {utf16_len} UTF-16 units long, exceeds CreateNamedPipe's 256 limit"
+        ));
+    }
+    Ok(())
+}
+
 /// Resolves the dir via `crate::util::paths::find_config_directory()`; on
 /// error hashes the literal "default".
 pub fn default_control_pipe_name() -> String {
@@ -559,6 +587,25 @@ mod tests {
             value: String::new(),
         }
         .is_mutating());
+    }
+
+    #[test]
+    fn validate_pipe_name_accepts_default_names() {
+        assert!(validate_pipe_name(&hashed_pipe_name("some/config/dir")).is_ok());
+        assert!(validate_pipe_name(r"\\.\PIPE\x").is_ok());
+    }
+
+    #[test]
+    fn validate_pipe_name_rejects_bad_names() {
+        assert!(validate_pipe_name("").is_err());
+        assert!(validate_pipe_name("foo").is_err());
+        assert!(validate_pipe_name(r"\\.\pipe\").is_err());
+        assert!(validate_pipe_name(r"\\.\pipe\a\b").is_err());
+        // Git Bash on Windows can mangle a `\\.\pipe\...` argument into a
+        // forward-slash form; that form must not be mistaken for valid.
+        assert!(validate_pipe_name("//./pipe/ggg-daemon-x").is_err());
+        let too_long = format!(r"\\.\pipe\{}", "a".repeat(300));
+        assert!(validate_pipe_name(&too_long).is_err());
     }
 
     #[test]
