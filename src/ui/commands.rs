@@ -1,5 +1,5 @@
 use crate::AppState;
-use crate::app::config::ReferrerPolicy;
+use crate::app::config::{Config, ReferrerPolicy};
 use crate::download::{manager::DownloadManager, task::DownloadTask};
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +125,35 @@ impl CommandResponse {
     }
 }
 
+/// Applies `edit` to a clone of the shared config, validates and saves the
+/// clone, and only swaps it into the shared state once both succeed. A
+/// validation or save failure (including an error the closure itself raises,
+/// e.g. an unknown folder) returns before the swap, so a rejected edit never
+/// leaves memory and disk diverged. Mirrors `dispatch_config_set` in
+/// `src/cli/daemon_ops.rs`. The write lock is held for the clone, edit,
+/// validate and save sequence, but not across any other await.
+async fn commit_config_edit(
+    state: &AppState,
+    edit: impl FnOnce(&mut Config) -> Result<(), CommandError>,
+) -> Result<(), CommandError> {
+    let mut guard = state.config.write().await;
+    let mut clone = guard.clone();
+
+    edit(&mut clone)?;
+
+    if let Err(errors) = crate::app::settings::validate_folder_config(&clone) {
+        let error_str = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
+        return Err(CommandError::ValidationFailed { error: error_str });
+    }
+
+    if let Err(e) = clone.save() {
+        return Err(CommandError::SaveConfig { error: e.to_string() });
+    }
+
+    *guard = clone;
+    Ok(())
+}
+
 pub async fn handle_command(
     command: Command,
     state: AppState,
@@ -206,288 +235,260 @@ pub async fn handle_command(
             }
         }
         Command::UpdateConfig { config } => {
-            let mut state_config = state.config.write().await;
-            if let Ok(new_config) = serde_json::from_value(config) {
-                // Validate before applying
-                if let Err(errors) = crate::app::settings::validate_folder_config(&new_config) {
-                    let error_str = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
-                    return CommandResponse::Error(CommandError::ValidationFailed { error: error_str });
-                }
-
-                *state_config = new_config;
-                // Save to disk
-                if let Err(e) = state_config.save() {
-                    return CommandResponse::Error(CommandError::SaveConfig {
-                        error: e.to_string(),
-                    });
-                }
-
-                CommandResponse::ok()
-            } else {
-                CommandResponse::Error(CommandError::InvalidConfig)
+            let new_config: Config = match serde_json::from_value(config) {
+                Ok(c) => c,
+                Err(_) => return CommandResponse::Error(CommandError::InvalidConfig),
+            };
+            match commit_config_edit(&state, |cfg| {
+                *cfg = new_config;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::ok(),
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateMaxConcurrent { value } => {
-            let mut config = state.config.write().await;
-            config.download.max_concurrent = value;
-
-            // Validate constraints
-            if let Err(errors) = crate::app::settings::validate_folder_config(&config) {
-                let error_str = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
-                return CommandResponse::Error(CommandError::ValidationFailed { error: error_str });
-            }
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.download.max_concurrent = value;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateMaxConcurrentPerFolder { value } => {
-            let mut config = state.config.write().await;
-            config.download.max_concurrent_per_folder = value;
-
-            // Validate constraints
-            if let Err(errors) = crate::app::settings::validate_folder_config(&config) {
-                let error_str = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
-                return CommandResponse::Error(CommandError::ValidationFailed { error: error_str });
-            }
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.download.max_concurrent_per_folder = value;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateMaxActiveFolders { value } => {
-            let mut config = state.config.write().await;
-            config.download.parallel_folder_count = value;
-
-            // Validate constraints
-            if let Err(errors) = crate::app::settings::validate_folder_config(&config) {
-                let error_str = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
-                return CommandResponse::Error(CommandError::ValidationFailed { error: error_str });
-            }
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.download.parallel_folder_count = value;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateMaxRedirects { value } => {
-            let mut config = state.config.write().await;
-            config.download.max_redirects = value;
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.download.max_redirects = value;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateRetryCount { value } => {
-            let mut config = state.config.write().await;
-            config.download.retry_count = value;
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.download.retry_count = value;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateScriptsEnabled { value } => {
-            let mut config = state.config.write().await;
-            config.scripts.enabled = value;
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.scripts.enabled = value;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
         Command::UpdateSkipDownloadPreview { value } => {
-            let mut config = state.config.write().await;
-            config.general.skip_download_preview = value;
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.general.skip_download_preview = value;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
         Command::UpdateAutoLaunchDnd { value } => {
-            let mut config = state.config.write().await;
-            config.general.auto_launch_dnd = value;
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.general.auto_launch_dnd = value;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
         Command::UpdateLanguage { value } => {
-            let mut config = state.config.write().await;
-            config.general.language = value.clone();
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.general.language = value.clone();
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateUserAgent { value } => {
-            let mut config = state.config.write().await;
-            config.download.user_agent = value.clone();
-
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "value": value}),
+            match commit_config_edit(&state, |config| {
+                config.download.user_agent = value.clone();
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateReferrerPolicy { policy } => {
-            let mut config = state.config.write().await;
-            config.download.referrer_policy = policy.clone();
-
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
+            match commit_config_edit(&state, |config| {
+                config.download.referrer_policy = policy;
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::ok(),
+                Err(e) => CommandResponse::Error(e),
             }
-
-            CommandResponse::ok()
         }
 
         Command::UpdateFolderMaxConcurrent { folder_id, value } => {
-            let mut config = state.config.write().await;
+            let result = commit_config_edit(&state, |config| {
+                let folder_config = config
+                    .folders
+                    .entry(folder_id.clone())
+                    .or_insert_with(crate::app::config::FolderConfig::default);
+                folder_config.max_concurrent = value;
+                Ok(())
+            })
+            .await;
 
-            // Get or create folder config
-            let folder_config = config
-                .folders
-                .entry(folder_id.clone())
-                .or_insert_with(crate::app::config::FolderConfig::default);
-
-            folder_config.max_concurrent = value;
-
-            // Validate constraints
-            if let Err(errors) = crate::app::settings::validate_folder_config(&config) {
-                let error_str = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ");
-                return CommandResponse::Error(CommandError::ValidationFailed { error: error_str });
-            }
-
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "folder_id": folder_id, "value": value}),
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id, "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateFolderUserAgent { folder_id, value } => {
-            let mut config = state.config.write().await;
+            let result = commit_config_edit(&state, |config| {
+                let folder_config = config
+                    .folders
+                    .entry(folder_id.clone())
+                    .or_insert_with(crate::app::config::FolderConfig::default);
+                folder_config.user_agent = value.clone();
+                Ok(())
+            })
+            .await;
 
-            let folder_config = config
-                .folders
-                .entry(folder_id.clone())
-                .or_insert_with(crate::app::config::FolderConfig::default);
-
-            folder_config.user_agent = value.clone();
-
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "folder_id": folder_id}),
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::UpdateFolderReferrerPolicy { folder_id, policy } => {
-            let mut config = state.config.write().await;
+            let result = commit_config_edit(&state, |config| {
+                let folder_config = config
+                    .folders
+                    .entry(folder_id.clone())
+                    .or_insert_with(crate::app::config::FolderConfig::default);
+                folder_config.referrer_policy = policy.clone();
+                Ok(())
+            })
+            .await;
 
-            let folder_config = config
-                .folders
-                .entry(folder_id.clone())
-                .or_insert_with(crate::app::config::FolderConfig::default);
-
-            folder_config.referrer_policy = policy;
-
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({"status": "ok", "folder_id": folder_id}),
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id}),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::ToggleScriptFile { filename } => {
-            let mut config = state.config.write().await;
-
             // Toggle the enabled status (default is true if not in map)
-            let current_status = config.scripts.script_files.get(&filename).copied().unwrap_or(true);
-            let new_status = !current_status;
-            config.scripts.script_files.insert(filename.clone(), new_status);
+            let mut new_status = true;
+            let result = commit_config_edit(&state, |config| {
+                let current_status = config.scripts.script_files.get(&filename).copied().unwrap_or(true);
+                new_status = !current_status;
+                config.scripts.script_files.insert(filename.clone(), new_status);
+                Ok(())
+            })
+            .await;
 
-            // Save to disk
-            if let Err(e) = config.save() {
-                return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-            }
-
-            CommandResponse::Success {
-                data: serde_json::json!({
-                    "status": "ok",
-                    "filename": filename,
-                    "enabled": new_status
-                }),
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({
+                        "status": "ok",
+                        "filename": filename,
+                        "enabled": new_status
+                    }),
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
         Command::ToggleFolderScriptFile { folder_id, filename } => {
-            let mut config = state.config.write().await;
+            let result = commit_config_edit(&state, |config| {
+                // Get application-level status first (before the mutable borrow)
+                let app_status = config.scripts.script_files.get(&filename).copied().unwrap_or(true);
 
-            // Get application-level status first (before mutable borrow)
-            let app_status = config.scripts.script_files.get(&filename).copied().unwrap_or(true);
+                let folder_config = config
+                    .folders
+                    .get_mut(&folder_id)
+                    .ok_or_else(|| CommandError::FolderNotFound { folder: folder_id.clone() })?;
 
-            // Get or create folder config
-            if let Some(folder_config) = config.folders.get_mut(&folder_id) {
                 // Get or create the script_files map for this folder
                 let script_files = folder_config.script_files.get_or_insert_with(std::collections::HashMap::new);
 
@@ -508,20 +509,19 @@ pub async fn handle_command(
                     folder_config.script_files = None;
                 }
 
-                // Save to disk
-                if let Err(e) = config.save() {
-                    return CommandResponse::Error(CommandError::SaveConfig { error: e.to_string() });
-                }
+                Ok(())
+            })
+            .await;
 
-                CommandResponse::Success {
+            match result {
+                Ok(()) => CommandResponse::Success {
                     data: serde_json::json!({
                         "status": "ok",
                         "folder_id": folder_id,
                         "filename": filename,
                     }),
-                }
-            } else {
-                CommandResponse::Error(CommandError::FolderNotFound { folder: folder_id })
+                },
+                Err(e) => CommandResponse::Error(e),
             }
         }
 
@@ -566,7 +566,10 @@ pub async fn handle_command(
                 return CommandResponse::Error(CommandError::ReloadActiveDownloads);
             }
 
-            // Reload configuration from disk
+            // Reads a config that is already on disk rather than deriving one
+            // from an edit, so there is nothing to validate or save here;
+            // `commit_config_edit` does not apply. A load failure returns
+            // before the write lock is taken, so memory is untouched either way.
             match crate::app::config::Config::load() {
                 Ok(new_config) => {
                     // Update application state
@@ -580,5 +583,62 @@ pub async fn handle_command(
                 }),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::config::FolderConfig;
+    use crate::download::manager::DownloadManager;
+
+    fn state_with(config: Config) -> AppState {
+        AppState::new(config)
+    }
+
+    #[tokio::test]
+    async fn update_max_concurrent_rejected_keeps_old_value() {
+        let mut config = Config::default();
+        // 5 * 2 = 10, exactly at the initial limit, so this setup is valid
+        // before the update under test.
+        config.download.max_concurrent = 10;
+        config.download.max_concurrent_per_folder = Some(5);
+        config.download.parallel_folder_count = Some(2);
+        let state = state_with(config);
+
+        let response =
+            handle_command(Command::UpdateMaxConcurrent { value: 3 }, state.clone(), DownloadManager::new()).await;
+
+        match response {
+            CommandResponse::Error(CommandError::ValidationFailed { .. }) => {}
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert_eq!(config.download.max_concurrent, 10);
+    }
+
+    #[tokio::test]
+    async fn update_folder_max_concurrent_rejected_keeps_old_value() {
+        let mut config = Config::default();
+        config.download.max_concurrent = 3;
+        config.folders.insert(
+            "folder-1".to_string(),
+            FolderConfig { max_concurrent: Some(2), ..FolderConfig::default() },
+        );
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::UpdateFolderMaxConcurrent { folder_id: "folder-1".to_string(), value: Some(5) },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+
+        match response {
+            CommandResponse::Error(CommandError::ValidationFailed { .. }) => {}
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert_eq!(config.folders.get("folder-1").and_then(|f| f.max_concurrent), Some(2));
     }
 }
