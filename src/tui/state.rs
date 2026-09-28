@@ -154,6 +154,7 @@ pub enum ApplicationSettingsField {
     MaxConcurrentPerFolder,
     MaxActiveFolders,
     ScriptsEnabled,
+    DefaultDirectory,
 }
 
 impl ApplicationSettingsField {
@@ -170,6 +171,7 @@ impl ApplicationSettingsField {
             Self::MaxConcurrentPerFolder,
             Self::MaxActiveFolders,
             Self::ScriptsEnabled,
+            Self::DefaultDirectory,
         ]
     }
 
@@ -185,7 +187,8 @@ impl ApplicationSettingsField {
             | Self::RetryCount
             | Self::MaxConcurrent
             | Self::MaxConcurrentPerFolder
-            | Self::MaxActiveFolders => SettingsSection::Downloads,
+            | Self::MaxActiveFolders
+            | Self::DefaultDirectory => SettingsSection::Downloads,
             Self::ScriptsEnabled => SettingsSection::Scripts,
         }
     }
@@ -215,6 +218,10 @@ impl ApplicationSettingsField {
     /// only spawned when scripts are enabled at startup (`AppState::new_with_scripts`);
     /// turning it on later leaves `script_sender` `None` for the rest of the
     /// session, so scripts silently never run until a restart.
+    /// `DefaultDirectory` is not in this list either: it is read from the
+    /// shared config on every download/folder creation (`DownloadTask::new_with_folder`,
+    /// `download::manager`), never cached at startup, so an edit applies to
+    /// the next download without a restart.
     pub fn requires_restart(&self) -> bool {
         matches!(
             self,
@@ -241,6 +248,7 @@ impl ApplicationSettingsField {
             Self::SkipDownloadPreview => "settings-app-skip-download-preview",
             Self::Language => "settings-app-language",
             Self::AutoLaunchDnd => "settings-app-auto-launch-dnd",
+            Self::DefaultDirectory => "settings-app-default-directory",
         }
     }
 
@@ -258,6 +266,7 @@ impl ApplicationSettingsField {
             Self::SkipDownloadPreview => "settings-app-skip-download-preview-desc",
             Self::Language => "settings-app-language-desc",
             Self::AutoLaunchDnd => "settings-app-auto-launch-dnd-desc",
+            Self::DefaultDirectory => "settings-app-default-directory-desc",
         }
     }
 }

@@ -24,6 +24,8 @@ settings-app-user-agent = ユーザーエージェント
 settings-app-user-agent-desc = HTTPリクエストのデフォルトUser-Agentヘッダー
 settings-app-referrer-policy = リファラーポリシー
 settings-app-referrer-policy-desc = ダウンロードのデフォルトReferrerヘッダーポリシー
+settings-app-default-directory = デフォルトディレクトリ
+settings-app-default-directory-desc = 新規フォルダおよびフォルダなしダウンロードの基準保存先パス
 
 # Folder Settings Fields
 settings-folder-name = 名前

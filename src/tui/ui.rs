@@ -1135,6 +1135,9 @@ fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
                         app.state.t("settings-value-disabled")
                     }
                 }
+                ApplicationSettingsField::DefaultDirectory => {
+                    config.download.default_directory.display().to_string()
+                }
             };
 
             let restart_marker = if field.requires_restart() {

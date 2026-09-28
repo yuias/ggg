@@ -24,6 +24,8 @@ settings-app-user-agent = User Agent
 settings-app-user-agent-desc = Default User-Agent header for HTTP requests
 settings-app-referrer-policy = Referrer Policy
 settings-app-referrer-policy-desc = Default Referrer header policy for downloads
+settings-app-default-directory = Default Directory
+settings-app-default-directory-desc = Base save path for new folders and folder-less downloads
 
 # Folder Settings Fields
 settings-folder-name = Name

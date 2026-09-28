@@ -17,6 +17,7 @@ pub(crate) fn localize_command_error(state: &TuiState, err: &CommandError) -> St
         CommandError::ScriptsDisabled => state.t("cmd-error-scripts-disabled"),
         CommandError::ReloadActiveDownloads => state.t("cmd-error-reload-active-downloads"),
         CommandError::EmptyFolderName => state.t("cmd-error-empty-folder-name"),
+        CommandError::EmptyDefaultDirectory => state.t("cmd-error-empty-default-directory"),
         CommandError::DuplicateFolderName { name } => state.t_with_args(
             "cmd-error-duplicate-folder-name",
             Some(&fluent_args!["name" => name.clone()]),

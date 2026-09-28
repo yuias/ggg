@@ -28,6 +28,7 @@ pub enum Command {
     UpdateLanguage { value: String },
     UpdateUserAgent { value: String },
     UpdateReferrerPolicy { policy: ReferrerPolicy },
+    UpdateDefaultDirectory { value: std::path::PathBuf },
 
     // Folder-level settings
     UpdateFolderName { folder_id: String, value: String },
@@ -71,6 +72,9 @@ pub enum CommandError {
     ReloadActiveDownloads,
     /// A folder name edit resolved to an empty (or whitespace-only) value.
     EmptyFolderName,
+    /// A default download directory edit resolved to an empty (or
+    /// whitespace-only) value.
+    EmptyDefaultDirectory,
     /// A folder name edit collided with another folder's display name.
     DuplicateFolderName { name: String },
     /// An attempt to rename the protected default folder.
@@ -100,6 +104,9 @@ impl std::fmt::Display for CommandError {
                 write!(f, "Cannot reload configuration while downloads are active")
             }
             CommandError::EmptyFolderName => write!(f, "Folder name cannot be empty"),
+            CommandError::EmptyDefaultDirectory => {
+                write!(f, "Default download directory cannot be empty")
+            }
             CommandError::DuplicateFolderName { name } => {
                 write!(f, "A folder named '{name}' already exists")
             }
@@ -421,6 +428,24 @@ pub async fn handle_command(
             .await
             {
                 Ok(()) => CommandResponse::ok(),
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
+        Command::UpdateDefaultDirectory { value } => {
+            if value.to_string_lossy().trim().is_empty() {
+                return CommandResponse::Error(CommandError::EmptyDefaultDirectory);
+            }
+
+            match commit_config_edit(&state, |config| {
+                config.download.default_directory = value.clone();
+                Ok(())
+            })
+            .await
+            {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "value": value}),
+                },
                 Err(e) => CommandResponse::Error(e),
             }
         }
@@ -1047,5 +1072,52 @@ mod tests {
         unsafe { std::env::remove_var("GGG_TEST_MODE") };
 
         assert_eq!(reloaded.folders.get(&folder_id).map(|f| f.name.clone()), Some("Renamed".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_default_directory_persists_to_disk() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        let state = state_with(Config::default());
+
+        let new_dir = std::path::PathBuf::from("custom_default_downloads");
+        let response = handle_command(
+            Command::UpdateDefaultDirectory { value: new_dir.clone() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(response, CommandResponse::Success { .. }), "response: {response:?}");
+
+        let reloaded = Config::load().expect("reloaded config");
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert_eq!(reloaded.download.default_directory, new_dir);
+    }
+
+    #[tokio::test]
+    async fn update_default_directory_rejects_empty() {
+        let mut config = Config::default();
+        config.download.default_directory = std::path::PathBuf::from("original");
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::UpdateDefaultDirectory { value: std::path::PathBuf::new() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+
+        match response {
+            CommandResponse::Error(CommandError::EmptyDefaultDirectory) => {}
+            other => panic!("expected EmptyDefaultDirectory, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert_eq!(config.download.default_directory, std::path::PathBuf::from("original"));
     }
 }

@@ -2662,6 +2662,9 @@ impl TuiApp {
             ApplicationSettingsField::Language => {
                 config.general.language.clone()
             }
+            ApplicationSettingsField::DefaultDirectory => {
+                config.download.default_directory.display().to_string()
+            }
             ApplicationSettingsField::ScriptsEnabled | ApplicationSettingsField::SkipDownloadPreview | ApplicationSettingsField::AutoLaunchDnd | ApplicationSettingsField::ReferrerPolicy => {
                 // These are handled above as toggles/cycles
                 unreachable!()
@@ -2779,6 +2782,9 @@ impl TuiApp {
                     return Ok(());
                 }
                 Command::UpdateLanguage { value }
+            }
+            ApplicationSettingsField::DefaultDirectory => {
+                Command::UpdateDefaultDirectory { value: std::path::PathBuf::from(value_str) }
             }
         };
 

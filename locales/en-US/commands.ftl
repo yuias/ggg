@@ -15,6 +15,7 @@ cmd-error-reload-scripts = Failed to reload scripts: { $error }
 cmd-error-reload-config = Failed to reload config: { $error }
 cmd-error-reload-active-downloads = Cannot reload config while downloads are active. Pause all downloads and try again.
 cmd-error-empty-folder-name = Folder name cannot be empty
+cmd-error-empty-default-directory = Default download directory cannot be empty
 cmd-error-duplicate-folder-name = A folder named '{ $name }' already exists
 cmd-error-default-folder-rename = Cannot rename the default folder
 cmd-error-script-send = Send error: { $error }

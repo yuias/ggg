@@ -15,6 +15,7 @@ cmd-error-reload-scripts = スクリプトの再読み込みに失敗: { $error 
 cmd-error-reload-config = 設定のリロードに失敗: { $error }
 cmd-error-reload-active-downloads = ダウンロード実行中は設定をリロードできない。全てのダウンロードを一時停止してから再試行すること。
 cmd-error-empty-folder-name = フォルダ名を空にすることはできない
+cmd-error-empty-default-directory = デフォルトのダウンロードディレクトリを空にすることはできない
 cmd-error-duplicate-folder-name = フォルダ '{ $name }' は既に存在する
 cmd-error-default-folder-rename = デフォルトフォルダの名前は変更できない
 cmd-error-script-send = 送信エラー: { $error }
