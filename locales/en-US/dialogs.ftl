@@ -34,6 +34,7 @@ prompt-value = Value:
 # Confirmation messages
 confirm-delete-single = Delete this download?
 confirm-delete-multiple = Delete {$count} downloads?
+confirm-delete-folder-config-note = This also removes its config directory.
 
 # Help text in dialogs
 help-edit-field = Enter: Edit value

@@ -334,7 +334,22 @@ impl Default for Config {
     }
 }
 
+/// Name that identifies the protected default folder. `Config::load` (below)
+/// recreates a folder with this name whenever none exists, so anything that
+/// needs to know whether a folder *is* the default folder (rename/delete
+/// guards) must check against this same value rather than inventing its own
+/// rule.
+pub const DEFAULT_FOLDER_NAME: &str = "default";
+
 impl Config {
+    /// Whether `folder_id` is the protected default folder, using the exact
+    /// rule `load` uses to decide whether to recreate one (see step 4 below).
+    pub fn is_default_folder(&self, folder_id: &str) -> bool {
+        self.folders
+            .get(folder_id)
+            .is_some_and(|f| f.name == DEFAULT_FOLDER_NAME)
+    }
+
     /// Look up folder display name by UUID key.
     /// Returns the folder's `name` field, or the key itself as fallback.
     pub fn folder_name(&self, folder_id: &str) -> String {
@@ -394,14 +409,14 @@ impl Config {
         let (mut folders, migrated) = Self::migrate_folder_keys(folders);
 
         // Step 4: Ensure a "default" folder exists (any folder named "default")
-        let has_default = folders.values().any(|f| f.name == "default");
+        let has_default = folders.values().any(|f| f.name == DEFAULT_FOLDER_NAME);
         if !has_default {
             tracing::info!("Creating default folder config");
             let default_id = Self::generate_folder_id();
             folders.insert(
                 default_id,
                 FolderConfig {
-                    name: "default".to_string(),
+                    name: DEFAULT_FOLDER_NAME.to_string(),
                     save_path: app_config.download.default_directory.clone(),
                     auto_date_directory: false,
                     auto_start_downloads: false,

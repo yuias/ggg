@@ -86,6 +86,16 @@ pub enum DetailsPosition {
     Hidden,
 }
 
+/// What the confirm-delete dialog will act on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DeleteTarget {
+    /// The selected download(s) in Normal mode (today's behavior).
+    #[default]
+    Downloads,
+    /// A folder in Settings, identified by its UUID key.
+    Folder(String),
+}
+
 /// Settings screen sections
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
@@ -510,6 +520,9 @@ pub struct TuiState {
     /// Settings screen: selected folder ID
     pub selected_folder_id: Option<String>,
 
+    /// What the confirm-delete dialog (`UiMode::ConfirmDelete`) will act on.
+    pub delete_target: DeleteTarget,
+
     /// Settings screen: currently editing field
     pub settings_edit_field: Option<SettingsField>,
 
@@ -654,6 +667,7 @@ impl TuiState {
             current_folder_id: "default".to_string(),
             folder_picker_index: 0,
             selected_folder_id: None,
+            delete_target: DeleteTarget::default(),
             settings_edit_field: None,
             settings_folder_index: 0,
             settings_field_index: 0,
@@ -1209,6 +1223,13 @@ impl TuiState {
     pub fn clear_dirty(&mut self) {
         self.needs_redraw = false;
     }
+
+    /// Reads the confirm-delete target and resets it to `Downloads`, so a
+    /// stale folder target never lingers into the next Normal-mode delete.
+    /// Called on both the confirm and the cancel path.
+    pub fn take_delete_target(&mut self) -> DeleteTarget {
+        std::mem::take(&mut self.delete_target)
+    }
 }
 
 #[cfg(test)]
@@ -1290,6 +1311,48 @@ mod settings_tests {
         let field_count = SettingsField::all().len();
         assert_eq!(SettingsField::row_count(0), field_count);
         assert_eq!(SettingsField::row_count(4), field_count + 4);
+    }
+}
+
+#[cfg(test)]
+mod delete_target_tests {
+    use super::*;
+    use crate::app::config::Config;
+    use crate::app::keybindings::KeybindingsConfig;
+
+    fn test_state() -> TuiState {
+        TuiState::new(AppState::new(Config::default()), &KeybindingsConfig::default(), "en")
+    }
+
+    #[test]
+    fn delete_target_defaults_to_downloads() {
+        let state = test_state();
+        assert_eq!(state.delete_target, DeleteTarget::Downloads);
+    }
+
+    #[test]
+    fn take_delete_target_resets_to_downloads_after_confirm() {
+        let mut state = test_state();
+        state.delete_target = DeleteTarget::Folder("folder-1".to_string());
+
+        let taken = state.take_delete_target();
+
+        assert_eq!(taken, DeleteTarget::Folder("folder-1".to_string()));
+        assert_eq!(state.delete_target, DeleteTarget::Downloads);
+    }
+
+    #[test]
+    fn take_delete_target_resets_to_downloads_after_cancel() {
+        let mut state = test_state();
+        state.delete_target = DeleteTarget::Folder("folder-2".to_string());
+
+        // Cancel reads the target the same way confirm does; both paths must
+        // leave the field reset for the next delete.
+        let _ = state.take_delete_target();
+        let taken_again = state.take_delete_target();
+
+        assert_eq!(taken_again, DeleteTarget::Downloads);
+        assert_eq!(state.delete_target, DeleteTarget::Downloads);
     }
 }
 

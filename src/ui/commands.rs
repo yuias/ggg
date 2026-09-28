@@ -73,6 +73,8 @@ pub enum CommandError {
     EmptyFolderName,
     /// A folder name edit collided with another folder's display name.
     DuplicateFolderName { name: String },
+    /// An attempt to rename the protected default folder.
+    DefaultFolderRename,
     StartDownload { error: String },
     PauseDownload { error: String },
     RemoveDownload { error: String },
@@ -100,6 +102,9 @@ impl std::fmt::Display for CommandError {
             CommandError::EmptyFolderName => write!(f, "Folder name cannot be empty"),
             CommandError::DuplicateFolderName { name } => {
                 write!(f, "A folder named '{name}' already exists")
+            }
+            CommandError::DefaultFolderRename => {
+                write!(f, "Cannot rename the default folder")
             }
             CommandError::StartDownload { error } => write!(f, "Failed to start download: {error}"),
             CommandError::PauseDownload { error } => write!(f, "Failed to pause download: {error}"),
@@ -427,6 +432,13 @@ pub async fn handle_command(
             }
 
             let result = commit_config_edit(&state, |config| {
+                // The default folder's name is what config load uses to find it
+                // (`Config::is_default_folder`); renaming it away would make load
+                // recreate a second folder named "default" on the next start.
+                if config.is_default_folder(&folder_id) {
+                    return Err(CommandError::DefaultFolderRename);
+                }
+
                 if config
                     .folders
                     .iter()
@@ -890,6 +902,30 @@ mod tests {
         }
         let config = state.config.read().await;
         assert_eq!(config.folders.get("folder-2").map(|f| f.name.clone()), Some("Movies".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_folder_name_rejects_renaming_default_folder() {
+        let mut config = Config::default();
+        config.folders.insert(
+            "folder-1".to_string(),
+            FolderConfig { name: "default".to_string(), ..FolderConfig::default() },
+        );
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::UpdateFolderName { folder_id: "folder-1".to_string(), value: "Renamed".to_string() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+
+        match response {
+            CommandResponse::Error(CommandError::DefaultFolderRename) => {}
+            other => panic!("expected DefaultFolderRename, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert_eq!(config.folders.get("folder-1").map(|f| f.name.clone()), Some("default".to_string()));
     }
 
     // Exercises the real `Config::save()`/load path, so it needs an isolated

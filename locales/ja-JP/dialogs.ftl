@@ -34,6 +34,7 @@ prompt-value = Value:
 # Confirmation messages
 confirm-delete-single = このダウンロードを削除しますか？
 confirm-delete-multiple = {$count}個のダウンロードを削除しますか？
+confirm-delete-folder-config-note = 設定ディレクトリも同時に削除される。
 
 # Help text in dialogs
 help-edit-field = Enter: Edit Value

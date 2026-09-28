@@ -2,7 +2,7 @@ use super::app::TuiApp;
 use super::format::{
     format_progress_bar, format_progress_with_bar, format_size, format_speed, truncate_filename,
 };
-use super::state::{DetailsPosition, FocusPane, FolderTreeItem, UiMode};
+use super::state::{DeleteTarget, DetailsPosition, FocusPane, FolderTreeItem, UiMode};
 use super::theme;
 use crate::download::task::{DownloadStatus, LogLevel};
 use crate::download::http_errors::HttpErrorInfo;
@@ -41,6 +41,12 @@ pub fn render(app: &TuiApp, f: &mut Frame) {
     match app.state.ui_mode {
         UiMode::Settings | UiMode::FolderEdit => render_settings(app, f, main_chunks[0]),
         UiMode::EditingField if app.state.is_editing_app_setting => render_settings(app, f, main_chunks[0]),
+        // A folder-delete confirmation was opened from Settings, so keep the
+        // Settings screen underneath the overlay instead of flashing the
+        // three-pane layout behind it.
+        UiMode::ConfirmDelete if matches!(app.state.delete_target, DeleteTarget::Folder(_)) => {
+            render_settings(app, f, main_chunks[0])
+        }
         _ if is_main_screen => render_three_pane_layout(app, f, main_chunks[0]),
         _ => render_three_pane_layout(app, f, main_chunks[0]),
     }
@@ -2013,8 +2019,15 @@ fn render_change_save_path_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
 
 /// Render confirm delete dialog (centered overlay)
 fn render_confirm_delete_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
+    let folder_target = match &app.state.delete_target {
+        DeleteTarget::Folder(folder_id) => Some(folder_id),
+        DeleteTarget::Downloads => None,
+    };
+
+    // The folder branch adds one extra line (the config-directory note), so
+    // its dialog is one row taller than the download branch's.
     let dialog_width = 60;
-    let dialog_height = 9;
+    let dialog_height = if folder_target.is_some() { 10 } else { 9 };
 
     let dialog_area = Rect {
         x: (area.width.saturating_sub(dialog_width)) / 2,
@@ -2023,23 +2036,51 @@ fn render_confirm_delete_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
         height: dialog_height,
     };
 
-    // Get filename of selected download
-    let filename = app
-        .state
-        .get_selected_download()
-        .map(|task| truncate_filename(&task.filename, 50))
-        .unwrap_or_else(|| "Unknown".to_string());
+    let mut lines = if let Some(folder_id) = folder_target {
+        let folder_name = app
+            .state
+            .folder_names
+            .get(folder_id)
+            .cloned()
+            .unwrap_or_else(|| folder_id.clone());
 
-    let lines = vec![
-        Line::from(Span::styled(
-            "Are you sure you want to delete this download?",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("File: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(&filename),
-        ]),
+        vec![
+            Line::from(Span::styled(
+                "Are you sure you want to delete this folder?",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Folder: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(folder_name),
+            ]),
+            Line::from(Span::styled(
+                app.state.t("confirm-delete-folder-config-note"),
+                Style::default().fg(Color::Red),
+            )),
+        ]
+    } else {
+        // Get filename of selected download
+        let filename = app
+            .state
+            .get_selected_download()
+            .map(|task| truncate_filename(&task.filename, 50))
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        vec![
+            Line::from(Span::styled(
+                "Are you sure you want to delete this download?",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("File: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(filename),
+            ]),
+        ]
+    };
+
+    lines.extend([
         Line::from(""),
         Line::from(Span::styled(
             "Press Y to confirm, N or Esc to cancel",
@@ -2051,7 +2092,7 @@ fn render_confirm_delete_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
             Span::raw("       "),
             Span::styled("[ No (N) ]      ", Style::default().fg(Color::Red)),
         ]),
-    ];
+    ]);
 
     let paragraph = Paragraph::new(lines)
         .block(

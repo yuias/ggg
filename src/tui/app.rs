@@ -1,5 +1,5 @@
 use super::events::TuiEvent;
-use super::state::{DetailsPosition, FocusPane, TuiState, UiMode};
+use super::state::{DeleteTarget, DetailsPosition, FocusPane, TuiState, UiMode};
 use crate::app::keybindings::KeyAction;
 use crate::app::state::AppState;
 use crate::download::enqueue::{enqueue, EnqueueOutcome};
@@ -424,10 +424,20 @@ impl TuiApp {
             if Self::point_in_rect(x, y, rect) {
                 let label = label.clone();
                 drop(regions);
-                if label == "yes" {
-                    self.delete_download().await?;
+                match self.state.take_delete_target() {
+                    DeleteTarget::Downloads => {
+                        if label == "yes" {
+                            self.delete_download().await?;
+                        }
+                        self.state.ui_mode = UiMode::Normal;
+                    }
+                    DeleteTarget::Folder(folder_id) => {
+                        if label == "yes" {
+                            self.delete_selected_folder(&folder_id).await?;
+                        }
+                        self.state.ui_mode = UiMode::Settings;
+                    }
                 }
-                self.state.ui_mode = UiMode::Normal;
                 return Ok(());
             }
         }
@@ -1211,9 +1221,19 @@ impl TuiApp {
                         self.create_new_folder().await?;
                     }
 
-                    // Delete selected folder
+                    // Ask for confirmation before deleting a folder (the default
+                    // folder is refused here so it never reaches the dialog).
                     KeyCode::Char('d') => {
-                        self.delete_selected_folder().await?;
+                        if let Some(ref folder_id) = self.state.selected_folder_id {
+                            let is_default = {
+                                let config = self.state.app_state.config.read().await;
+                                config.is_default_folder(folder_id)
+                            };
+                            if !is_default {
+                                self.state.delete_target = DeleteTarget::Folder(folder_id.clone());
+                                self.state.ui_mode = UiMode::ConfirmDelete;
+                            }
+                        }
                     }
 
                     // Enter folder edit mode
@@ -1959,13 +1979,23 @@ impl TuiApp {
     async fn handle_confirm_delete_mode(&mut self, key: KeyCode) -> Result<()> {
         match key {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                // Confirm - delete the download
-                self.delete_download().await?;
-                self.state.ui_mode = UiMode::Normal;
+                match self.state.take_delete_target() {
+                    DeleteTarget::Downloads => {
+                        self.delete_download().await?;
+                        self.state.ui_mode = UiMode::Normal;
+                    }
+                    DeleteTarget::Folder(folder_id) => {
+                        self.delete_selected_folder(&folder_id).await?;
+                        self.state.ui_mode = UiMode::Settings;
+                    }
+                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                // Cancel - return to normal mode
-                self.state.ui_mode = UiMode::Normal;
+                // Cancel - return to whichever screen the dialog was opened from
+                self.state.ui_mode = match self.state.take_delete_target() {
+                    DeleteTarget::Downloads => UiMode::Normal,
+                    DeleteTarget::Folder(_) => UiMode::Settings,
+                };
             }
             _ => {}
         }
@@ -2436,47 +2466,51 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Delete selected folder in settings
-    async fn delete_selected_folder(&mut self) -> Result<()> {
-        if let Some(ref folder_id) = self.state.selected_folder_id {
-            // Don't allow deleting the "default" folder (check by display name)
-            let is_default = {
-                let config = self.state.app_state.config.read().await;
-                config.folder_name(folder_id) == "default"
-            };
-            if is_default {
-                tracing::warn!("Cannot delete the default folder");
-                return Ok(());
-            }
+    /// Delete a folder confirmed via `UiMode::ConfirmDelete`.
+    ///
+    /// `folder_id` comes from the `DeleteTarget::Folder` captured when the
+    /// dialog was opened, not `self.state.selected_folder_id` directly, since
+    /// the caller (the confirm dialog's Yes handler) already took ownership
+    /// of the target via `take_delete_target`.
+    async fn delete_selected_folder(&mut self, folder_id: &str) -> Result<()> {
+        // Defense in depth: the same guard already ran before the dialog
+        // opened (Settings' `d` key), using the rule shared with `Config::load`.
+        let is_default = {
+            let config = self.state.app_state.config.read().await;
+            config.is_default_folder(folder_id)
+        };
+        if is_default {
+            tracing::warn!("Cannot delete the default folder");
+            return Ok(());
+        }
 
-            let folder_id_owned = folder_id.clone();
+        let mut config = self.state.app_state.config.write().await;
+        config.folders.remove(folder_id);
 
-            let mut config = self.state.app_state.config.write().await;
-            config.folders.remove(&folder_id_owned);
+        // Save config to persist the removal
+        if let Err(e) = config.save() {
+            tracing::error!("Failed to save config after folder deletion: {}", e);
+        }
+        drop(config);
 
-            // Save config to persist the removal
-            if let Err(e) = config.save() {
-                tracing::error!("Failed to save config after folder deletion: {}", e);
-            }
-            drop(config);
-
-            // Delete folder config directory from filesystem
-            if let Ok(config_dir) = crate::util::paths::find_config_directory() {
-                let folder_dir = config_dir.join(&folder_id_owned);
-                if folder_dir.exists() && folder_dir.is_dir() {
-                    if let Err(e) = std::fs::remove_dir_all(&folder_dir) {
-                        tracing::error!("Failed to delete folder directory {:?}: {}", folder_dir, e);
-                    } else {
-                        tracing::info!("Deleted folder config directory: {:?}", folder_dir);
-                    }
+        // Delete folder config directory from filesystem
+        if let Ok(config_dir) = crate::util::paths::find_config_directory() {
+            let folder_dir = config_dir.join(folder_id);
+            if folder_dir.exists() && folder_dir.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(&folder_dir) {
+                    tracing::error!("Failed to delete folder directory {:?}: {}", folder_dir, e);
+                } else {
+                    tracing::info!("Deleted folder config directory: {:?}", folder_dir);
                 }
             }
+        }
 
-            // Clear selection
+        // Clear selection
+        if self.state.selected_folder_id.as_deref() == Some(folder_id) {
             self.state.selected_folder_id = None;
-            if self.state.settings_folder_index > 0 {
-                self.state.settings_folder_index -= 1;
-            }
+        }
+        if self.state.settings_folder_index > 0 {
+            self.state.settings_folder_index -= 1;
         }
         Ok(())
     }

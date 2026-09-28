@@ -21,6 +21,7 @@ pub(crate) fn localize_command_error(state: &TuiState, err: &CommandError) -> St
             "cmd-error-duplicate-folder-name",
             Some(&fluent_args!["name" => name.clone()]),
         ),
+        CommandError::DefaultFolderRename => state.t("cmd-error-default-folder-rename"),
         CommandError::StartDownload { error } => state.t_with_args(
             "cmd-error-start-download",
             Some(&fluent_args!["error" => error.clone()]),
