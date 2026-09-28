@@ -50,6 +50,12 @@ pub enum KeyAction {
     Quit,
     Undo,
     Refresh,
+
+    // Variant names are the config keys on disk; never rename or remove one.
+    Back,
+    ConfirmYes,
+    ConfirmNo,
+    ReloadConfig,
 }
 
 impl KeyAction {
@@ -87,8 +93,84 @@ impl KeyAction {
             KeyAction::Quit,
             KeyAction::Undo,
             KeyAction::Refresh,
+            KeyAction::Back,
+            KeyAction::ConfirmYes,
+            KeyAction::ConfirmNo,
+            KeyAction::ReloadConfig,
         ]
     }
+
+    /// Contexts in which this action is resolved by [`KeybindingResolver::resolve_in`].
+    ///
+    /// Exhaustive on purpose: adding a variant forces a decision about where it applies
+    /// rather than silently falling into a wildcard arm.
+    pub fn contexts(self) -> &'static [KeyContext] {
+        use KeyContext::*;
+        match self {
+            KeyAction::MoveUp | KeyAction::MoveDown => {
+                &[Normal, Settings, Menu, Dialog, Help]
+            }
+            KeyAction::MoveToTop
+            | KeyAction::MoveToBottom
+            | KeyAction::PageUp
+            | KeyAction::PageDown => &[Normal, Settings, Dialog],
+            KeyAction::FocusNextPane
+            | KeyAction::FocusPrevPane
+            | KeyAction::FocusLeft
+            | KeyAction::FocusRight => &[Normal, Settings],
+            KeyAction::SelectItem => &[Normal, Settings, Menu, Dialog],
+            KeyAction::ToggleSelection => &[Normal, Settings],
+            KeyAction::AddDownload => &[Normal, Settings],
+            KeyAction::DeleteDownload => &[Normal, Settings, Menu],
+            KeyAction::ToggleDownload | KeyAction::RetryDownload | KeyAction::EditItem => {
+                &[Normal, Menu]
+            }
+            KeyAction::OpenHelp => &[Normal, Help],
+            KeyAction::OpenSettings => &[Normal, Settings],
+            KeyAction::Back => &[Settings, Menu, Dialog, Help],
+            KeyAction::ConfirmYes | KeyAction::ConfirmNo => &[Dialog],
+            KeyAction::ReloadConfig => &[Settings],
+            KeyAction::SelectAll
+            | KeyAction::DeselectAll
+            | KeyAction::ResumeAll
+            | KeyAction::PauseAll
+            | KeyAction::OpenContextMenu
+            | KeyAction::ToggleDetails
+            | KeyAction::CycleDetailsPosition
+            | KeyAction::OpenSearch
+            | KeyAction::SwitchFolder
+            | KeyAction::Quit
+            | KeyAction::Undo
+            | KeyAction::Refresh => &[Normal],
+        }
+    }
+}
+
+/// Screen or overlay a key press is resolved against. Each non-text-input mode picks the
+/// context matching its role so one physical key can mean different things (or nothing) in
+/// different places without the actions themselves being context-specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyContext {
+    /// Three-pane main screen.
+    Normal,
+    /// Settings tabs and the folder editor (non-text state).
+    Settings,
+    /// ContextMenu, FolderContextMenu.
+    Menu,
+    /// ChangeFolder, SwitchFolder, ConfirmDelete, DownloadPreview.
+    Dialog,
+    /// Help screen.
+    Help,
+}
+
+impl KeyContext {
+    pub const ALL: [KeyContext; 5] = [
+        KeyContext::Normal,
+        KeyContext::Settings,
+        KeyContext::Menu,
+        KeyContext::Dialog,
+        KeyContext::Help,
+    ];
 }
 
 /// A key binding specification (serializable format)
@@ -202,8 +284,33 @@ fn parse_key_code(s: &str) -> Option<KeyCode> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeybindingsConfig {
-    #[serde(flatten)]
+    #[serde(flatten, deserialize_with = "deserialize_known_bindings")]
     pub bindings: HashMap<KeyAction, KeyBindingSpec>,
+}
+
+/// Drops entries whose action name this build does not know (renamed,
+/// removed, or from a newer build) instead of failing the whole settings
+/// file; the resolver fills missing actions with defaults.
+fn deserialize_known_bindings<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<KeyAction, KeyBindingSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::IntoDeserializer;
+    let raw: HashMap<String, KeyBindingSpec> = HashMap::deserialize(deserializer)?;
+    let mut bindings = HashMap::new();
+    for (name, spec) in raw {
+        let action: Result<KeyAction, serde::de::value::Error> =
+            KeyAction::deserialize(name.as_str().into_deserializer());
+        match action {
+            Ok(action) => {
+                bindings.insert(action, spec);
+            }
+            Err(_) => tracing::warn!("Ignoring unknown keybinding action '{}'", name),
+        }
+    }
+    Ok(bindings)
 }
 
 impl Default for KeybindingsConfig {
@@ -281,6 +388,15 @@ impl Default for KeybindingsConfig {
         bindings.insert(KeyAction::Undo, KeyBindingSpec::Single("Ctrl+z".into()));
         bindings.insert(KeyAction::Refresh, KeyBindingSpec::Single("R".into()));
 
+        // Cross-context actions (Settings/Menu/Dialog/Help)
+        bindings.insert(
+            KeyAction::Back,
+            KeyBindingSpec::Multiple(vec!["Escape".into(), "q".into()]),
+        );
+        bindings.insert(KeyAction::ConfirmYes, KeyBindingSpec::Single("y".into()));
+        bindings.insert(KeyAction::ConfirmNo, KeyBindingSpec::Single("n".into()));
+        bindings.insert(KeyAction::ReloadConfig, KeyBindingSpec::Single("R".into()));
+
         Self { bindings }
     }
 }
@@ -288,19 +404,31 @@ impl Default for KeybindingsConfig {
 /// Runtime keybinding resolver
 #[derive(Debug, Clone)]
 pub struct KeybindingResolver {
-    /// Maps key combinations to actions
-    action_map: HashMap<KeyCombo, KeyAction>,
+    /// Maps (context, key combination) to the action resolved in that context.
+    action_map: HashMap<(KeyContext, KeyCombo), KeyAction>,
+    /// Configured key strings per action, kept verbatim (not reverse-formatted from
+    /// `KeyCombo`) for display in help text and status-bar hints.
+    display: HashMap<KeyAction, Vec<String>>,
 }
 
 impl KeybindingResolver {
-    /// Create a new resolver from configuration
+    /// Create a new resolver from configuration.
+    ///
+    /// Missing actions are filled from `KeybindingsConfig::default()` so a partial
+    /// user `[keybindings]` table still leaves every action bound to something.
+    /// An action present in `config.bindings` replaces its whole default spec (all
+    /// of that action's default keys are dropped, not merged key-by-key).
     pub fn from_config(config: &KeybindingsConfig) -> Self {
-        let mut action_map: HashMap<KeyCombo, KeyAction> = HashMap::new();
+        let mut merged = KeybindingsConfig::default().bindings;
+        merged.extend(config.bindings.iter().map(|(action, spec)| (*action, spec.clone())));
+
+        let mut action_map: HashMap<(KeyContext, KeyCombo), KeyAction> = HashMap::new();
+        let mut display: HashMap<KeyAction, Vec<String>> = HashMap::new();
 
         // Iterate in a stable order (by action name) so that when two actions
-        // claim the same combo, the winner is deterministic across runs rather
-        // than dependent on HashMap iteration order.
-        let mut entries: Vec<(&KeyAction, &KeyBindingSpec)> = config.bindings.iter().collect();
+        // claim the same combo in the same context, the winner is deterministic
+        // across runs rather than dependent on HashMap iteration order.
+        let mut entries: Vec<(&KeyAction, &KeyBindingSpec)> = merged.iter().collect();
         entries.sort_by_key(|(action, _)| format!("{:?}", action));
 
         for (action, spec) in entries {
@@ -309,32 +437,54 @@ impl KeybindingResolver {
                 KeyBindingSpec::Multiple(v) => v.clone(),
             };
 
+            display.insert(*action, keys.clone());
+
             for key_str in keys {
                 if let Some(combo) = KeyCombo::parse(&key_str) {
-                    if let Some(existing) = action_map.get(&combo) {
-                        if existing != action {
-                            tracing::warn!(
-                                "Keybinding conflict: '{}' is bound to both {:?} and {:?}; keeping {:?}",
-                                key_str, existing, action, existing
-                            );
+                    for &ctx in action.contexts() {
+                        if let Some(existing) = action_map.get(&(ctx, combo.clone())) {
+                            if existing != action {
+                                tracing::warn!(
+                                    "Keybinding conflict in {:?} context: '{}' is bound to both {:?} and {:?}; keeping {:?}",
+                                    ctx, key_str, existing, action, existing
+                                );
+                            }
+                            continue; // first (stable) binding wins
                         }
-                        continue; // first (stable) binding wins
+                        action_map.insert((ctx, combo.clone()), *action);
                     }
-                    action_map.insert(combo, *action);
                 }
             }
         }
 
-        Self { action_map }
+        Self { action_map, display }
     }
 
-    /// Resolve a key event to an action
+    /// Resolve a key event to an action in the `Normal` context.
     pub fn resolve(&self, code: KeyCode, modifiers: KeyModifiers) -> Option<KeyAction> {
+        self.resolve_in(KeyContext::Normal, code, modifiers)
+    }
+
+    /// Resolve a key event to an action within a specific context.
+    pub fn resolve_in(
+        &self,
+        ctx: KeyContext,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Option<KeyAction> {
         // Normalize shift modifier for uppercase characters
         let (code, modifiers) = normalize_key_event(code, modifiers);
 
         let combo = KeyCombo::new(code, modifiers);
-        self.action_map.get(&combo).copied()
+        self.action_map.get(&(ctx, combo)).copied()
+    }
+
+    /// Configured key strings for an action, e.g. `["j", "Down"]`. Empty if unbound.
+    pub fn keys_for(&self, action: KeyAction) -> &[String] {
+        self.display
+            .get(&action)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -360,6 +510,19 @@ impl Default for KeybindingResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_action_names_are_ignored() {
+        let config: KeybindingsConfig =
+            toml::from_str("move_down = \"x\"
+no_such_action = \"z\"
+").unwrap();
+        assert_eq!(config.bindings.len(), 1);
+        assert_eq!(
+            config.bindings.get(&KeyAction::MoveDown),
+            Some(&KeyBindingSpec::Single("x".into()))
+        );
+    }
 
     #[test]
     fn test_parse_single_char() {
@@ -446,5 +609,126 @@ mod tests {
             resolver.resolve(KeyCode::Char('S'), KeyModifiers::empty()),
             Some(KeyAction::ResumeAll)
         );
+    }
+
+    #[test]
+    fn test_resolve_in_context_same_key_different_action() {
+        let resolver = KeybindingResolver::default();
+
+        // 's' is ToggleDownload in both Normal and Menu, but unbound in Settings
+        // (Settings has no local meaning for it in the design; it must not leak in).
+        assert_eq!(
+            resolver.resolve_in(KeyContext::Normal, KeyCode::Char('s'), KeyModifiers::empty()),
+            Some(KeyAction::ToggleDownload)
+        );
+        assert_eq!(
+            resolver.resolve_in(KeyContext::Menu, KeyCode::Char('s'), KeyModifiers::empty()),
+            Some(KeyAction::ToggleDownload)
+        );
+        assert_eq!(
+            resolver.resolve_in(KeyContext::Settings, KeyCode::Char('s'), KeyModifiers::empty()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_esc_resolves_to_deselect_in_normal_and_back_in_dialog() {
+        let resolver = KeybindingResolver::default();
+
+        assert_eq!(
+            resolver.resolve_in(KeyContext::Normal, KeyCode::Esc, KeyModifiers::empty()),
+            Some(KeyAction::DeselectAll)
+        );
+        assert_eq!(
+            resolver.resolve_in(KeyContext::Dialog, KeyCode::Esc, KeyModifiers::empty()),
+            Some(KeyAction::Back)
+        );
+    }
+
+    #[test]
+    fn test_partial_user_config_still_resolves_defaults() {
+        let mut bindings = HashMap::new();
+        bindings.insert(KeyAction::Quit, KeyBindingSpec::Single("q".into()));
+        let config = KeybindingsConfig { bindings };
+        let resolver = KeybindingResolver::from_config(&config);
+
+        assert_eq!(
+            resolver.resolve_in(KeyContext::Normal, KeyCode::Char('j'), KeyModifiers::empty()),
+            Some(KeyAction::MoveDown)
+        );
+        assert_eq!(
+            resolver.resolve_in(KeyContext::Dialog, KeyCode::Esc, KeyModifiers::empty()),
+            Some(KeyAction::Back)
+        );
+
+        // The user's entry replaces the whole default spec for that action, so
+        // "Ctrl+c" (the other default Quit key) is dropped, not merged in.
+        assert_eq!(resolver.keys_for(KeyAction::Quit), &["q".to_string()]);
+        assert_eq!(
+            resolver.resolve_in(KeyContext::Normal, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            None
+        );
+    }
+
+    #[test]
+    fn test_keys_for_returns_configured_strings() {
+        let resolver = KeybindingResolver::default();
+        assert_eq!(
+            resolver.keys_for(KeyAction::MoveDown),
+            &["j".to_string(), "Down".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_no_conflicts_within_any_context_in_defaults() {
+        let config = KeybindingsConfig::default();
+
+        for &ctx in KeyContext::ALL.iter() {
+            let mut seen: HashMap<KeyCombo, KeyAction> = HashMap::new();
+            for action in KeyAction::all() {
+                let spec = config
+                    .bindings
+                    .get(&action)
+                    .unwrap_or_else(|| panic!("{:?} has no default binding", action));
+                let keys = match spec {
+                    KeyBindingSpec::Single(s) => vec![s.clone()],
+                    KeyBindingSpec::Multiple(v) => v.clone(),
+                };
+                if !action.contexts().contains(&ctx) {
+                    continue;
+                }
+                for key_str in keys {
+                    let combo = KeyCombo::parse(&key_str)
+                        .unwrap_or_else(|| panic!("default key '{}' failed to parse", key_str));
+                    if let Some(existing) = seen.insert(combo, action) {
+                        assert_eq!(
+                            existing, action,
+                            "conflict in {:?} context: '{}' bound to both {:?} and {:?}",
+                            ctx, key_str, existing, action
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_keybindings_config_serde_round_trip() {
+        let original = KeybindingsConfig::default();
+        let toml_str = toml::to_string(&original).expect("serialize");
+        let restored: KeybindingsConfig = toml::from_str(&toml_str).expect("deserialize");
+
+        let mut original_keys: Vec<_> = original.bindings.keys().copied().collect();
+        let mut restored_keys: Vec<_> = restored.bindings.keys().copied().collect();
+        original_keys.sort_by_key(|a| format!("{:?}", a));
+        restored_keys.sort_by_key(|a| format!("{:?}", a));
+        assert_eq!(original_keys, restored_keys);
+
+        for action in original_keys {
+            assert_eq!(
+                original.bindings.get(&action),
+                restored.bindings.get(&action)
+            );
+        }
     }
 }

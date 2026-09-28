@@ -831,6 +831,16 @@ impl TuiApp {
                     // Refresh - already happens on tick
                     return Ok(());
                 }
+
+                // Resolved only in Settings/Menu/Dialog/Help contexts; `resolve()`
+                // (Normal context) never yields these, but the match must stay
+                // exhaustive so new actions cannot be forgotten in other handlers.
+                KeyAction::Back
+                | KeyAction::ConfirmYes
+                | KeyAction::ConfirmNo
+                | KeyAction::ReloadConfig => {
+                    return Ok(());
+                }
             }
         }
 
