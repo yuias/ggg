@@ -107,6 +107,12 @@ pub fn script_executor_loop(
 
                 let _ = response.send(result);
             }
+
+            ScriptRequest::Flush { response } => {
+                // The channel is FIFO, so replying here means every request
+                // queued before this one has already been processed.
+                let _ = response.send(());
+            }
         }
 
         script_manager.pump_v8_tasks();
@@ -188,5 +194,31 @@ mod tests {
         let (ctx, result) = response_rx.recv().unwrap();
         assert!(result.is_ok());
         assert_eq!(ctx.url, "https://example.com");
+    }
+
+    #[test]
+    fn executor_answers_flush() {
+        let (tx, rx) = mpsc::channel();
+        let config = ScriptConfig {
+            enabled: true,
+            directory: PathBuf::from("./nonexistent_flush_test_dir"),
+            timeout: 30,
+            script_files: HashMap::new(),
+        };
+
+        std::thread::spawn(move || {
+            let script_manager = ScriptManager::new(&config).unwrap();
+            script_executor_loop(rx, script_manager);
+        });
+
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        tx.send(ScriptRequest::Flush {
+            response: response_tx,
+        })
+        .unwrap();
+
+        response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("flush should be answered");
     }
 }

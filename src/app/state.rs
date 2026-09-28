@@ -3,6 +3,7 @@ use crate::script::{executor, message::ScriptRequest};
 use crate::util::i18n::LocalizationManager;
 use anyhow::Result;
 use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 #[derive(Clone)]
@@ -154,6 +155,32 @@ impl AppState {
             Err(anyhow::anyhow!("Scripts are not enabled"))
         }
     }
+
+    /// Wait for every script request queued before this call to finish
+    /// processing.
+    ///
+    /// Returns immediately when scripts are disabled (no executor thread).
+    /// On timeout, logs a warning and returns without waiting further.
+    pub async fn flush_scripts(&self, timeout: Duration) {
+        let Some(sender) = self.script_sender.clone() else {
+            return;
+        };
+
+        let flushed = tokio::task::spawn_blocking(move || {
+            let (response_tx, response_rx) = mpsc::channel();
+            if sender.send(ScriptRequest::Flush { response: response_tx }).is_err() {
+                // Executor thread is gone; nothing to wait for.
+                return true;
+            }
+            response_rx.recv_timeout(timeout).is_ok()
+        })
+        .await
+        .unwrap_or(false);
+
+        if !flushed {
+            tracing::warn!("Timed out waiting for script executor to flush");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +192,15 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AppState>();
         assert_send_sync::<LocalizationManager>();
+    }
+
+    #[tokio::test]
+    async fn flush_scripts_without_executor_returns_immediately() {
+        let state = AppState::new(Config::default(), "en");
+        assert!(state.script_sender.is_none());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        state.flush_scripts(Duration::from_secs(5)).await;
+        assert!(std::time::Instant::now() < deadline);
     }
 }

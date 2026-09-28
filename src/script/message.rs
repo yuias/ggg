@@ -70,6 +70,13 @@ pub enum ScriptRequest {
     Reload {
         response: mpsc::Sender<ScriptResult<()>>,
     },
+
+    /// Barrier: the executor replies once every request queued before this
+    /// one has been processed. Used to wait for fire-and-forget hooks (e.g.
+    /// the error hook) without adding a response channel to each of them.
+    Flush {
+        response: mpsc::Sender<()>,
+    },
 }
 
 impl ScriptRequest {
@@ -86,6 +93,7 @@ impl ScriptRequest {
             Self::Progress { .. } => "Progress",
             Self::AuthRequired { .. } => "AuthRequired",
             Self::Reload { .. } => "Reload",
+            Self::Flush { .. } => "Flush",
         }
     }
 }

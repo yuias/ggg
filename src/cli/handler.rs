@@ -267,6 +267,13 @@ async fn handle_start(
         if let Err(e) = manager.save_queue_to_folders().await {
             tracing::error!("Failed to save queue after wait: {e}");
         }
+        let scripts_timeout = state.config.read().await.scripts.timeout;
+        state
+            .flush_scripts(
+                tokio::time::Duration::from_secs(scripts_timeout)
+                    .saturating_add(tokio::time::Duration::from_secs(5)),
+            )
+            .await;
         remote::render_waited(outcome, task, false);
         return Ok(remote::exit_code_for_wait(outcome));
     }
