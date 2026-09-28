@@ -42,6 +42,31 @@ cargo run
 
 For a complete keybindings reference, see the [KeyBindings Guide](docs/KeyBindings.md) or press `?` in the TUI for the help screen.
 
+### URL Range Expansion
+
+A URL containing a numeric range `[start-end]` is expanded into one download
+per number when it is added (TUI add dialog, `ggg add`, and each line of
+`ggg batch-add`):
+
+```bash
+ggg add "https://example.com/img[9-11].jpg"
+# -> img9.jpg, img10.jpg, img11.jpg
+
+ggg add "https://example.com/img[009-011].jpg"
+# -> img009.jpg, img010.jpg, img011.jpg (a leading zero keeps the width)
+```
+
+- Only the first `[start-end]` in a URL is expanded.
+- A range whose end is below its start, or that would produce more than
+  1000 URLs, adds nothing.
+- When the brackets are part of the real URL, pass `--no-expand` to `add` or
+  `batch-add` to take each URL literally:
+
+```bash
+ggg add --no-expand "https://example.com/archive[1-2].zip"
+ggg batch-add --no-expand urls.txt
+```
+
 ### Chrome Extension (Add to ggg)
 
 A Chrome extension can push URLs into ggg from the browser's context menu.
