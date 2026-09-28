@@ -1,4 +1,5 @@
 use super::events::TuiEvent;
+use super::item_editor;
 use super::state::{DeleteTarget, DetailsPosition, FocusPane, TuiState, UiMode};
 use crate::app::keybindings::{KeyAction, KeyContext};
 use crate::app::state::AppState;
@@ -161,6 +162,7 @@ impl TuiApp {
                     UiMode::FolderEdit => self.handle_folder_edit_mode(code, modifiers).await?,
                     UiMode::ChangeFolder => self.handle_change_folder_for_item_mode(code, modifiers).await?,
                     UiMode::ChangeSavePath => self.handle_change_save_path_mode(code, modifiers).await?,
+                    UiMode::ItemEdit => self.handle_item_edit_mode(code, modifiers).await?,
                     UiMode::SwitchFolder => self.handle_switch_folder_mode(code, modifiers).await?,
                     UiMode::ConfirmDelete => self.handle_confirm_delete_mode(code, modifiers).await?,
                     UiMode::ContextMenu => self.handle_context_menu_mode(code, modifiers).await?,
@@ -210,16 +212,18 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Append text into the input buffer, respecting the length cap.
-    /// Shared by bracketed-paste, Ctrl+v, and right-click paste.
+    /// Append text into the focused input field (see `active_input_mut`),
+    /// respecting the length cap. Shared by bracketed-paste, Ctrl+v, and
+    /// right-click paste.
     fn insert_input_text(&mut self, text: &str) {
-        let available = MAX_INPUT_LENGTH.saturating_sub(self.state.input_buffer.len());
+        let input = self.state.active_input_mut();
+        let available = MAX_INPUT_LENGTH.saturating_sub(input.len());
         if available == 0 {
             return;
         }
         // Char-based slicing to avoid splitting UTF-8 sequences
         let to_add: String = text.chars().take(available).collect();
-        self.state.input_buffer.push_str(&to_add);
+        input.push_str(&to_add);
         // Keep search query in sync while in Search mode
         if self.state.ui_mode == UiMode::Search {
             self.state.set_search_query(self.state.input_buffer.clone());
@@ -236,7 +240,7 @@ impl TuiApp {
         if mods.contains(KeyModifiers::CONTROL) {
             match key {
                 KeyCode::Char('u') => {
-                    self.state.input_buffer.clear();
+                    self.state.active_input_mut().clear();
                     return TextEdit::Typed;
                 }
                 // Some terminals deliver Ctrl+v as a raw key event instead of a
@@ -254,13 +258,14 @@ impl TuiApp {
 
         match key {
             KeyCode::Char(c) => {
-                if self.state.input_buffer.len() < MAX_INPUT_LENGTH {
-                    self.state.input_buffer.push(c);
+                let input = self.state.active_input_mut();
+                if input.len() < MAX_INPUT_LENGTH {
+                    input.push(c);
                 }
                 TextEdit::Typed
             }
             KeyCode::Backspace => {
-                self.state.input_buffer.pop();
+                self.state.active_input_mut().pop();
                 TextEdit::Typed
             }
             KeyCode::Enter => TextEdit::Submit,
@@ -884,13 +889,7 @@ impl TuiApp {
                     return Ok(());
                 }
                 KeyAction::EditItem => {
-                    // TODO: Expand to a multi-field editor supporting Referrer,
-                    //       Cookie, and other per-item properties.
-                    if self.state.get_selected_download().is_none() {
-                        return Ok(());
-                    }
-                    self.state.ui_mode = UiMode::ChangeSavePath;
-                    self.state.input_buffer.clear();
+                    self.open_item_editor();
                     return Ok(());
                 }
 
@@ -2011,6 +2010,85 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Opens the item editor for the current selection. No-op in the History
+    /// view (editing completed items is not supported) or with nothing
+    /// focused (no task to prefill from).
+    fn open_item_editor(&mut self) {
+        if self.state.is_viewing_completed_node() {
+            return;
+        }
+        let targets = self.state.get_target_download_ids();
+        let editor = match self.state.get_selected_download() {
+            Some(task) => item_editor::ItemEditorState::from_task(task, targets),
+            None => return,
+        };
+        self.state.item_editor = Some(editor);
+        self.state.validation_error = None;
+        self.state.ui_mode = UiMode::ItemEdit;
+    }
+
+    /// Handle the item editor dialog (Save path + Referrer).
+    async fn handle_item_edit_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
+        match key {
+            KeyCode::Tab | KeyCode::Down => {
+                if let Some(editor) = self.state.item_editor.as_mut() {
+                    editor.focus = editor.focus.next();
+                }
+                return Ok(());
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(editor) = self.state.item_editor.as_mut() {
+                    editor.focus = editor.focus.prev();
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        match self.apply_text_edit_key(key, mods) {
+            TextEdit::Typed => {}
+            TextEdit::Submit => {
+                let Some(editor) = self.state.item_editor.clone() else {
+                    self.state.ui_mode = UiMode::Normal;
+                    return Ok(());
+                };
+                if let Err(message_id) = editor.validate() {
+                    self.state.validation_error = Some(self.state.t(message_id));
+                    return Ok(());
+                }
+                let header_edit = editor.header_edit();
+                let new_save_path = editor.new_save_path();
+                let report = item_editor::apply_item_edit(
+                    &self.manager,
+                    &editor.targets,
+                    header_edit.as_ref(),
+                    new_save_path.as_deref(),
+                )
+                .await;
+                if report.changed > 0 {
+                    self.save_queue().await?;
+                }
+                let skipped = report.busy + report.not_found + report.failed;
+                self.state.status_message = if skipped > 0 {
+                    let args = fluent::fluent_args! { "count" => skipped };
+                    Some(self.state.t_with_args("status-item-edit-skipped", Some(&args)))
+                } else {
+                    None
+                };
+                self.state.item_editor = None;
+                self.state.validation_error = None;
+                self.state.ui_mode = UiMode::Normal;
+            }
+            TextEdit::Cancel => {
+                self.state.item_editor = None;
+                self.state.validation_error = None;
+                self.state.ui_mode = UiMode::Normal;
+            }
+            TextEdit::Ignored => {}
+        }
+        Ok(())
+    }
+
     /// Handle switch folder mode (folder picker dialog)
     async fn handle_switch_folder_mode(&mut self, key: KeyCode, mods: KeyModifiers) -> Result<()> {
         // Get folder list (sorted by display name)
@@ -2174,8 +2252,7 @@ impl TuiApp {
                 self.state.ui_mode = UiMode::ChangeFolder;
             }
             ContextMenuAction::ChangeSavePath => {
-                self.state.ui_mode = UiMode::ChangeSavePath;
-                self.state.input_buffer.clear();
+                self.open_item_editor();
             }
             ContextMenuAction::CopyUrl => {
                 let target_ids = self.state.get_target_download_ids();

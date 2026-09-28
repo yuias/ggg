@@ -8,6 +8,15 @@ dialog-edit-field = Edit Field
 dialog-edit-label = Edit {$label}
 dialog-add-download = Add Download (Shift+Enter to expand [n-m] pattern)
 dialog-change-save-path = Change Save Path (Enter to confirm, Esc to cancel)
+dialog-item-edit = Edit item
+dialog-item-edit-multi = Edit {$count} items
+dialog-item-edit-save-path = Save path
+dialog-item-edit-referrer = Referrer
+dialog-item-edit-referrer-hint = Empty = use the referrer policy
+dialog-item-edit-headers = Other headers (read-only):
+dialog-item-edit-invalid-referrer = Referrer must not contain control characters
+status-item-edit-skipped = {$count} item(s) skipped: pause them first
+hint-item-edit = Tab: next field  Enter: apply  Esc: cancel
 dialog-change-folder = 📁 Change Folder ({$down}/{$up} to navigate, {$select} to select)
 dialog-confirm-delete = Confirm Delete
 dialog-switch-folder = 📁 Switch Folder ({$down}/{$up} to navigate, {$select} to select)

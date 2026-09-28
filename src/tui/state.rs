@@ -1,3 +1,4 @@
+use super::item_editor::ItemEditorState;
 use crate::app::state::AppState;
 use crate::download::manager::DownloadManager;
 use crate::download::task::DownloadTask;
@@ -25,6 +26,8 @@ pub enum UiMode {
     ChangeFolder,
     /// Changing save path for selected download (free text input)
     ChangeSavePath,
+    /// Editing the save path and referrer of the target download(s)
+    ItemEdit,
     /// Switching current folder for new downloads
     SwitchFolder,
     /// Help screen overlay
@@ -48,7 +51,12 @@ impl UiMode {
     pub fn is_text_input(&self) -> bool {
         matches!(
             self,
-            UiMode::AddDownload | UiMode::EditingField | UiMode::Search | UiMode::FolderEdit | UiMode::ChangeSavePath
+            UiMode::AddDownload
+                | UiMode::EditingField
+                | UiMode::Search
+                | UiMode::FolderEdit
+                | UiMode::ChangeSavePath
+                | UiMode::ItemEdit
         )
     }
 }
@@ -565,6 +573,9 @@ pub struct TuiState {
     /// `None` = nothing to show.
     pub status_message: Option<String>,
 
+    /// Item editor dialog state (`UiMode::ItemEdit`); `None` when closed.
+    pub item_editor: Option<ItemEditorState>,
+
     /// Rendering optimization: flag to indicate if UI needs redraw
     pub needs_redraw: bool,
 
@@ -694,6 +705,7 @@ impl TuiState {
             is_editing_app_setting: false,
             validation_error: None,
             status_message: None,
+            item_editor: None,
             needs_redraw: true,  // Initial render needed
             selected_downloads: std::collections::HashSet::new(),
             context_menu_index: 0,
@@ -1375,6 +1387,17 @@ impl TuiState {
     pub fn take_delete_target(&mut self) -> DeleteTarget {
         std::mem::take(&mut self.delete_target)
     }
+
+    /// Buffer that typed/pasted text goes to in the current mode: the focused
+    /// item-editor field in `ItemEdit`, otherwise the generic `input_buffer`.
+    pub fn active_input_mut(&mut self) -> &mut String {
+        if self.ui_mode == UiMode::ItemEdit {
+            if let Some(editor) = self.item_editor.as_mut() {
+                return editor.focused_mut();
+            }
+        }
+        &mut self.input_buffer
+    }
 }
 
 #[cfg(test)]
@@ -1581,5 +1604,39 @@ mod menu_accelerator_tests {
         // Back's configured key string is "Escape"; the hint shows the short form.
         assert_eq!(ContextMenuAction::Cancel.key_hint(&resolver), "Esc");
         assert_eq!(FolderContextMenuAction::Cancel.key_hint(&resolver), "Esc");
+    }
+}
+
+#[cfg(test)]
+mod active_input_tests {
+    use super::*;
+    use crate::app::config::Config;
+    use crate::app::keybindings::KeybindingsConfig;
+    use super::super::item_editor::ItemEditorField;
+
+    fn test_state() -> TuiState {
+        TuiState::new(AppState::new(Config::default()), &KeybindingsConfig::default(), "en")
+    }
+
+    #[test]
+    fn active_input_mut_targets_focused_editor_field() {
+        let mut state = test_state();
+        let task = DownloadTask::new("https://example.org/f".to_string(), std::path::PathBuf::from("/tmp/f"));
+        state.item_editor = Some(ItemEditorState::from_task(&task, vec![task.id]));
+        state.ui_mode = UiMode::ItemEdit;
+
+        // `from_task` starts focus on Referrer.
+        state.active_input_mut().push_str("https://ref.example/");
+        assert_eq!(state.item_editor.as_ref().unwrap().referrer.value, "https://ref.example/");
+        assert_eq!(state.input_buffer, "", "typing in ItemEdit must not touch input_buffer");
+
+        state.item_editor.as_mut().unwrap().focus = ItemEditorField::SavePath;
+        state.active_input_mut().push_str("-typed");
+        assert!(state.item_editor.as_ref().unwrap().save_path.value.ends_with("-typed"));
+
+        // Outside ItemEdit, the generic input buffer is used.
+        state.ui_mode = UiMode::AddDownload;
+        state.active_input_mut().push_str("hello");
+        assert_eq!(state.input_buffer, "hello");
     }
 }

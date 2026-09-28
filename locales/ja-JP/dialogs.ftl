@@ -8,6 +8,15 @@ dialog-edit-field = Edit Field
 dialog-edit-label = Edit {$label}
 dialog-add-download = Add Download (Shift+Enter: Expand [n-m])
 dialog-change-save-path = Change Save Path (Enter: Confirm, Esc: Cancel)
+dialog-item-edit = 項目を編集
+dialog-item-edit-multi = {$count}件の項目を編集
+dialog-item-edit-save-path = 保存先
+dialog-item-edit-referrer = リファラー
+dialog-item-edit-referrer-hint = 空欄 = リファラーポリシーを使用
+dialog-item-edit-headers = その他のヘッダー（読み取り専用）:
+dialog-item-edit-invalid-referrer = リファラーに制御文字は使用できない
+status-item-edit-skipped = {$count}件をスキップした: 一時停止してから再試行
+hint-item-edit = Tab: 次のフィールド  Enter: 適用  Esc: キャンセル
 dialog-change-folder = 📁 Change Folder ({$down}/{$up}: Navigate, {$select}: Select)
 dialog-confirm-delete = Confirm Delete
 dialog-switch-folder = 📁 Select Folder ({$down}/{$up}: Navigate, {$select}: Select)

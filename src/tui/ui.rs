@@ -25,8 +25,8 @@ pub fn render(app: &TuiApp, f: &mut Frame) {
     let is_main_screen = matches!(
         app.state.ui_mode,
         UiMode::Normal | UiMode::AddDownload | UiMode::DownloadPreview |
-        UiMode::Search | UiMode::ChangeFolder | UiMode::ChangeSavePath | UiMode::SwitchFolder |
-        UiMode::ConfirmDelete | UiMode::ContextMenu | UiMode::Help
+        UiMode::Search | UiMode::ChangeFolder | UiMode::ChangeSavePath | UiMode::ItemEdit |
+        UiMode::SwitchFolder | UiMode::ConfirmDelete | UiMode::ContextMenu | UiMode::Help
     ) || (matches!(app.state.ui_mode, UiMode::EditingField) && !app.state.is_editing_app_setting);
 
     // Main layout: content area + status bar
@@ -64,6 +64,7 @@ pub fn render(app: &TuiApp, f: &mut Frame) {
         UiMode::Search => {}, // Search is inline in status bar
         UiMode::ChangeFolder => render_change_folder_for_item_dialog(app, f, size),
         UiMode::ChangeSavePath => render_change_save_path_dialog(app, f, size),
+        UiMode::ItemEdit => render_item_edit_dialog(app, f, size),
         UiMode::SwitchFolder => render_switch_folder_dialog(app, f, size),
         UiMode::ConfirmDelete => render_confirm_delete_dialog(app, f, size),
         UiMode::ContextMenu => render_context_menu(app, f, size),
@@ -722,6 +723,11 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
                 "cancel" => "Esc",
             };
             (t_args("status-hint-confirm-cancel", Some(&args)), String::new())
+        }
+        UiMode::ItemEdit => {
+            // Field navigation (Tab/Enter/Esc) is hard-coded, like the other
+            // free-text dialogs above, so the hint text is static.
+            (t("hint-item-edit"), String::new())
         }
         UiMode::SwitchFolder => {
             let args = fluent_args! {
@@ -2160,6 +2166,97 @@ fn render_change_save_path_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
                 .style(Style::default().bg(theme::BG_PRIMARY)),
         );
 
+    f.render_widget(paragraph, dialog_area);
+}
+
+/// One label/value row of a form-style dialog; the focused row is
+/// highlighted and gets a trailing cursor marker.
+fn form_row(label: &str, value: &str, focused: bool) -> Line<'static> {
+    let style = if focused {
+        Style::default().fg(theme::ACCENT_SELECTED).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::TEXT_NORMAL)
+    };
+    let cursor = if focused { "\u{2588}" } else { "" };
+    Line::from(Span::styled(format!("{label}: {value}{cursor}"), style))
+}
+
+/// Render the item editor dialog (Save path + Referrer, other headers read-only).
+fn render_item_edit_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
+    use super::item_editor::ItemEditorField;
+
+    let Some(editor) = app.state.item_editor.as_ref() else { return };
+
+    let mut lines = vec![
+        form_row(
+            &app.state.t("dialog-item-edit-save-path"),
+            &editor.save_path.value,
+            editor.focus == ItemEditorField::SavePath,
+        ),
+        form_row(
+            &app.state.t("dialog-item-edit-referrer"),
+            &editor.referrer.value,
+            editor.focus == ItemEditorField::Referrer,
+        ),
+        Line::from(Span::styled(
+            app.state.t("dialog-item-edit-referrer-hint"),
+            Style::default().fg(theme::TEXT_MUTED),
+        )),
+    ];
+
+    if !editor.other_headers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            app.state.t("dialog-item-edit-headers"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for (name, value) in &editor.other_headers {
+            lines.push(Line::from(Span::styled(
+                format!("{name}: {value}"),
+                Style::default().fg(theme::TEXT_MUTED),
+            )));
+        }
+    }
+
+    if let Some(error) = &app.state.validation_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(error.as_str(), Style::default().fg(Color::Red))));
+    }
+
+    let dialog_width = 80;
+    // A long save path or referrer wraps inside the box (`Wrap { trim: true }`
+    // below), so the row count must account for wrapped width, not just line
+    // count, or the bottom rows (including the validation error) get clipped.
+    let inner_width = (dialog_width - 2) as usize;
+    let wrapped_rows: usize = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(inner_width))
+        .sum();
+    let dialog_height = (wrapped_rows as u16 + 2).max(7);
+
+    let dialog_area = Rect {
+        x: (area.width.saturating_sub(dialog_width)) / 2,
+        y: (area.height.saturating_sub(dialog_height)) / 2,
+        width: dialog_width,
+        height: dialog_height,
+    };
+
+    let title = if editor.targets.len() > 1 {
+        let args = fluent_args! { "count" => editor.targets.len() as i64 };
+        app.state.t_with_args("dialog-item-edit-multi", Some(&args))
+    } else {
+        app.state.t("dialog-item-edit")
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .style(Style::default().bg(theme::BG_PRIMARY)),
+        )
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(Clear, dialog_area);
     f.render_widget(paragraph, dialog_area);
 }
 
