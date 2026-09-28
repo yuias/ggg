@@ -1,5 +1,5 @@
 use crate::AppState;
-use crate::app::config::{Config, ReferrerPolicy};
+use crate::app::config::{Config, DEFAULT_FOLDER_NAME, ReferrerPolicy};
 use crate::download::{manager::DownloadManager, task::DownloadTask};
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,7 @@ pub enum Command {
     UpdateFolderPreventDuplicateUrl { folder_id: String, value: bool },
     UpdateFolderScriptsEnabled { folder_id: String, value: Option<bool> },
     CreateFolder,
+    DeleteFolder { folder_id: String },
 
     // Script settings
     ToggleScriptFile { filename: String },
@@ -79,6 +80,8 @@ pub enum CommandError {
     DuplicateFolderName { name: String },
     /// An attempt to rename the protected default folder.
     DefaultFolderRename,
+    /// An attempt to delete the protected default folder.
+    DefaultFolderDelete,
     StartDownload { error: String },
     PauseDownload { error: String },
     RemoveDownload { error: String },
@@ -112,6 +115,9 @@ impl std::fmt::Display for CommandError {
             }
             CommandError::DefaultFolderRename => {
                 write!(f, "Cannot rename the default folder")
+            }
+            CommandError::DefaultFolderDelete => {
+                write!(f, "Cannot delete the default folder")
             }
             CommandError::StartDownload { error } => write!(f, "Failed to start download: {error}"),
             CommandError::PauseDownload { error } => write!(f, "Failed to pause download: {error}"),
@@ -267,6 +273,29 @@ pub async fn handle_command(
                 Err(_) => return CommandResponse::Error(CommandError::InvalidConfig),
             };
             match commit_config_edit(&state, |cfg| {
+                // Find the previous default folder's id (if any) before it is
+                // overwritten, so a replacement that renames or drops it away
+                // (leaving no folder named `DEFAULT_FOLDER_NAME`, or leaving that
+                // id under a different name) can be refused. Without this, a
+                // full-config replace would bypass the same guard `UpdateFolderName`
+                // enforces, and the next `Config::load` would silently recreate a
+                // second default folder.
+                let previous_default_id =
+                    cfg.folders.iter().find(|(_, f)| f.name == DEFAULT_FOLDER_NAME).map(|(id, _)| id.clone());
+
+                let still_has_default = new_config.folders.values().any(|f| f.name == DEFAULT_FOLDER_NAME);
+                // Also refused if the previous default id was dropped entirely
+                // (not just renamed in place): an absent id no longer has that
+                // name either, and a replacement could otherwise drop the old
+                // default id while adding an unrelated one named "default".
+                let previous_id_lost = previous_default_id.as_ref().is_some_and(|id| {
+                    !new_config.folders.get(id).is_some_and(|f| f.name == DEFAULT_FOLDER_NAME)
+                });
+
+                if !still_has_default || previous_id_lost {
+                    return Err(CommandError::DefaultFolderRename);
+                }
+
                 *cfg = new_config;
                 Ok(())
             })
@@ -459,8 +488,10 @@ pub async fn handle_command(
             let result = commit_config_edit(&state, |config| {
                 // The default folder's name is what config load uses to find it
                 // (`Config::is_default_folder`); renaming it away would make load
-                // recreate a second folder named "default" on the next start.
-                if config.is_default_folder(&folder_id) {
+                // recreate a second folder named "default" on the next start. Setting
+                // it to its current name (no-op) is fine and must not error, since
+                // e.g. re-submitting an unchanged field should not be a rejection.
+                if config.is_default_folder(&folder_id) && new_name != DEFAULT_FOLDER_NAME {
                     return Err(CommandError::DefaultFolderRename);
                 }
 
@@ -665,6 +696,27 @@ pub async fn handle_command(
             match result {
                 Ok(()) => CommandResponse::Success {
                     data: serde_json::json!({"status": "ok", "folder_id": new_folder_id}),
+                },
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
+        Command::DeleteFolder { folder_id } => {
+            let result = commit_config_edit(&state, |config| {
+                if config.is_default_folder(&folder_id) {
+                    return Err(CommandError::DefaultFolderDelete);
+                }
+                if !config.folders.contains_key(&folder_id) {
+                    return Err(CommandError::FolderNotFound { folder: folder_id.clone() });
+                }
+                config.folders.remove(&folder_id);
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id}),
                 },
                 Err(e) => CommandResponse::Error(e),
             }
@@ -953,6 +1005,139 @@ mod tests {
         assert_eq!(config.folders.get("folder-1").map(|f| f.name.clone()), Some("default".to_string()));
     }
 
+    // Reaches `commit_config_edit`'s success path (a no-op rename still saves),
+    // so it needs the same isolated-config-directory + `#[serial]` protocol as
+    // the other `*_persists_to_disk` tests below: `Config::save` writes to
+    // whatever `set_config_dir_override` currently points at, which is a
+    // process-global, not per-test, so an unguarded save here would race any
+    // concurrently running test that also touches the real/overridden config.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_folder_name_allows_default_folder_unchanged_name_as_noop() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        let folder_id = Config::generate_folder_id();
+        let mut config = Config::default();
+        config.folders.insert(folder_id.clone(), FolderConfig { name: "default".to_string(), ..FolderConfig::default() });
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::UpdateFolderName { folder_id: folder_id.clone(), value: "default".to_string() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert!(matches!(response, CommandResponse::Success { .. }), "response: {response:?}");
+        let config = state.config.read().await;
+        assert_eq!(config.folders.get(&folder_id).map(|f| f.name.clone()), Some("default".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_folder_name_rejects_renaming_to_default() {
+        let mut config = Config::default();
+        config.folders.insert(
+            "folder-1".to_string(),
+            FolderConfig { name: "default".to_string(), ..FolderConfig::default() },
+        );
+        config.folders.insert(
+            "folder-2".to_string(),
+            FolderConfig { name: "Movies".to_string(), ..FolderConfig::default() },
+        );
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::UpdateFolderName { folder_id: "folder-2".to_string(), value: "default".to_string() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+
+        match response {
+            CommandResponse::Error(CommandError::DuplicateFolderName { .. }) => {}
+            other => panic!("expected DuplicateFolderName, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert_eq!(config.folders.get("folder-2").map(|f| f.name.clone()), Some("Movies".to_string()));
+    }
+
+    #[tokio::test]
+    async fn delete_folder_rejects_default_folder() {
+        let mut config = Config::default();
+        config.folders.insert(
+            "folder-1".to_string(),
+            FolderConfig { name: "default".to_string(), ..FolderConfig::default() },
+        );
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::DeleteFolder { folder_id: "folder-1".to_string() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+
+        match response {
+            CommandResponse::Error(CommandError::DefaultFolderDelete) => {}
+            other => panic!("expected DefaultFolderDelete, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert!(config.folders.contains_key("folder-1"));
+    }
+
+    #[tokio::test]
+    async fn delete_folder_rejects_missing_folder() {
+        let state = state_with(Config::default());
+
+        let response = handle_command(
+            Command::DeleteFolder { folder_id: "does-not-exist".to_string() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+
+        match response {
+            CommandResponse::Error(CommandError::FolderNotFound { .. }) => {}
+            other => panic!("expected FolderNotFound, got {other:?}"),
+        }
+    }
+
+    // Exercises the real `Config::save()`/load path, so it needs an isolated
+    // config directory; `#[serial]` keeps it from racing other tests that
+    // touch the same process-global override.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delete_folder_persists_to_disk() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        let folder_id = Config::generate_folder_id();
+        let mut config = Config::default();
+        config.folders.insert(folder_id.clone(), FolderConfig { name: "Movies".to_string(), ..FolderConfig::default() });
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::DeleteFolder { folder_id: folder_id.clone() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(response, CommandResponse::Success { .. }), "response: {response:?}");
+
+        let reloaded = Config::load().expect("reloaded config");
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert!(!reloaded.folders.contains_key(&folder_id));
+    }
+
     // Exercises the real `Config::save()`/load path, so it needs an isolated
     // config directory; `#[serial]` keeps it from racing other tests that
     // touch the same process-global override.
@@ -1119,5 +1304,98 @@ mod tests {
         }
         let config = state.config.read().await;
         assert_eq!(config.download.default_directory, std::path::PathBuf::from("original"));
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_replacement_missing_default_folder() {
+        let mut config = Config::default();
+        config.folders.insert(
+            "folder-1".to_string(),
+            FolderConfig { name: "default".to_string(), ..FolderConfig::default() },
+        );
+        let state = state_with(config.clone());
+
+        // Replacement config renames the only folder away from "default",
+        // which would make the next `Config::load` recreate a second one.
+        let mut replacement = config.clone();
+        replacement.folders.get_mut("folder-1").unwrap().name = "Renamed".to_string();
+        let replacement_value = serde_json::to_value(&replacement).unwrap();
+
+        let response =
+            handle_command(Command::UpdateConfig { config: replacement_value }, state.clone(), DownloadManager::new())
+                .await;
+
+        match response {
+            CommandResponse::Error(CommandError::DefaultFolderRename) => {}
+            other => panic!("expected DefaultFolderRename, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert_eq!(config.folders.get("folder-1").map(|f| f.name.clone()), Some("default".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_replacement_dropping_previous_default_id() {
+        let mut config = Config::default();
+        config.folders.insert(
+            "folder-1".to_string(),
+            FolderConfig { name: "default".to_string(), ..FolderConfig::default() },
+        );
+        let state = state_with(config.clone());
+
+        // Replacement drops the previous default folder's id entirely and adds
+        // an unrelated folder that happens to be named "default"; `still_has_default`
+        // alone would pass this, so the id-loss check must catch it too.
+        let mut replacement = config.clone();
+        replacement.folders.remove("folder-1");
+        replacement.folders.insert(
+            "folder-2".to_string(),
+            FolderConfig { name: "default".to_string(), ..FolderConfig::default() },
+        );
+        let replacement_value = serde_json::to_value(&replacement).unwrap();
+
+        let response =
+            handle_command(Command::UpdateConfig { config: replacement_value }, state.clone(), DownloadManager::new())
+                .await;
+
+        match response {
+            CommandResponse::Error(CommandError::DefaultFolderRename) => {}
+            other => panic!("expected DefaultFolderRename, got {other:?}"),
+        }
+        let config = state.config.read().await;
+        assert!(config.folders.contains_key("folder-1"));
+        assert!(!config.folders.contains_key("folder-2"));
+    }
+
+    // Reaches `commit_config_edit`'s success path (the replacement is accepted
+    // and saved), so needs the same isolated-config-directory + `#[serial]`
+    // protocol as the `*_persists_to_disk` tests: an unguarded `Config::save`
+    // here would race any concurrently running test touching the process-global
+    // config-dir override.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_config_accepts_replacement_keeping_default_folder() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        let mut config = Config::default();
+        config.folders.insert(
+            Config::generate_folder_id(),
+            FolderConfig { name: "default".to_string(), ..FolderConfig::default() },
+        );
+        let state = state_with(config.clone());
+
+        let mut replacement = config.clone();
+        replacement.download.max_redirects += 1;
+        let replacement_value = serde_json::to_value(&replacement).unwrap();
+
+        let response =
+            handle_command(Command::UpdateConfig { config: replacement_value }, state.clone(), DownloadManager::new())
+                .await;
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert!(matches!(response, CommandResponse::Success { .. }), "response: {response:?}");
     }
 }

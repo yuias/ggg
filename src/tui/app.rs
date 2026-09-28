@@ -823,6 +823,7 @@ impl TuiApp {
                         && (!self.state.selected_downloads.is_empty()
                             || self.state.get_selected_download().is_some())
                     {
+                        self.state.delete_target = DeleteTarget::Downloads;
                         self.state.ui_mode = UiMode::ConfirmDelete;
                     }
                     return Ok(());
@@ -1299,10 +1300,13 @@ impl TuiApp {
                             // Safety net: a bad remap must not trap the user here.
                             self.state.reset_settings_state();
                             self.state.ui_mode = UiMode::Normal;
-                        } else if matches!(key, KeyCode::Char('n')) {
+                        } else if matches!(key, KeyCode::Char('n'))
+                            && (mods.is_empty() || mods == KeyModifiers::SHIFT)
+                        {
                             // Hard-coded alias for "new folder" on this tab only;
                             // a remap that claims 'n' for another action (matched
-                            // above) takes priority over this fallback.
+                            // above) takes priority over this fallback. Guarded to
+                            // no-modifier / Shift-only so Ctrl+n etc. do not misfire.
                             self.create_new_folder().await?;
                         }
                     }
@@ -1723,7 +1727,7 @@ impl TuiApp {
     /// Cycle folder referrer policy: None(inherit) → Some(None) → Some(SameAsUrl) → Some(UrlPath) → Some(UrlOrigin) → None(inherit)
     async fn cycle_folder_referrer_policy(&mut self) -> Result<()> {
         use crate::app::config::ReferrerPolicy;
-        use crate::ui::commands::{Command, handle_command};
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
 
         if let Some(ref folder_id) = self.state.selected_folder_id {
             let config = self.state.app_state.config.read().await;
@@ -1747,14 +1751,23 @@ impl TuiApp {
                 folder_id: folder_id.clone(),
                 policy: next,
             };
-            handle_command(
+            let response = handle_command(
                 command,
                 self.state.app_state.clone(),
                 self.manager.clone(),
             )
             .await;
 
-            tracing::info!("Cycled folder referrer policy for '{}'", folder_id);
+            match response {
+                CommandResponse::Success { .. } => {
+                    self.state.validation_error = None;
+                    tracing::info!("Cycled folder referrer policy for '{}'", folder_id);
+                }
+                CommandResponse::Error(err) => {
+                    tracing::error!("Failed to cycle folder referrer policy: {}", err);
+                    self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
+                }
+            }
         }
         Ok(())
     }
@@ -1790,21 +1803,30 @@ impl TuiApp {
 
     /// Toggle skip download preview at application level
     async fn toggle_app_skip_download_preview(&mut self) -> Result<()> {
-        use crate::ui::commands::{Command, handle_command};
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
 
-        let config = self.state.app_state.config.write().await;
+        let config = self.state.app_state.config.read().await;
         let new_value = !config.general.skip_download_preview;
         drop(config);
 
         let command = Command::UpdateSkipDownloadPreview { value: new_value };
-        handle_command(
+        let response = handle_command(
             command,
             self.state.app_state.clone(),
             self.manager.clone(),
         )
         .await;
 
-        tracing::info!("Toggled skip download preview to {}", new_value);
+        match response {
+            CommandResponse::Success { .. } => {
+                self.state.validation_error = None;
+                tracing::info!("Toggled skip download preview to {}", new_value);
+            }
+            CommandResponse::Error(err) => {
+                tracing::error!("Failed to toggle skip download preview: {}", err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
+            }
+        }
         Ok(())
     }
 
@@ -1839,21 +1861,30 @@ impl TuiApp {
 
     /// Cycle through referrer policy options at application level
     async fn cycle_app_referrer_policy(&mut self) -> Result<()> {
-        use crate::ui::commands::{Command, handle_command};
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
 
         let config = self.state.app_state.config.read().await;
         let next_policy = config.download.referrer_policy.cycle_next();
         drop(config);
 
         let command = Command::UpdateReferrerPolicy { policy: next_policy };
-        handle_command(
+        let response = handle_command(
             command,
             self.state.app_state.clone(),
             self.manager.clone(),
         )
         .await;
 
-        tracing::info!("Cycled app referrer policy");
+        match response {
+            CommandResponse::Success { .. } => {
+                self.state.validation_error = None;
+                tracing::info!("Cycled app referrer policy");
+            }
+            CommandResponse::Error(err) => {
+                tracing::error!("Failed to cycle app referrer policy: {}", err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
+            }
+        }
         Ok(())
     }
 
@@ -2094,15 +2125,17 @@ impl TuiApp {
             }
 
             // Local accelerators with no global action; must not collide with
-            // any key resolved above (see KeybindingResolver defaults).
+            // any key resolved above (see KeybindingResolver defaults). Guarded
+            // to no-modifier / Shift-only so e.g. Ctrl+c does not copy the URL
+            // instead of doing whatever Ctrl+c means to the terminal.
             None => match key {
-                KeyCode::Char('f') => {
+                KeyCode::Char('f') if mods.is_empty() || mods == KeyModifiers::SHIFT => {
                     self.execute_menu_action(ContextMenuAction::ChangeFolder).await?;
                 }
-                KeyCode::Char('c') => {
+                KeyCode::Char('c') if mods.is_empty() || mods == KeyModifiers::SHIFT => {
                     self.execute_menu_action(ContextMenuAction::CopyUrl).await?;
                 }
-                KeyCode::Char('o') => {
+                KeyCode::Char('o') if mods.is_empty() || mods == KeyModifiers::SHIFT => {
                     self.execute_menu_action(ContextMenuAction::OpenFolder).await?;
                 }
                 // Safety net: a remap that unbinds Back must not trap the user.
@@ -2133,6 +2166,7 @@ impl TuiApp {
             }
             ContextMenuAction::Delete => {
                 // Go to confirm delete mode
+                self.state.delete_target = DeleteTarget::Downloads;
                 self.state.ui_mode = UiMode::ConfirmDelete;
             }
             ContextMenuAction::ChangeFolder => {
@@ -2231,11 +2265,11 @@ impl TuiApp {
             // Local accelerators with no global action (StopAll, ClearHistory);
             // must not collide with any key resolved above.
             None => match key {
-                KeyCode::Char('p') if !is_completed => {
+                KeyCode::Char('p') if !is_completed && (mods.is_empty() || mods == KeyModifiers::SHIFT) => {
                     self.execute_folder_menu_action(FolderContextMenuAction::StopAll)
                         .await?;
                 }
-                KeyCode::Char('c') if is_completed => {
+                KeyCode::Char('c') if is_completed && (mods.is_empty() || mods == KeyModifiers::SHIFT) => {
                     self.execute_folder_menu_action(FolderContextMenuAction::ClearHistory)
                         .await?;
                 }
@@ -2551,27 +2585,26 @@ impl TuiApp {
     /// the caller (the confirm dialog's Yes handler) already took ownership
     /// of the target via `take_delete_target`.
     async fn delete_selected_folder(&mut self, folder_id: &str) -> Result<()> {
-        // Defense in depth: the same guard already ran before the dialog
-        // opened (Settings' `d` key), using the rule shared with `Config::load`.
-        let is_default = {
-            let config = self.state.app_state.config.read().await;
-            config.is_default_folder(folder_id)
-        };
-        if is_default {
-            tracing::warn!("Cannot delete the default folder");
-            return Ok(());
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
+
+        let command = Command::DeleteFolder { folder_id: folder_id.to_string() };
+        let response = handle_command(command, self.state.app_state.clone(), self.manager.clone()).await;
+
+        match response {
+            CommandResponse::Success { .. } => {
+                self.state.validation_error = None;
+            }
+            CommandResponse::Error(err) => {
+                tracing::error!("Failed to delete folder '{}': {}", folder_id, err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
+                return Ok(());
+            }
         }
 
-        let mut config = self.state.app_state.config.write().await;
-        config.folders.remove(folder_id);
-
-        // Save config to persist the removal
-        if let Err(e) = config.save() {
-            tracing::error!("Failed to save config after folder deletion: {}", e);
-        }
-        drop(config);
-
-        // Delete folder config directory from filesystem
+        // The command already removed the folder from config and saved; only
+        // remove the on-disk directory and adjust selection once that succeeded,
+        // so a rejected/failed delete never leaves the directory gone while the
+        // config edit didn't happen (or vice versa).
         if let Ok(config_dir) = crate::util::paths::find_config_directory() {
             let folder_dir = config_dir.join(folder_id);
             if folder_dir.exists() && folder_dir.is_dir() {

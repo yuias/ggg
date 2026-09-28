@@ -35,6 +35,7 @@ prompt-value = Value:
 confirm-delete-single = Delete this download?
 confirm-delete-multiple = Delete {$count} downloads?
 confirm-delete-folder-config-note = This also removes its config directory.
+confirm-delete-hint = Press {$select} or {$confirm} to confirm, {$cancel} or {$back} to cancel
 
 # Help text in dialogs. Args are display-formatted configured keys (see
 # KeybindingResolver::display_key).

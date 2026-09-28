@@ -2235,25 +2235,28 @@ fn render_confirm_delete_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
     let cancel_key = resolver.display_key(KeyAction::ConfirmNo);
     let back_key = resolver.display_key(KeyAction::Back);
 
+    let hint_args = fluent_args! {
+        "select" => select_key.clone(),
+        "confirm" => confirm_key.clone(),
+        "cancel" => cancel_key.clone(),
+        "back" => back_key.clone(),
+    };
+
+    let yes_label = format!("[ Yes ({confirm_key}) ]");
+    let no_label = format!("[ No ({cancel_key}) ]");
+    let button_gap = "       ";
+
     lines.extend([
         Line::from(""),
         Line::from(Span::styled(
-            format!(
-                "Press {select_key} or {confirm_key} to confirm, {cancel_key} or {back_key} to cancel"
-            ),
+            app.state.t_with_args("confirm-delete-hint", Some(&hint_args)),
             Style::default().fg(Color::Cyan),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(
-                format!("      [ Yes ({confirm_key}) ]"),
-                Style::default().fg(Color::Green),
-            ),
-            Span::raw("       "),
-            Span::styled(
-                format!("[ No ({cancel_key}) ]      "),
-                Style::default().fg(Color::Red),
-            ),
+            Span::styled(yes_label.clone(), Style::default().fg(Color::Green)),
+            Span::raw(button_gap),
+            Span::styled(no_label.clone(), Style::default().fg(Color::Red)),
         ]),
     ]);
 
@@ -2270,25 +2273,34 @@ fn render_confirm_delete_dialog(app: &TuiApp, f: &mut Frame, area: Rect) {
     f.render_widget(Clear, dialog_area);
     f.render_widget(paragraph, dialog_area);
 
-    // Track button regions for mouse clicks
-    // Buttons are on the last content line (dialog_area.y + dialog_height - 2)
+    // Track button regions for mouse clicks. Buttons are on the last content
+    // line (dialog_area.y + dialog_height - 2); their rects are derived from
+    // the actual rendered label widths (rather than a fixed guess) so they
+    // stay aligned with the text once the label changes with the configured
+    // key (e.g. a longer key name widens "[ Yes (...) ]").
     let button_y = dialog_area.y + dialog_height - 2;
+    let inner_x = dialog_area.x + 1;
     let inner_width = dialog_width - 2;
-    let center_x = dialog_area.x + 1 + inner_width / 2;
 
-    // Yes button: approximately 6 chars left of center, 11 chars wide
+    let yes_width = UnicodeWidthStr::width(yes_label.as_str()) as u16;
+    let no_width = UnicodeWidthStr::width(no_label.as_str()) as u16;
+    let gap_width = UnicodeWidthStr::width(button_gap) as u16;
+    let line_width = yes_width + gap_width + no_width;
+
+    // Mirrors ratatui's own centering of a line within its area.
+    let line_start_x = inner_x + inner_width.saturating_sub(line_width) / 2;
+
     let yes_button = Rect {
-        x: center_x.saturating_sub(15),
+        x: line_start_x,
         y: button_y,
-        width: 13,
+        width: yes_width,
         height: 1,
     };
 
-    // No button: approximately 6 chars right of center, 10 chars wide
     let no_button = Rect {
-        x: center_x + 3,
+        x: line_start_x + yes_width + gap_width,
         y: button_y,
-        width: 12,
+        width: no_width,
         height: 1,
     };
 
@@ -2760,6 +2772,11 @@ mod tests {
                 "dialogs.ftl",
                 "help-script-toggle",
                 &["down", "up", "toggle", "select", "reload"],
+            ),
+            (
+                "dialogs.ftl",
+                "confirm-delete-hint",
+                &["select", "confirm", "cancel", "back"],
             ),
             (
                 "settings.ftl",

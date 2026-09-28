@@ -18,6 +18,7 @@ cmd-error-empty-folder-name = フォルダ名を空にすることはできな�
 cmd-error-empty-default-directory = デフォルトのダウンロードディレクトリを空にすることはできない
 cmd-error-duplicate-folder-name = フォルダ '{ $name }' は既に存在する
 cmd-error-default-folder-rename = デフォルトフォルダの名前は変更できない
+cmd-error-default-folder-delete = デフォルトフォルダは削除できない
 cmd-error-script-send = 送信エラー: { $error }
 cmd-error-script-recv = 受信エラー: { $error }
 cmd-error-script-communication = 送受信エラー: { $error }

@@ -18,6 +18,7 @@ cmd-error-empty-folder-name = Folder name cannot be empty
 cmd-error-empty-default-directory = Default download directory cannot be empty
 cmd-error-duplicate-folder-name = A folder named '{ $name }' already exists
 cmd-error-default-folder-rename = Cannot rename the default folder
+cmd-error-default-folder-delete = Cannot delete the default folder
 cmd-error-script-send = Send error: { $error }
 cmd-error-script-recv = Recv error: { $error }
 cmd-error-script-communication = Send/recv error: { $error }
