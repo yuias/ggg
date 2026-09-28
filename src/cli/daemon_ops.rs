@@ -59,15 +59,18 @@ pub struct DaemonContext {
     pub save_lock: Arc<Mutex<()>>,
 }
 
-/// Answers one request against the current daemon state. Variants not yet
-/// implemented answer `Error{Unsupported}` rather than panicking or hanging,
-/// so an older client talking to this daemon gets a clear message.
+/// Answers one request against the current daemon state. The match below is
+/// exhaustive (no `_ =>` arm), so a new `ControlRequest` variant fails to
+/// compile here until it is given a handler.
 ///
 /// Contract: a handler for a mutating request (`ControlRequest::is_mutating`)
 /// returns `ControlResponse::Error` only on paths that changed no state.
 /// `after_response` relies on this to skip the queue save on an error reply
 /// (see `should_save`); returning `Error` after a real mutation would leave
-/// that change unsaved.
+/// that change unsaved. `dispatch_config_set` mutates a clone of the config
+/// and only assigns it back to the shared lock after `Config::save()`
+/// succeeds, so the in-memory config and the file on disk never diverge:
+/// a failed save (`Error{Internal}`) leaves both at the pre-set value.
 pub async fn dispatch(req: ControlRequest, ctx: &DaemonContext) -> ControlResponse {
     match req {
         ControlRequest::Ping => ControlResponse::Pong {
@@ -141,10 +144,8 @@ pub async fn dispatch(req: ControlRequest, ctx: &DaemonContext) -> ControlRespon
         ControlRequest::Modify { id, edit } => dispatch_modify(id, edit, ctx).await,
         ControlRequest::Move { id, op } => dispatch_move(id, op, ctx).await,
         ControlRequest::Priority { id, priority } => dispatch_priority(id, priority, ctx).await,
-        _ => ControlResponse::Error {
-            code: ControlErrorCode::Unsupported,
-            message: "not supported by this daemon yet".to_string(),
-        },
+        ControlRequest::ConfigGet { key } => dispatch_config_get(key, ctx).await,
+        ControlRequest::ConfigSet { key, value } => dispatch_config_set(key, value, ctx).await,
     }
 }
 
@@ -343,6 +344,56 @@ async fn dispatch_priority(id: Uuid, priority: u8, ctx: &DaemonContext) -> Contr
             message: format!("Set priority to {priority} for download {id}"),
         },
         Err(e) => not_found(&e.to_string()),
+    }
+}
+
+/// Mirrors the standalone `config get` command (`handle_config` in
+/// `handler.rs`), sharing its key parsing via `get_config_value`.
+async fn dispatch_config_get(key: String, ctx: &DaemonContext) -> ControlResponse {
+    let config = ctx.state.config.read().await;
+    match super::handler::get_config_value(&config, &key) {
+        Ok(value) => ControlResponse::Value { value },
+        Err(e) => ControlResponse::Error {
+            code: ControlErrorCode::InvalidInput,
+            message: e.to_string(),
+        },
+    }
+}
+
+/// Mirrors the standalone `config set` command, but validates and saves a
+/// clone before touching the shared config, so a bad key/value or a failed
+/// save leaves the running daemon's in-memory config exactly as it was.
+/// Takes the write lock for the whole operation, like
+/// `dispatch_set_script_enabled`, so a concurrent `ConfigSet` can't
+/// interleave with this one's clone/validate/save sequence.
+async fn dispatch_config_set(key: String, value: String, ctx: &DaemonContext) -> ControlResponse {
+    let mut guard = ctx.state.config.write().await;
+    let mut clone = guard.clone();
+
+    if let Err(e) = super::handler::set_config_value(&mut clone, &key, &value) {
+        return ControlResponse::Error {
+            code: ControlErrorCode::InvalidInput,
+            message: e.to_string(),
+        };
+    }
+    if let Err(errors) = crate::app::settings::validate_folder_config(&clone) {
+        return ControlResponse::Error {
+            code: ControlErrorCode::InvalidInput,
+            message: errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", "),
+        };
+    }
+    if let Err(e) = clone.save() {
+        return ControlResponse::Error {
+            code: ControlErrorCode::Internal,
+            message: format!("failed to save config: {e}"),
+        };
+    }
+
+    *guard = clone;
+    ControlResponse::Ok {
+        message: format!(
+            "Configuration updated: {key} = {value} (the running daemon may apply this only after a restart)"
+        ),
     }
 }
 
@@ -869,22 +920,6 @@ mod tests {
     async fn dispatch_reload_without_scripts_is_unsupported() {
         let ctx = test_context(DownloadManager::new());
         let resp = dispatch(ControlRequest::ReloadScripts, &ctx).await;
-        match resp {
-            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::Unsupported),
-            other => panic!("expected Error{{Unsupported}}, got {other:?}"),
-        }
-    }
-
-    // `ConfigGet` is not handled by the daemon yet, so it still falls
-    // through `dispatch`'s catch-all arm.
-    #[tokio::test]
-    async fn dispatch_unhandled_is_unsupported() {
-        let ctx = test_context(DownloadManager::new());
-        let resp = dispatch(
-            ControlRequest::ConfigGet { key: "download.max_concurrent".to_string() },
-            &ctx,
-        )
-        .await;
         match resp {
             ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::Unsupported),
             other => panic!("expected Error{{Unsupported}}, got {other:?}"),
@@ -1645,5 +1680,85 @@ mod tests {
         }
         let task = ctx.manager.get_by_id(id).await.expect("task still queued");
         assert_eq!(task.priority, 5);
+    }
+
+    // Exercises the real `Config::save()`/load path, so it needs an isolated
+    // config directory; `#[serial]` keeps it from racing other tests that
+    // touch the same process-global override.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_config_set_then_get() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        let ctx = test_context(DownloadManager::new());
+        let set_resp = dispatch(
+            ControlRequest::ConfigSet {
+                key: "download.max_concurrent".to_string(),
+                value: "7".to_string(),
+            },
+            &ctx,
+        )
+        .await;
+        match set_resp {
+            ControlResponse::Ok { message } => {
+                assert!(message.contains("download.max_concurrent"), "message: {message}");
+                assert!(message.contains('7'), "message: {message}");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        // Proves the override actually took effect: without it, `save()`
+        // would write to the developer's real config directory instead.
+        assert!(temp_dir.path().join("settings.toml").exists());
+
+        let get_resp = dispatch(
+            ControlRequest::ConfigGet { key: "download.max_concurrent".to_string() },
+            &ctx,
+        )
+        .await;
+        match get_resp {
+            ControlResponse::Value { value } => assert_eq!(value, "7"),
+            other => panic!("expected Value, got {other:?}"),
+        }
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+    }
+
+    #[tokio::test]
+    async fn dispatch_config_set_unknown_key_invalid() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::ConfigSet {
+                key: "no.such.key".to_string(),
+                value: "1".to_string(),
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::InvalidInput),
+            other => panic!("expected Error{{InvalidInput}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_config_set_bad_value_leaves_config_unchanged() {
+        let ctx = test_context(DownloadManager::new());
+        let resp = dispatch(
+            ControlRequest::ConfigSet {
+                key: "download.max_concurrent".to_string(),
+                value: "abc".to_string(),
+            },
+            &ctx,
+        )
+        .await;
+        match resp {
+            ControlResponse::Error { code, .. } => assert_eq!(code, ControlErrorCode::InvalidInput),
+            other => panic!("expected Error{{InvalidInput}}, got {other:?}"),
+        }
+        let config = ctx.state.config.read().await;
+        assert_eq!(config.download.max_concurrent, 3);
     }
 }

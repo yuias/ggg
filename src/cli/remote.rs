@@ -80,7 +80,7 @@ pub fn classify(cmd: &Commands) -> RemoteClass {
         Commands::Config { action } => match action {
             ConfigAction::Get { .. } => RemoteClass::ReadOnly,
             ConfigAction::Show { .. } => RemoteClass::ReadOnly,
-            ConfigAction::Set { .. } => RemoteClass::RefuseWhileRunning,
+            ConfigAction::Set { .. } => RemoteClass::Routed,
         },
         Commands::Logs { .. } => RemoteClass::ReadOnly,
         Commands::History { .. } => RemoteClass::ReadOnly,
@@ -487,6 +487,18 @@ async fn send_and_render(cmd: &Commands, pipe_name: &str) -> RouteDecision {
                 }
             };
             let req = ControlRequest::Move { id: uid, op };
+            match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
+                Ok(ControlResponse::Ok { message }) => {
+                    println!("{message}");
+                    RouteDecision::Handled(error::SUCCESS)
+                }
+                Ok(other) => render_unexpected(other),
+                Err(e) => render_send_error(&e),
+            }
+        }
+
+        Commands::Config { action: ConfigAction::Set { key, value } } => {
+            let req = ControlRequest::ConfigSet { key: key.clone(), value: value.clone() };
             match client::send(pipe_name, &req, Some(REQUEST_TIMEOUT)).await {
                 Ok(ControlResponse::Ok { message }) => {
                     println!("{message}");
@@ -938,6 +950,15 @@ mod tests {
                 to_bottom: false,
                 before: None,
                 folder: None,
+            }),
+            RemoteClass::Routed
+        );
+        assert_eq!(
+            classify(&Commands::Config {
+                action: ConfigAction::Set {
+                    key: "download.max_concurrent".to_string(),
+                    value: "3".to_string(),
+                },
             }),
             RemoteClass::Routed
         );

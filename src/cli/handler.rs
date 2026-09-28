@@ -401,7 +401,7 @@ async fn handle_config(action: ConfigAction, state: &AppState) -> Result<i32> {
 }
 
 /// Get configuration value by dot notation key
-fn get_config_value(config: &Config, key: &str) -> Result<String> {
+pub(crate) fn get_config_value(config: &Config, key: &str) -> Result<String> {
     let parts: Vec<&str> = key.split('.').collect();
 
     match parts.as_slice() {
@@ -427,7 +427,7 @@ fn get_config_value(config: &Config, key: &str) -> Result<String> {
 }
 
 /// Set configuration value by dot notation key
-fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<()> {
+pub(crate) fn set_config_value(config: &mut Config, key: &str, value: &str) -> Result<()> {
     let parts: Vec<&str> = key.split('.').collect();
 
     match parts.as_slice() {
