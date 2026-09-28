@@ -153,9 +153,62 @@ pub fn apply_add_referrer(task: &mut DownloadTask, referrer: &str) {
     }
 }
 
+/// Outcome of applying an edit to several targets.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ItemEditReport {
+    pub changed: usize,
+    pub busy: usize,
+    pub not_found: usize,
+    pub failed: usize,
+}
+
+/// Applies `header_edit`/`new_save_path` to every target, mirroring the CLI `modify` path
+/// (`edit_task_headers` + `apply_header_edit`) for the referrer and `change_save_path` for
+/// the path. A busy or not-found referrer edit skips the path for that target, since the
+/// task either does not exist or is about to overwrite this edit on its own. Does not
+/// persist; the caller runs `save_queue()` when `changed > 0`.
+pub async fn apply_item_edit(
+    manager: &crate::download::manager::DownloadManager,
+    targets: &[Uuid],
+    header_edit: Option<&HeaderEdit>,
+    new_save_path: Option<&std::path::Path>,
+) -> ItemEditReport {
+    let mut report = ItemEditReport::default();
+    for &id in targets {
+        let mut applied = false;
+        if let Some(edit) = header_edit {
+            match manager
+                .edit_task_headers(id, |task| crate::cli::daemon_ops::apply_header_edit(task, edit))
+                .await
+            {
+                Ok(_) => applied = true,
+                Err(crate::download::manager::EditHeadersError::Busy(_, _)) => {
+                    report.busy += 1;
+                    continue;
+                }
+                Err(crate::download::manager::EditHeadersError::NotFound) => {
+                    report.not_found += 1;
+                    continue;
+                }
+            }
+        }
+        if let Some(path) = new_save_path {
+            match manager.change_save_path(id, path.to_path_buf()).await {
+                Ok(()) => applied = true,
+                Err(_) => report.failed += 1,
+            }
+        }
+        if applied {
+            report.changed += 1;
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::download::manager::DownloadManager;
     use crate::download::task::DownloadTask;
     use std::path::PathBuf;
 
@@ -266,5 +319,102 @@ mod tests {
         let mut task = task_with_headers(&[]);
         apply_add_referrer(&mut task, "   ");
         assert_eq!(find_header(&task, "Referer"), None);
+    }
+
+    async fn manager_with_task(headers: &[(&str, &str)]) -> (DownloadManager, Uuid) {
+        let manager = DownloadManager::new();
+        let task = task_with_headers(headers);
+        let id = task.id;
+        manager.add_download(task).await;
+        (manager, id)
+    }
+
+    #[tokio::test]
+    async fn apply_sets_referrer_on_pending_task() {
+        let (manager, id) = manager_with_task(&[]).await;
+        let original_path = manager.get_by_id(id).await.expect("task queued").save_path;
+        let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
+        let report = apply_item_edit(&manager, &[id], Some(&edit), None).await;
+        assert_eq!(report, ItemEditReport { changed: 1, ..Default::default() });
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(find_header(&task, "Referer"), Some("https://a.example/"));
+        assert_eq!(task.save_path, original_path, "no new_save_path must leave the path untouched");
+    }
+
+    #[tokio::test]
+    async fn apply_clears_referrer() {
+        let (manager, id) = manager_with_task(&[("Referer", "https://a.example/")]).await;
+        let edit = HeaderEdit { clear_referrer: true, ..Default::default() };
+        let report = apply_item_edit(&manager, &[id], Some(&edit), None).await;
+        assert_eq!(report, ItemEditReport { changed: 1, ..Default::default() });
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(find_header(&task, "Referer"), None);
+    }
+
+    #[tokio::test]
+    async fn apply_changes_save_path_only_when_given() {
+        let (manager, id) = manager_with_task(&[]).await;
+        let new_path = PathBuf::from("/tmp/new-name");
+        let report = apply_item_edit(&manager, &[id], None, Some(&new_path)).await;
+        assert_eq!(report, ItemEditReport { changed: 1, ..Default::default() });
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(task.save_path, new_path);
+        assert_eq!(find_header(&task, "Referer"), None, "no header_edit must leave headers untouched");
+    }
+
+    #[tokio::test]
+    async fn apply_both_fields_on_one_target_counts_as_one_changed() {
+        let (manager, id) = manager_with_task(&[]).await;
+        let new_path = PathBuf::from("/tmp/new-name");
+        let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
+        let report = apply_item_edit(&manager, &[id], Some(&edit), Some(&new_path)).await;
+        assert_eq!(
+            report,
+            ItemEditReport { changed: 1, ..Default::default() },
+            "a target counts as changed once, not per applied field"
+        );
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(task.save_path, new_path);
+        assert_eq!(find_header(&task, "Referer"), Some("https://a.example/"));
+    }
+
+    #[tokio::test]
+    async fn apply_skips_running_task_as_busy() {
+        let (manager, id) = manager_with_task(&[]).await;
+        let handle = tokio::spawn(std::future::pending::<()>());
+        manager.insert_active_handle_for_test(id, handle).await;
+
+        let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
+        let new_path = PathBuf::from("/tmp/new-name");
+        let report = apply_item_edit(&manager, &[id], Some(&edit), Some(&new_path)).await;
+        assert_eq!(report, ItemEditReport { busy: 1, ..Default::default() });
+
+        let task = manager.get_by_id(id).await.expect("task still queued");
+        assert_eq!(find_header(&task, "Referer"), None, "a busy target must get neither field applied");
+        assert_ne!(task.save_path, new_path, "a busy target must get neither field applied");
+
+        manager.abort_active_handle_for_test(id).await;
+    }
+
+    #[tokio::test]
+    async fn apply_counts_unknown_id_as_not_found() {
+        let manager = DownloadManager::new();
+        let unknown = Uuid::new_v4();
+        let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
+        let report = apply_item_edit(&manager, &[unknown], Some(&edit), None).await;
+        assert_eq!(report, ItemEditReport { not_found: 1, ..Default::default() });
+    }
+
+    #[tokio::test]
+    async fn apply_multiple_targets_counts_each() {
+        let manager = DownloadManager::new();
+        let ok_task = task_with_headers(&[]);
+        let ok_id = ok_task.id;
+        manager.add_download(ok_task).await;
+        let unknown = Uuid::new_v4();
+
+        let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
+        let report = apply_item_edit(&manager, &[ok_id, unknown], Some(&edit), None).await;
+        assert_eq!(report, ItemEditReport { changed: 1, not_found: 1, ..Default::default() });
     }
 }
