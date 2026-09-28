@@ -38,5 +38,5 @@ confirm-delete-multiple = Delete {$count} downloads?
 # Help text in dialogs
 help-edit-field = Enter: Edit value
 help-folder-edit-navigate = j/k: navigate | Enter: edit field | Esc: back to settings
-help-folder-list = Enter: edit folder | s: save config
+help-folder-list = Enter: edit folder
 help-script-toggle = j/k: Navigate  Space/Enter: Toggle  r: Reload all

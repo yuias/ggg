@@ -1211,11 +1211,6 @@ impl TuiApp {
                         self.start_rename_folder().await;
                     }
 
-                    // Save configuration
-                    KeyCode::Char('s') => {
-                        self.save_config().await?;
-                    }
-
                     // Enter folder edit mode
                     KeyCode::Enter => {
                         if self.state.selected_folder_id.is_some() {
@@ -1384,49 +1379,86 @@ impl TuiApp {
     /// Save the edited field value
     async fn save_field_edit(&mut self) -> Result<()> {
         use super::state::SettingsField;
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
 
-        if let Some(ref folder_id) = self.state.selected_folder_id {
-            if let Some(field) = self.state.settings_edit_field {
-                let mut config = self.state.app_state.config.write().await;
-                if let Some(folder) = config.folders.get_mut(folder_id) {
-                    match field {
-                        SettingsField::FolderSavePath => {
-                            folder.save_path = PathBuf::from(&self.state.input_buffer);
-                            tracing::info!("Updated save_path to '{}' for folder '{}'", self.state.input_buffer, folder_id);
-                        }
-                        SettingsField::FolderMaxConcurrent => {
-                            if self.state.input_buffer.is_empty() {
-                                folder.max_concurrent = None;
-                                tracing::info!("Cleared max_concurrent for folder '{}'", folder_id);
-                            } else if let Ok(value) = self.state.input_buffer.parse::<usize>() {
-                                folder.max_concurrent = Some(value);
-                                tracing::info!("Updated max_concurrent to {} for folder '{}'", value, folder_id);
-                            } else {
-                                self.state.validation_error = Some(format!(
-                                    "Invalid number: '{}'. Expected a positive integer or leave empty to inherit.",
-                                    self.state.input_buffer
-                                ));
-                                tracing::warn!("Invalid number: '{}'", self.state.input_buffer);
-                            }
-                        }
-                        SettingsField::FolderUserAgent => {
-                            if self.state.input_buffer.is_empty() {
-                                folder.user_agent = None;
-                                tracing::info!("Cleared user_agent for folder '{}'", folder_id);
-                            } else {
-                                folder.user_agent = Some(self.state.input_buffer.clone());
-                                tracing::info!("Updated user_agent to '{}' for folder '{}'", self.state.input_buffer, folder_id);
-                            }
-                        }
-                        _ => {}
+        let Some(folder_id) = self.state.selected_folder_id.clone() else {
+            return Ok(());
+        };
+        let Some(field) = self.state.settings_edit_field else {
+            return Ok(());
+        };
+
+        match field {
+            SettingsField::FolderSavePath => {
+                let value = PathBuf::from(&self.state.input_buffer);
+                let command = Command::UpdateFolderSavePath { folder_id: folder_id.clone(), value };
+                let response =
+                    handle_command(command, self.state.app_state.clone(), self.manager.clone()).await;
+                match response {
+                    CommandResponse::Success { .. } => {
+                        self.state.validation_error = None;
+                        tracing::info!("Updated save_path to '{}' for folder '{}'", self.state.input_buffer, folder_id);
+                    }
+                    CommandResponse::Error(err) => {
+                        tracing::error!("Failed to update folder save_path: {}", err);
+                        self.state.validation_error =
+                            Some(crate::tui::localize_command_error(&self.state, &err));
                     }
                 }
-                // Persist immediately so a confirmed folder-field edit isn't
-                // lost when the user quits without pressing the save key.
-                if let Err(e) = config.save() {
-                    tracing::error!("Failed to persist folder settings: {}", e);
+            }
+            SettingsField::FolderMaxConcurrent => {
+                let value = if self.state.input_buffer.is_empty() {
+                    Some(None)
+                } else if let Ok(value) = self.state.input_buffer.parse::<usize>() {
+                    Some(Some(value))
+                } else {
+                    None
+                };
+
+                let Some(value) = value else {
+                    self.state.validation_error = Some(format!(
+                        "Invalid number: '{}'. Expected a positive integer or leave empty to inherit.",
+                        self.state.input_buffer
+                    ));
+                    tracing::warn!("Invalid number: '{}'", self.state.input_buffer);
+                    return Ok(());
+                };
+
+                let command = Command::UpdateFolderMaxConcurrent { folder_id: folder_id.clone(), value };
+                let response =
+                    handle_command(command, self.state.app_state.clone(), self.manager.clone()).await;
+                match response {
+                    CommandResponse::Success { .. } => {
+                        self.state.validation_error = None;
+                        tracing::info!("Updated max_concurrent to {:?} for folder '{}'", value, folder_id);
+                    }
+                    CommandResponse::Error(err) => {
+                        tracing::error!("Failed to update folder max_concurrent: {}", err);
+                        self.state.validation_error =
+                            Some(crate::tui::localize_command_error(&self.state, &err));
+                    }
                 }
             }
+            SettingsField::FolderUserAgent => {
+                let value =
+                    if self.state.input_buffer.is_empty() { None } else { Some(self.state.input_buffer.clone()) };
+
+                let command = Command::UpdateFolderUserAgent { folder_id: folder_id.clone(), value };
+                let response =
+                    handle_command(command, self.state.app_state.clone(), self.manager.clone()).await;
+                match response {
+                    CommandResponse::Success { .. } => {
+                        self.state.validation_error = None;
+                        tracing::info!("Updated user_agent for folder '{}'", folder_id);
+                    }
+                    CommandResponse::Error(err) => {
+                        tracing::error!("Failed to update folder user_agent: {}", err);
+                        self.state.validation_error =
+                            Some(crate::tui::localize_command_error(&self.state, &err));
+                    }
+                }
+            }
+            _ => {}
         }
 
         Ok(())
@@ -1493,15 +1525,25 @@ impl TuiApp {
 
     /// Toggle auto_date_directory for selected folder
     async fn toggle_auto_date(&mut self) -> Result<()> {
-        if let Some(ref folder_id) = self.state.selected_folder_id {
-            let mut config = self.state.app_state.config.write().await;
-            if let Some(folder) = config.folders.get_mut(folder_id) {
-                folder.auto_date_directory = !folder.auto_date_directory;
-                tracing::info!(
-                    "Toggled auto_date_directory to {} for folder '{}'",
-                    folder.auto_date_directory,
-                    folder_id
-                );
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
+
+        let Some(folder_id) = self.state.selected_folder_id.clone() else {
+            return Ok(());
+        };
+        let config = self.state.app_state.config.read().await;
+        let current = config.folders.get(&folder_id).map(|f| f.auto_date_directory).unwrap_or(false);
+        drop(config);
+
+        let command = Command::UpdateFolderAutoDateDirectory { folder_id: folder_id.clone(), value: !current };
+        let response = handle_command(command, self.state.app_state.clone(), self.manager.clone()).await;
+        match response {
+            CommandResponse::Success { .. } => {
+                self.state.validation_error = None;
+                tracing::info!("Toggled auto_date_directory to {} for folder '{}'", !current, folder_id);
+            }
+            CommandResponse::Error(err) => {
+                tracing::error!("Failed to update auto_date_directory: {}", err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
             }
         }
         Ok(())
@@ -1509,15 +1551,25 @@ impl TuiApp {
 
     /// Toggle auto_start_downloads for selected folder
     async fn toggle_auto_start(&mut self) -> Result<()> {
-        if let Some(ref folder_id) = self.state.selected_folder_id {
-            let mut config = self.state.app_state.config.write().await;
-            if let Some(folder) = config.folders.get_mut(folder_id) {
-                folder.auto_start_downloads = !folder.auto_start_downloads;
-                tracing::info!(
-                    "Toggled auto_start_downloads to {} for folder '{}'",
-                    folder.auto_start_downloads,
-                    folder_id
-                );
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
+
+        let Some(folder_id) = self.state.selected_folder_id.clone() else {
+            return Ok(());
+        };
+        let config = self.state.app_state.config.read().await;
+        let current = config.folders.get(&folder_id).map(|f| f.auto_start_downloads).unwrap_or(false);
+        drop(config);
+
+        let command = Command::UpdateFolderAutoStartDownloads { folder_id: folder_id.clone(), value: !current };
+        let response = handle_command(command, self.state.app_state.clone(), self.manager.clone()).await;
+        match response {
+            CommandResponse::Success { .. } => {
+                self.state.validation_error = None;
+                tracing::info!("Toggled auto_start_downloads to {} for folder '{}'", !current, folder_id);
+            }
+            CommandResponse::Error(err) => {
+                tracing::error!("Failed to update auto_start_downloads: {}", err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
             }
         }
         Ok(())
@@ -1525,15 +1577,25 @@ impl TuiApp {
 
     /// Toggle prevent_duplicate_url for selected folder
     async fn toggle_prevent_duplicate_url(&mut self) -> Result<()> {
-        if let Some(ref folder_id) = self.state.selected_folder_id {
-            let mut config = self.state.app_state.config.write().await;
-            if let Some(folder) = config.folders.get_mut(folder_id) {
-                folder.prevent_duplicate_url = !folder.prevent_duplicate_url;
-                tracing::info!(
-                    "Toggled prevent_duplicate_url to {} for folder '{}'",
-                    folder.prevent_duplicate_url,
-                    folder_id
-                );
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
+
+        let Some(folder_id) = self.state.selected_folder_id.clone() else {
+            return Ok(());
+        };
+        let config = self.state.app_state.config.read().await;
+        let current = config.folders.get(&folder_id).map(|f| f.prevent_duplicate_url).unwrap_or(false);
+        drop(config);
+
+        let command = Command::UpdateFolderPreventDuplicateUrl { folder_id: folder_id.clone(), value: !current };
+        let response = handle_command(command, self.state.app_state.clone(), self.manager.clone()).await;
+        match response {
+            CommandResponse::Success { .. } => {
+                self.state.validation_error = None;
+                tracing::info!("Toggled prevent_duplicate_url to {} for folder '{}'", !current, folder_id);
+            }
+            CommandResponse::Error(err) => {
+                tracing::error!("Failed to update prevent_duplicate_url: {}", err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
             }
         }
         Ok(())
@@ -1541,19 +1603,31 @@ impl TuiApp {
 
     /// Cycle scripts_enabled through None -> Some(false) -> Some(true) -> None
     async fn cycle_scripts_enabled(&mut self) -> Result<()> {
-        if let Some(ref folder_id) = self.state.selected_folder_id {
-            let mut config = self.state.app_state.config.write().await;
-            if let Some(folder) = config.folders.get_mut(folder_id) {
-                folder.scripts_enabled = match folder.scripts_enabled {
-                    None => Some(false),
-                    Some(false) => Some(true),
-                    Some(true) => None,
-                };
-                tracing::info!(
-                    "Cycled scripts_enabled to {:?} for folder '{}'",
-                    folder.scripts_enabled,
-                    folder_id
-                );
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
+
+        let Some(folder_id) = self.state.selected_folder_id.clone() else {
+            return Ok(());
+        };
+        let config = self.state.app_state.config.read().await;
+        let current = config.folders.get(&folder_id).and_then(|f| f.scripts_enabled);
+        drop(config);
+
+        let next = match current {
+            None => Some(false),
+            Some(false) => Some(true),
+            Some(true) => None,
+        };
+
+        let command = Command::UpdateFolderScriptsEnabled { folder_id: folder_id.clone(), value: next };
+        let response = handle_command(command, self.state.app_state.clone(), self.manager.clone()).await;
+        match response {
+            CommandResponse::Success { .. } => {
+                self.state.validation_error = None;
+                tracing::info!("Cycled scripts_enabled to {:?} for folder '{}'", next, folder_id);
+            }
+            CommandResponse::Error(err) => {
+                tracing::error!("Failed to update scripts_enabled: {}", err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
             }
         }
         Ok(())
@@ -2322,39 +2396,24 @@ impl TuiApp {
 
     /// Create a new folder in settings
     async fn create_new_folder(&mut self) -> Result<()> {
-        let mut config = self.state.app_state.config.write().await;
+        use crate::ui::commands::{Command, CommandResponse, handle_command};
 
-        // Generate unique display name
-        let mut counter = 1;
-        let mut display_name = format!("folder_{}", counter);
-        while config.folders.values().any(|f| f.name == display_name) {
-            counter += 1;
-            display_name = format!("folder_{}", counter);
+        let response =
+            handle_command(Command::CreateFolder, self.state.app_state.clone(), self.manager.clone()).await;
+
+        match response {
+            CommandResponse::Success { data } => {
+                self.state.validation_error = None;
+                if let Some(folder_id) = data.get("folder_id").and_then(|v| v.as_str()) {
+                    tracing::info!("Created new folder '{}'", folder_id);
+                    self.state.selected_folder_id = Some(folder_id.to_string());
+                }
+            }
+            CommandResponse::Error(err) => {
+                tracing::error!("Failed to create folder: {}", err);
+                self.state.validation_error = Some(crate::tui::localize_command_error(&self.state, &err));
+            }
         }
-
-        // UUID-based folder ID
-        let new_folder_id = crate::app::config::Config::generate_folder_id();
-
-        // Create new folder with default settings
-        let new_folder = crate::app::config::FolderConfig {
-            name: display_name,
-            save_path: config.download.default_directory.clone(),
-            auto_date_directory: false,
-            auto_start_downloads: false,
-            scripts_enabled: None,
-            script_files: None,
-            max_concurrent: None,
-            user_agent: None,
-            referrer_policy: None,
-            default_headers: std::collections::HashMap::new(),
-            prevent_duplicate_url: false,
-        };
-
-        config.folders.insert(new_folder_id.clone(), new_folder);
-        drop(config);
-
-        // Select the newly created folder
-        self.state.selected_folder_id = Some(new_folder_id);
 
         Ok(())
     }
@@ -2493,14 +2552,6 @@ impl TuiApp {
                 self.state.settings_folder_index -= 1;
             }
         }
-        Ok(())
-    }
-
-    /// Save configuration to file
-    async fn save_config(&self) -> Result<()> {
-        let config = self.state.app_state.config.read().await;
-        config.save()?;
-        tracing::info!("Configuration saved successfully");
         Ok(())
     }
 

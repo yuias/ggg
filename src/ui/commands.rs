@@ -30,9 +30,15 @@ pub enum Command {
     UpdateReferrerPolicy { policy: ReferrerPolicy },
 
     // Folder-level settings
+    UpdateFolderSavePath { folder_id: String, value: std::path::PathBuf },
     UpdateFolderMaxConcurrent { folder_id: String, value: Option<usize> },
     UpdateFolderUserAgent { folder_id: String, value: Option<String> },
     UpdateFolderReferrerPolicy { folder_id: String, policy: Option<ReferrerPolicy> },
+    UpdateFolderAutoDateDirectory { folder_id: String, value: bool },
+    UpdateFolderAutoStartDownloads { folder_id: String, value: bool },
+    UpdateFolderPreventDuplicateUrl { folder_id: String, value: bool },
+    UpdateFolderScriptsEnabled { folder_id: String, value: Option<bool> },
+    CreateFolder,
 
     // Script settings
     ToggleScriptFile { filename: String },
@@ -399,6 +405,25 @@ pub async fn handle_command(
             }
         }
 
+        Command::UpdateFolderSavePath { folder_id, value } => {
+            let result = commit_config_edit(&state, |config| {
+                let folder_config = config
+                    .folders
+                    .entry(folder_id.clone())
+                    .or_insert_with(crate::app::config::FolderConfig::default);
+                folder_config.save_path = value.clone();
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id}),
+                },
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
         Command::UpdateFolderMaxConcurrent { folder_id, value } => {
             let result = commit_config_edit(&state, |config| {
                 let folder_config = config
@@ -451,6 +476,111 @@ pub async fn handle_command(
             match result {
                 Ok(()) => CommandResponse::Success {
                     data: serde_json::json!({"status": "ok", "folder_id": folder_id}),
+                },
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
+        Command::UpdateFolderAutoDateDirectory { folder_id, value } => {
+            let result = commit_config_edit(&state, |config| {
+                let folder_config = config
+                    .folders
+                    .entry(folder_id.clone())
+                    .or_insert_with(crate::app::config::FolderConfig::default);
+                folder_config.auto_date_directory = value;
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id, "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
+        Command::UpdateFolderAutoStartDownloads { folder_id, value } => {
+            let result = commit_config_edit(&state, |config| {
+                let folder_config = config
+                    .folders
+                    .entry(folder_id.clone())
+                    .or_insert_with(crate::app::config::FolderConfig::default);
+                folder_config.auto_start_downloads = value;
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id, "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
+        Command::UpdateFolderPreventDuplicateUrl { folder_id, value } => {
+            let result = commit_config_edit(&state, |config| {
+                let folder_config = config
+                    .folders
+                    .entry(folder_id.clone())
+                    .or_insert_with(crate::app::config::FolderConfig::default);
+                folder_config.prevent_duplicate_url = value;
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id, "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
+        Command::UpdateFolderScriptsEnabled { folder_id, value } => {
+            let result = commit_config_edit(&state, |config| {
+                let folder_config = config
+                    .folders
+                    .entry(folder_id.clone())
+                    .or_insert_with(crate::app::config::FolderConfig::default);
+                folder_config.scripts_enabled = value;
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": folder_id, "value": value}),
+                },
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
+        Command::CreateFolder => {
+            let new_folder_id = Config::generate_folder_id();
+            let result = commit_config_edit(&state, |config| {
+                let mut counter = 1;
+                let mut display_name = format!("folder_{}", counter);
+                while config.folders.values().any(|f| f.name == display_name) {
+                    counter += 1;
+                    display_name = format!("folder_{}", counter);
+                }
+
+                let new_folder = crate::app::config::FolderConfig {
+                    name: display_name,
+                    save_path: config.download.default_directory.clone(),
+                    ..crate::app::config::FolderConfig::default()
+                };
+
+                config.folders.insert(new_folder_id.clone(), new_folder);
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({"status": "ok", "folder_id": new_folder_id}),
                 },
                 Err(e) => CommandResponse::Error(e),
             }
@@ -640,5 +770,96 @@ mod tests {
         }
         let config = state.config.read().await;
         assert_eq!(config.folders.get("folder-1").and_then(|f| f.max_concurrent), Some(2));
+    }
+
+    // Exercises the real `Config::save()`/load path, so it needs an isolated
+    // config directory; `#[serial]` keeps it from racing other tests that
+    // touch the same process-global override.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_folder_auto_date_directory_persists_to_disk() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        // A non-UUID key would be treated as a legacy name and re-keyed on
+        // load, so use a real UUID folder id like production code does.
+        let folder_id = Config::generate_folder_id();
+        let mut config = Config::default();
+        config.folders.insert(folder_id.clone(), FolderConfig::default());
+        let state = state_with(config);
+
+        let response = handle_command(
+            Command::UpdateFolderAutoDateDirectory { folder_id: folder_id.clone(), value: true },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(response, CommandResponse::Success { .. }), "response: {response:?}");
+
+        // Reload from disk (as a fresh process would after a quit) to prove
+        // the toggle was not only applied in memory.
+        let reloaded = Config::load().expect("reloaded config");
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert_eq!(reloaded.folders.get(&folder_id).map(|f| f.auto_date_directory), Some(true));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn create_folder_persists_to_disk() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        let state = state_with(Config::default());
+
+        let response = handle_command(Command::CreateFolder, state.clone(), DownloadManager::new()).await;
+        let folder_id = match response {
+            CommandResponse::Success { data } => data
+                .get("folder_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .expect("response carries the new folder_id"),
+            other => panic!("expected Success, got {other:?}"),
+        };
+
+        let reloaded = Config::load().expect("reloaded config");
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert!(reloaded.folders.contains_key(&folder_id));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_folder_save_path_persists_to_disk() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        let folder_id = Config::generate_folder_id();
+        let mut config = Config::default();
+        config.folders.insert(folder_id.clone(), FolderConfig::default());
+        let state = state_with(config);
+
+        let new_path = std::path::PathBuf::from("custom_downloads");
+        let response = handle_command(
+            Command::UpdateFolderSavePath { folder_id: folder_id.clone(), value: new_path.clone() },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(response, CommandResponse::Success { .. }), "response: {response:?}");
+
+        let reloaded = Config::load().expect("reloaded config");
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert_eq!(reloaded.folders.get(&folder_id).map(|f| f.save_path.clone()), Some(new_path));
     }
 }

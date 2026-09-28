@@ -38,5 +38,5 @@ confirm-delete-multiple = {$count}個のダウンロードを削除しますか�
 # Help text in dialogs
 help-edit-field = Enter: Edit Value
 help-folder-edit-navigate = j/k: Navigate | Enter: Edit Field | Esc: Back to Settings
-help-folder-list = Enter: Edit Folder | s: Save Settings
+help-folder-list = Enter: Edit Folder
 help-script-toggle = j/k: Navigate  Space/Enter: Toggle  r: Reload All

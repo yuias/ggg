@@ -1241,7 +1241,6 @@ fn render_folder_list(app: &TuiApp, f: &mut Frame, area: Rect) {
     let border_color = theme::BORDER_INACTIVE;
     let success_color = theme::STATUS_SUCCESS;
     let error_color = theme::STATUS_ERROR;
-    let section_header_color = theme::ACCENT_SECTION;
     let muted_color = theme::TEXT_MUTED;
 
     let mut folder_items = Vec::new();
@@ -1295,10 +1294,6 @@ fn render_folder_list(app: &TuiApp, f: &mut Frame, area: Rect) {
     folder_items.push(Line::from(Span::styled(
         "d: delete",
         Style::default().fg(error_color),
-    )));
-    folder_items.push(Line::from(Span::styled(
-        "s: save config",
-        Style::default().fg(section_header_color),
     )));
     folder_items.push(Line::from(Span::styled(
         "x/Esc: close",
