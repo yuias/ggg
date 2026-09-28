@@ -690,7 +690,16 @@ fn render_status_bar(app: &TuiApp, f: &mut Frame, area: Rect) {
             (t("status-hint-close"), String::new())
         }
         UiMode::Settings => {
-            (t("status-hint-settings"), String::new())
+            // The restart notice set right after editing a field is shown
+            // here too, not only in Normal mode, since the user is usually
+            // still on the settings screen when it matters.
+            let status_hint = app
+                .state
+                .status_message
+                .as_ref()
+                .map(|msg| format!(" | {msg}"))
+                .unwrap_or_default();
+            (format!("{}{}", t("status-hint-settings"), status_hint), String::new())
         }
         UiMode::FolderEdit => {
             (t("status-hint-folder-edit"), String::new())
@@ -1017,8 +1026,19 @@ fn render_application_settings(app: &TuiApp, f: &mut Frame, area: Rect) {
                 }
             };
 
+            let restart_marker = if field.requires_restart() {
+                format!(" {}", app.state.t("settings-restart-marker"))
+            } else {
+                String::new()
+            };
             lines.push(Line::from(Span::styled(
-                format!("{}{}: {}", prefix, app.state.t(field.label_key()), value),
+                format!(
+                    "{}{}{}: {}",
+                    prefix,
+                    app.state.t(field.label_key()),
+                    restart_marker,
+                    value
+                ),
                 style,
             )));
 

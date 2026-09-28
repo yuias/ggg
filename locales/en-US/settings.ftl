@@ -87,3 +87,7 @@ settings-tab-scripts = Scripts
 settings-tab-folders = Folders
 settings-hint-switch-tab = Tab/Shift+Tab: switch tabs
 settings-hint-close = Esc/q/x: close
+
+# Restart-required fields
+settings-restart-marker = (restart required)
+settings-restart-notice = { $label } will take effect after you restart the application.

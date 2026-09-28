@@ -1781,6 +1781,11 @@ impl DownloadManager {
         *current = max;
     }
 
+    /// Current application-wide concurrency limit (see `set_max_concurrent`).
+    pub async fn get_max_concurrent(&self) -> usize {
+        *self.max_concurrent.read().await
+    }
+
     /// Number of live handles (downloading, waiting for a permit, or in
     /// retry backoff). A finished-but-not-yet-released entry (see
     /// `release_active_entry`) does not count.

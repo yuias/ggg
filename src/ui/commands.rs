@@ -272,9 +272,15 @@ pub async fn handle_command(
             })
             .await
             {
-                Ok(()) => CommandResponse::Success {
-                    data: serde_json::json!({"status": "ok", "value": value}),
-                },
+                Ok(()) => {
+                    // Applies live: no restart needed, unlike the other
+                    // download-limit fields (the manager rebuilds its
+                    // per-folder queues only at startup).
+                    download_manager.set_max_concurrent(value).await;
+                    CommandResponse::Success {
+                        data: serde_json::json!({"status": "ok", "value": value}),
+                    }
+                }
                 Err(e) => CommandResponse::Error(e),
             }
         }
@@ -786,6 +792,27 @@ mod tests {
         }
         let config = state.config.read().await;
         assert_eq!(config.download.max_concurrent, 10);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_max_concurrent_applies_to_manager_live() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        crate::util::paths::set_config_dir_override(Some(temp_dir.path().to_path_buf()));
+        unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+
+        let config = Config::default();
+        let state = state_with(config);
+        let manager = DownloadManager::new();
+
+        let response =
+            handle_command(Command::UpdateMaxConcurrent { value: 7 }, state.clone(), manager.clone()).await;
+
+        crate::util::paths::set_config_dir_override(None);
+        unsafe { std::env::remove_var("GGG_TEST_MODE") };
+
+        assert!(matches!(response, CommandResponse::Success { .. }));
+        assert_eq!(manager.get_max_concurrent().await, 7);
     }
 
     #[tokio::test]

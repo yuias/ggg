@@ -1069,6 +1069,15 @@ impl TuiApp {
                     if reload_scripts {
                         tracing::info!("Scripts reloaded successfully");
                     } else {
+                        // Keys are resolved against this cached table, so a
+                        // reload must rebuild it or a remapped `[keybindings]`
+                        // would not take effect until the next restart.
+                        let config = self.state.app_state.config.read().await;
+                        self.state.keybinding_resolver =
+                            crate::app::keybindings::KeybindingResolver::from_config(
+                                &config.ui.keybindings,
+                            );
+                        drop(config);
                         tracing::info!("Configuration reloaded successfully");
                     }
                 }
@@ -1633,6 +1642,7 @@ impl TuiApp {
 
     /// Toggle scripts enabled at application level
     async fn toggle_app_scripts_enabled(&mut self) -> Result<()> {
+        use super::state::ApplicationSettingsField;
         use crate::ui::commands::{Command, handle_command};
 
         let config = self.state.app_state.config.write().await;
@@ -1640,12 +1650,20 @@ impl TuiApp {
         drop(config);
 
         let command = Command::UpdateScriptsEnabled { value: new_value };
-        handle_command(
+        let response = handle_command(
             command,
             self.state.app_state.clone(),
             self.manager.clone(),
         )
         .await;
+
+        if let crate::ui::commands::CommandResponse::Success { .. } = response {
+            let args = fluent::fluent_args! {
+                "label" => self.state.t(ApplicationSettingsField::ScriptsEnabled.label_key()),
+            };
+            self.state.status_message =
+                Some(self.state.t_with_args("settings-restart-notice", Some(&args)));
+        }
 
         tracing::info!("Toggled scripts enabled to {}", new_value);
         Ok(())
@@ -1673,6 +1691,7 @@ impl TuiApp {
 
     /// Toggle auto-launch ggg-dnd at application level
     async fn toggle_app_auto_launch_dnd(&mut self) -> Result<()> {
+        use super::state::ApplicationSettingsField;
         use crate::ui::commands::{Command, handle_command};
 
         let config = self.state.app_state.config.write().await;
@@ -1680,12 +1699,20 @@ impl TuiApp {
         drop(config);
 
         let command = Command::UpdateAutoLaunchDnd { value: new_value };
-        handle_command(
+        let response = handle_command(
             command,
             self.state.app_state.clone(),
             self.manager.clone(),
         )
         .await;
+
+        if let crate::ui::commands::CommandResponse::Success { .. } = response {
+            let args = fluent::fluent_args! {
+                "label" => self.state.t(ApplicationSettingsField::AutoLaunchDnd.label_key()),
+            };
+            self.state.status_message =
+                Some(self.state.t_with_args("settings-restart-notice", Some(&args)));
+        }
 
         tracing::info!("Toggled auto launch dnd to {}", new_value);
         Ok(())
@@ -2626,9 +2653,12 @@ impl TuiApp {
                 self.state.validation_error = None;  // Clear error on success
                 tracing::info!("Application setting updated successfully");
 
-                // Log restart reminder for language changes
-                if matches!(field, ApplicationSettingsField::Language) {
-                    tracing::info!("Language changed. Please restart application for changes to take effect.");
+                if field.requires_restart() {
+                    let args = fluent::fluent_args! {
+                        "label" => self.state.t(field.label_key()),
+                    };
+                    self.state.status_message =
+                        Some(self.state.t_with_args("settings-restart-notice", Some(&args)));
                 }
             }
             crate::ui::commands::CommandResponse::Error(err) => {

@@ -87,3 +87,7 @@ settings-tab-scripts = スクリプト
 settings-tab-folders = フォルダ
 settings-hint-switch-tab = Tab/Shift+Tab: タブ切り替え
 settings-hint-close = Esc/q/x: 閉じる
+
+# Restart-required fields
+settings-restart-marker = (再起動が必要)
+settings-restart-notice = { $label } の変更はアプリケーションを再起動すると反映されます。

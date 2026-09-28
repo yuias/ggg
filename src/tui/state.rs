@@ -198,16 +198,22 @@ impl ApplicationSettingsField {
     }
 
     /// Whether changing this field only takes effect after a restart.
-    /// `MaxConcurrent` is included until the manager is updated live.
+    /// `MaxConcurrent` applies live via `DownloadManager::set_max_concurrent`,
+    /// so it is not in this list; the others are read only at startup (see
+    /// `main.rs`, where the manager and its per-folder queues are built once).
+    /// `ScriptsEnabled` is included because the script executor thread is
+    /// only spawned when scripts are enabled at startup (`AppState::new_with_scripts`);
+    /// turning it on later leaves `script_sender` `None` for the rest of the
+    /// session, so scripts silently never run until a restart.
     pub fn requires_restart(&self) -> bool {
         matches!(
             self,
             Self::Language
                 | Self::AutoLaunchDnd
                 | Self::RetryCount
-                | Self::MaxConcurrent
                 | Self::MaxConcurrentPerFolder
                 | Self::MaxActiveFolders
+                | Self::ScriptsEnabled
         )
     }
 
