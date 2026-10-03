@@ -27,7 +27,7 @@ The **Config key** column is the name used under `[keybindings]` in `settings.to
 | Page up                            | `Ctrl+u`              | `page_up`                | Normal, Settings, Dialog, Help       |
 | Page down                          | `Ctrl+d`              | `page_down`              | Normal, Settings, Dialog, Help       |
 | Focus next pane / next tab         | `Tab`                 | `focus_next_pane`        | Normal, Settings                     |
-| Focus previous pane / previous tab | `BackTab` (Shift+Tab) | `focus_prev_pane`        | Normal, Settings                     |
+| Focus previous pane / previous tab | `BackTab` (`Shift+Tab` alias) | `focus_prev_pane`        | Normal, Settings                     |
 | Focus left                         | `h`, `Left`           | `focus_left`             | Normal, Settings                     |
 | Focus right                        | `l`, `Right`          | `focus_right`            | Normal, Settings                     |
 | Select item                        | `Enter`               | `select_item`            | Normal, Settings, Menu, Dialog       |
@@ -75,6 +75,6 @@ Add a `[keybindings]` table to `settings.toml`. `examples/settings.toml.example`
 A key is written as a string:
 
 - A single character: `"a"`, `"j"`. An uppercase letter such as `"G"` is typed with Shift.
-- A named key: `Enter`, `Space`, `Tab`, `BackTab`, `Escape`, `Backspace`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, `Delete`, `Insert`, `F1` to `F12`.
+- A named key: `Enter`, `Space`, `Tab`, `BackTab`, `Escape`, `Backspace`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, `Delete`, `Insert`, `F1` to `F12`. `Shift+Tab` is accepted as an alias of `BackTab`.
 - A key with modifiers: `Ctrl+`, `Alt+` or `Shift+` in front, for example `"Ctrl+z"`.
 - A list of keys to bind several keys to one action: `["k", "Up"]`.

@@ -224,6 +224,16 @@ impl KeyCombo {
         // Parse key code
         let code = parse_key_code(key_part)?;
 
+        // Same canonical form as normalize_key_event, limited to Tab so that
+        // other shifted keys (e.g. "Shift+A") keep their parsing.
+        let (code, modifiers) = match code {
+            KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
+                (KeyCode::BackTab, modifiers - KeyModifiers::SHIFT)
+            }
+            KeyCode::BackTab => (code, modifiers - KeyModifiers::SHIFT),
+            _ => (code, modifiers),
+        };
+
         Some(KeyCombo::new(code, modifiers))
     }
 
@@ -511,14 +521,17 @@ pub fn format_key_for_display(key: &str) -> String {
     }
 }
 
-/// Normalize key events to handle shifted characters consistently.
-/// Terminals may or may not include SHIFT in modifiers for characters
-/// that are inherently shifted (e.g., '?', '!', 'A'-'Z').
-/// Strip SHIFT when the character itself already represents the shifted form.
+/// Strip SHIFT where the key code already encodes it. Terminals disagree on
+/// whether SHIFT is reported for shifted characters ('?', '!', 'A'-'Z'), and
+/// crossterm reports Shift+Tab as BackTab *with* SHIFT.
 fn normalize_key_event(code: KeyCode, modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
     match code {
         KeyCode::Char(c) if !c.is_ascii_lowercase() => {
             (code, modifiers - KeyModifiers::SHIFT)
+        }
+        KeyCode::BackTab => (code, modifiers - KeyModifiers::SHIFT),
+        KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
+            (KeyCode::BackTab, modifiers - KeyModifiers::SHIFT)
         }
         _ => (code, modifiers),
     }
@@ -544,6 +557,55 @@ no_such_action = \"z\"
         assert_eq!(
             config.bindings.get(&KeyAction::MoveDown),
             Some(&KeyBindingSpec::Single("x".into()))
+        );
+    }
+
+    #[test]
+    fn backtab_with_shift_resolves_focus_prev_pane() {
+        let resolver = KeybindingResolver::default();
+        assert_eq!(
+            resolver.resolve(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Some(KeyAction::FocusPrevPane)
+        );
+        assert_eq!(
+            resolver.resolve(KeyCode::BackTab, KeyModifiers::empty()),
+            Some(KeyAction::FocusPrevPane)
+        );
+    }
+
+    #[test]
+    fn shift_tab_event_resolves_like_backtab() {
+        let resolver = KeybindingResolver::default();
+        assert_eq!(
+            resolver.resolve(KeyCode::Tab, KeyModifiers::SHIFT),
+            resolver.resolve(KeyCode::BackTab, KeyModifiers::SHIFT)
+        );
+        assert_eq!(
+            resolver.resolve(KeyCode::Tab, KeyModifiers::SHIFT),
+            Some(KeyAction::FocusPrevPane)
+        );
+    }
+
+    #[test]
+    fn parse_shift_tab_aliases() {
+        for s in ["Shift+Tab", "BackTab", "Shift+BackTab"] {
+            let combo = KeyCombo::parse(s).unwrap();
+            assert_eq!(combo.code, KeyCode::BackTab, "{s}");
+            assert!(combo.modifiers.is_empty(), "{s}");
+        }
+        let combo = KeyCombo::parse("Ctrl+Shift+Tab").unwrap();
+        assert_eq!(combo.code, KeyCode::BackTab);
+        assert_eq!(combo.modifiers, KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn custom_shift_tab_binding_resolves() {
+        let config: KeybindingsConfig =
+            toml::from_str("focus_prev_pane = \"Shift+Tab\"\n").unwrap();
+        let resolver = KeybindingResolver::from_config(&config);
+        assert_eq!(
+            resolver.resolve(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Some(KeyAction::FocusPrevPane)
         );
     }
 
