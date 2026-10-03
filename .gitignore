@@ -22,10 +22,10 @@ target
 
 # Claude Code
 .claude/
-.serena/
 
 # Development
 docs/dev/*
+.scoop/
 
 # Local portable config directory for manual testing; ggg uses <exe_dir>/config
 # when present, so it must never be committed or shipped.
