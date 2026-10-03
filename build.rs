@@ -14,6 +14,31 @@ fn main() {
 
     println!("cargo:rustc-env=GIT_HASH={git_hash}");
 
-    // Rebuild when HEAD moves so the embedded hash stays current.
+    // Rebuild when HEAD moves so the embedded hash stays current. A commit on
+    // the current branch only rewrites the branch ref, not .git/HEAD itself.
     println!("cargo:rerun-if-changed=.git/HEAD");
+    for path in ["HEAD", "packed-refs"].into_iter().chain(head_ref().as_deref()) {
+        if let Some(resolved) = git_path(path) {
+            println!("cargo:rerun-if-changed={resolved}");
+        }
+    }
+}
+
+/// The ref HEAD points at (e.g. `refs/heads/main`), or None when detached.
+fn head_ref() -> Option<String> {
+    let out = Command::new("git").args(["symbolic-ref", "-q", "HEAD"]).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8(out.stdout).ok())
+        .flatten()
+        .map(|s| s.trim().to_string())
+}
+
+fn git_path(path: &str) -> Option<String> {
+    let out = Command::new("git").args(["rev-parse", "--git-path", path]).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8(out.stdout).ok())
+        .flatten()
+        .map(|s| s.trim().to_string())
 }
