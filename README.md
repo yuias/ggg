@@ -107,7 +107,7 @@ for extension-side details.
 
 ggg uses a TOML-based configuration system with application-wide and folder-specific settings.
 
-For a complete, fully documented configuration example, see `config/settings.toml.example` in the release archive or repository. Every setting is explained inline, with folder-specific overrides covered at the bottom.
+For a complete, fully documented configuration example, see `examples/settings.toml.example` in the release archive or repository. Every setting is explained inline, with folder-specific overrides covered at the bottom.
 
 ## Project Structure
 

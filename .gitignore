@@ -27,5 +27,9 @@ target
 # Development
 docs/dev/*
 
-# Testing
-config/*
+# Local portable config directory for manual testing; ggg uses <exe_dir>/config
+# when present, so it must never be committed or shipped.
+/config/
+
+# Release archives produced by tools/build-release.ps1
+/dist/

@@ -22,7 +22,7 @@ nothing) in different places:
 ## Default bindings
 
 The **Config key** column is the name used under `[keybindings]` in
-`settings.toml` (see `config/settings.toml.example`).
+`settings.toml` (see `examples/settings.toml.example`).
 
 | Action                  | Default key(s)   | Config key                | Contexts |
 |--------------------------|------------------|----------------------------|----------|
@@ -79,7 +79,7 @@ Notes:
 ## Customizing
 
 Add a `[keybindings]` table to `settings.toml` (see
-`config/settings.toml.example` for a fully commented copy of the defaults
+`examples/settings.toml.example` for a fully commented copy of the defaults
 above). Rules:
 
 - Only the actions you list are overridden; every action left out keeps its

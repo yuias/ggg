@@ -204,7 +204,7 @@ reload_config = "R"
 # Folder-Specific Settings
 # ============================================================================
 # Folder settings override the application settings above. Create a file at:
-#   config/<folder_name>/settings.toml
+#   <config_dir>/<folder_name>/settings.toml
 #
 # Every field is optional and inherits from the application settings when
 # omitted. Note: keys live at the root of the folder file (there is no

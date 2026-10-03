@@ -501,4 +501,4 @@ Scripts are JavaScript (ES5+). Common issues:
 
 ## Getting Help
 
-- Check example scripts in `scripts/examples` directory
+- Check example scripts in `examples/scripts` directory
