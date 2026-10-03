@@ -208,8 +208,18 @@ pub struct ProgressContext {
     pub total: Option<u64>,
     /// Download speed in bytes/sec
     pub speed: Option<f64>,
-    /// Progress percentage (0-100)
+    /// Progress percentage (0-100); None when the total is unknown or zero
     pub percentage: Option<f32>,
+}
+
+impl ProgressContext {
+    /// Percentage 0-100, or None when the total is unknown or zero.
+    pub fn compute_percentage(downloaded: u64, total: Option<u64>) -> Option<f32> {
+        match total {
+            Some(t) if t > 0 => Some(((downloaded as f64 / t as f64) * 100.0).min(100.0) as f32),
+            _ => None,
+        }
+    }
 }
 
 impl EventContext for ProgressContext {
@@ -359,6 +369,16 @@ mod tests {
         let ctx2: ProgressContext = ProgressContext::from_json(json).unwrap();
         assert_eq!(ctx2.downloaded, 512);
         assert_eq!(ctx2.speed, Some(1024.5));
+    }
+
+    #[test]
+    fn compute_percentage_handles_known_and_unknown_totals() {
+        assert_eq!(ProgressContext::compute_percentage(50, Some(200)), Some(25.0));
+        assert_eq!(ProgressContext::compute_percentage(0, Some(10)), Some(0.0));
+        assert_eq!(ProgressContext::compute_percentage(10, None), None);
+        assert_eq!(ProgressContext::compute_percentage(10, Some(0)), None);
+        // Clamped when the server sends more than the advertised length.
+        assert_eq!(ProgressContext::compute_percentage(300, Some(200)), Some(100.0));
     }
 
     #[test]

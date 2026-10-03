@@ -1152,9 +1152,12 @@ impl DownloadManager {
                             url: task_url.clone(),
                             filename: task.filename.clone(),
                             downloaded,
-                            total,
+                            total: task.size,
                             speed: Some(speed_value),
-                            percentage: None, // Calculated by script engine
+                            percentage: crate::script::events::ProgressContext::compute_percentage(
+                                downloaded,
+                                task.size,
+                            ),
                         };
                         let sender_clone = (*sender).clone();
                         let effective_files = effective_script_files_for_progress.clone();
