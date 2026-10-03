@@ -156,7 +156,8 @@ pub struct CompletedContext {
     pub save_path: String,
     /// New filename if renaming (modifiable)
     pub new_filename: Option<String>,
-    /// New path if moving (modifiable)
+    /// Target directory if moving (modifiable). Created if missing; a relative
+    /// path is resolved against `save_path`.
     pub move_to_path: Option<String>,
     /// Download size in bytes
     pub size: u64,

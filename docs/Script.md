@@ -126,15 +126,22 @@ ggg.on('authRequired', function (e) {
 - `newFilename` is reduced to a bare file name (path separators and other
   unsafe characters are removed). If the name already exists in the folder, ggg
   makes it unique.
-- `moveToPath` is a directory that must already exist; ggg does not create it.
-  Use an absolute path. A path containing `..` is rejected.
+- `moveToPath` is a directory. ggg creates it if it is missing. A relative path
+  is resolved against `savePath`; an absolute path is used as is. A path
+  containing `..` is rejected.
+- If a file with the same name already exists in the target directory, ggg does
+  not overwrite it. The moved file gets a unique name, as with `newFilename`.
+- Moving to another drive or volume works (ggg copies the file, then deletes
+  the original, and keeps the modification time).
 - The rename happens first, then the move. A failed rename or move is logged
   and the file stays where it is.
 
 ```javascript
 ggg.on('completed', function (e) {
     if (/\.(jpg|png|gif)$/i.test(e.filename)) {
-        e.moveToPath = '/path/to/images';
+        e.moveToPath = 'images';              // <savePath>/images
+    } else if (/\.pdf$/i.test(e.filename)) {
+        e.moveToPath = '/path/to/documents';  // absolute path
     }
     return true;
 });

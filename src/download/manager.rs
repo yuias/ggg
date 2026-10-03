@@ -1315,27 +1315,28 @@ impl DownloadManager {
                         }
                     }
 
-                    // Apply file move if script set moveToPath. Reject paths
-                    // containing `..` components so an untrusted script cannot
-                    // traverse out to arbitrary locations.
+                    // Apply file move if script set moveToPath. The helper
+                    // rejects `..` (scripts are untrusted), creates the
+                    // directory, resolves relative paths against file_dir and
+                    // picks a unique name instead of overwriting.
                     if let Some(new_dir_str) = modified_ctx.move_to_path {
-                        let new_dir = std::path::PathBuf::from(&new_dir_str);
-                        let has_parent_traversal = new_dir
-                            .components()
-                            .any(|c| matches!(c, std::path::Component::ParentDir));
-                        if has_parent_traversal {
-                            task.log_warn(format!(
-                                "Script moveToPath '{}' rejected (contains '..')",
-                                new_dir_str
-                            ));
-                        } else {
-                            let current_path = file_dir.join(&task.filename);
-                            let new_path = new_dir.join(&task.filename);
-                            if let Err(e) = std::fs::rename(&current_path, &new_path) {
-                                tracing::error!("Failed to move file: {}", e);
-                            } else {
-                                task.save_path = new_dir;
+                        match crate::file::relocate::move_into_dir(
+                            &file_dir,
+                            &task.filename,
+                            &new_dir_str,
+                        ) {
+                            Ok(moved) => {
+                                task.save_path = moved.dir;
+                                task.filename = moved.filename;
                                 task.log_info("File moved by script".to_string());
+                            }
+                            Err(e) => {
+                                let msg = format!(
+                                    "Script moveToPath '{}' rejected: {}",
+                                    new_dir_str, e
+                                );
+                                tracing::warn!("{}", msg);
+                                task.log_warn(msg);
                             }
                         }
                     }
