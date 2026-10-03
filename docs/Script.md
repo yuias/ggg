@@ -289,8 +289,12 @@ The same switches are available in the Settings > Scripts tab (select a script
 and press `Enter` or `Space`), in the folder settings editor, and with
 `ggg script list`, `ggg script enable <file>` and `ggg script disable <file>`.
 
-A folder file may also contain `scripts_enabled`, but hooks do not check it;
-use `script_files` to switch scripts off for a folder.
+A folder settings file may set `scripts_enabled = false` to turn off every hook
+for downloads in that folder. ggg reads it when each download starts, so no
+reload is needed. `scripts_enabled = true` cannot turn scripting on when
+`[scripts] enabled` is `false`. A download in a folder with scripting off that
+gets HTTP 401 or 407 fails, because no `authRequired` handler can run. To switch
+off single scripts instead, use `script_files`.
 
 ## Example scripts
 
@@ -342,6 +346,7 @@ it with `ggg logs -f`. Script messages start with `[Script] `.
   error, an unknown event name or an invalid filter.
 - Check the filter. It is matched against the event's URL, not the file name.
 - An earlier handler may have returned `false`.
+- The download's folder may set `scripts_enabled = false` in its settings file.
 
 **A handler runs but has no effect.** Look in the log for `Script execution
 error` (the handler threw) or `Script timeout` (it ran longer than `timeout`).

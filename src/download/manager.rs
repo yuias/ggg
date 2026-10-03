@@ -523,6 +523,12 @@ impl DownloadManager {
         let folder_queue = self.get_or_create_folder_queue(&folder_id).await;
         let folder_semaphore = folder_queue.semaphore();
 
+        // A folder can opt out of scripting. Dropping the sender here covers every
+        // hook for this run: beforeRequest, the retry loop's download_task calls,
+        // and the error hook (script_sender_for_error is cloned from it below).
+        let folder_disabled = Self::folder_scripts_disabled(&*config.read().await, &task.folder_id);
+        let script_sender = if folder_disabled { None } else { script_sender };
+
         // Hook Point 1: beforeRequest - Modify URL, headers, user-agent before HTTP request
         // Execute via message passing BEFORE spawning download task
         if let Some(ref sender) = script_sender {
@@ -770,6 +776,13 @@ impl DownloadManager {
         self.emit(DownloadEvent::Started { task_id: id });
 
         Ok(StartOutcome::Started)
+    }
+
+    /// True when the folder's settings explicitly set `scripts_enabled = false`.
+    /// Deliberately ignores the app-level flag: that one only applies at the
+    /// next start, when the script engine is created.
+    fn folder_scripts_disabled(config: &crate::app::config::Config, folder_id: &str) -> bool {
+        config.folders.get(folder_id).and_then(|f| f.scripts_enabled) == Some(false)
     }
 
     /// Encode Basic authentication credentials
@@ -3154,6 +3167,71 @@ mod tests {
             Ok(ScriptRequest::Error { .. }) => {}
             other => panic!("expected a queued Error hook request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn folder_scripts_disabled_reads_only_explicit_false() {
+        let mut config = Config::default();
+        for (id, flag) in [
+            ("unset", None),
+            ("on", Some(true)),
+            ("off", Some(false)),
+        ] {
+            let folder = FolderConfig { scripts_enabled: flag, ..FolderConfig::default() };
+            config.folders.insert(id.to_string(), folder);
+        }
+
+        assert!(!DownloadManager::folder_scripts_disabled(&config, "unset"));
+        assert!(!DownloadManager::folder_scripts_disabled(&config, "on"));
+        assert!(DownloadManager::folder_scripts_disabled(&config, "off"));
+        assert!(!DownloadManager::folder_scripts_disabled(&config, "missing"));
+    }
+
+    /// With the sender dropped for the folder, neither the beforeRequest hook
+    /// nor the error hook may be sent. A sent beforeRequest would hang
+    /// `start_download` because nobody answers it, hence the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn folder_with_scripts_disabled_sends_no_hooks() {
+        let manager = DownloadManager::with_retry_settings(1, 0);
+        let mut task = DownloadTask::new("http://127.0.0.1:1/x".to_string(), "/tmp".into());
+        task.folder_id = "folder1".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let folder = FolderConfig { scripts_enabled: Some(false), ..FolderConfig::default() };
+        let mut cfg = Config::default();
+        cfg.folders.insert("folder1".to_string(), folder);
+        let config = Arc::new(tokio::sync::RwLock::new(cfg));
+
+        let mut events = manager.subscribe();
+        let (script_tx, script_rx) = mpsc::channel::<ScriptRequest>();
+
+        let outcome = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            manager.start_download(id, Some(script_tx), config),
+        )
+        .await
+        .expect("start_download hung: a hook was probably sent")
+        .expect("start must succeed");
+        assert_eq!(outcome, StartOutcome::Started);
+
+        let wait_for_failed = async {
+            loop {
+                match events.recv().await {
+                    Ok(DownloadEvent::Failed { task_id, .. }) if task_id == id => return,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel closed before Failed: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), wait_for_failed)
+            .await
+            .expect("did not observe Failed within timeout");
+
+        assert!(
+            script_rx.try_recv().is_err(),
+            "no hook request may be sent for a folder with scripts disabled"
+        );
     }
 
     #[tokio::test]

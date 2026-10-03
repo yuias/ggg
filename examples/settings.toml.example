@@ -216,7 +216,8 @@ reload_config = "R"
 #   auto_start_downloads = true        # Start downloads when added (default: false)
 #   prevent_duplicate_url = false      # Reject URLs already queued in this folder (default: false)
 #
-#   scripts_enabled = true             # Override [scripts].enabled (omit = inherit)
+#   scripts_enabled = false            # false turns off all script hooks for this folder;
+#                                      # true cannot override [scripts].enabled = false (omit = inherit)
 #   max_concurrent = 5                 # Override global limit (omit = inherit)
 #   user_agent = "CustomAgent/1.0"     # Override User-Agent (omit = inherit)
 #   referrer_policy = "url_origin"     # Override referrer policy (omit = inherit)
