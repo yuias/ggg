@@ -20,17 +20,18 @@ manifest installed by `ggg bridge install`.
 
 ## Install
 
-1. Build the bridge: `cargo build --release -p ggg-bridge`.
-2. Register the native host: `ggg bridge install`.
-   - This writes `%LOCALAPPDATA%\ggg\com.ggg.bridge.json` and a registry
-     value at `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.ggg.bridge`.
-3. Load the extension:
+1. Put `ggg-bridge.exe` next to `ggg.exe`. The release archive already has it
+   there; from source, build it with `cargo build --release -p ggg-bridge`.
+2. Load the extension:
    - Chrome → `chrome://extensions` → enable Developer Mode → "Load unpacked"
    - Select this directory (`windows/ggg-extension`).
    - Note the assigned **Extension ID** (e.g. `abcdefghijklmnopabcdefghijklmnop`).
-4. Tell ggg which extension to trust:
-   - `ggg bridge install --extension-id <ID>` (re-running install is fine).
-5. Start ggg. Right-click any link or page and pick "Add link to ggg".
+3. Register the native host, allowing that extension:
+   - `ggg bridge install --extension-id <ID>` (`--extension-id` is required;
+     re-running install is fine).
+   - This writes `%LOCALAPPDATA%\ggg\com.ggg.bridge.json` and a registry
+     value at `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.ggg.bridge`.
+4. Start ggg. Right-click any link or page and pick "Add link to ggg".
 
 ## Uninstall
 

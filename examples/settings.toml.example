@@ -196,7 +196,7 @@ reload_config = "R"
 #   - If two actions end up bound to the same key in the same screen, the
 #     one that comes first alphabetically by its internal name wins; a
 #     warning is logged for the loser.
-# See docs/KeyBindings.md for which screens ("contexts") each action
+# See docs/Keybindings.md for which screens ("contexts") each action
 # resolves in, and press `?` in the TUI for the generated help screen.
 
 
