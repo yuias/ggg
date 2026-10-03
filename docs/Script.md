@@ -1,359 +1,311 @@
-# Script Hook System User Guide
+# Scripts
 
-The script hook system allows you to customize download behavior using JavaScript scripts.
+Scripts are JavaScript files that hook into the download lifecycle. They can
+change a request before it is sent (URL, headers, user agent), supply login
+credentials, rename or move a finished file, and react to errors and progress.
+Ready-made scripts are in `examples/scripts/`; copy one into
+`<config_dir>/scripts/` to use it.
 
-## Quick Start
+## Quick start
 
-### 1. Enable Scripts in Configuration
+1. Check `settings.toml` (these are the defaults):
 
-Edit your `settings.toml`:
+   ```toml
+   [scripts]
+   enabled = true
+   directory = "./scripts"  # relative to the config directory; default is <config_dir>/scripts
+   timeout = 30             # seconds
+   ```
 
-```toml
-[scripts]
-enabled = true
-directory = "./scripts"  # Relative to config directory
-timeout = 30
-```
+2. Create `<config_dir>/scripts/twitter_referer.js`:
 
-### 2. Create a Script
+   ```javascript
+   ggg.on('beforeRequest', function (e) {
+       e.headers['Referer'] = 'https://twitter.com/';
+       ggg.log('Added Referer for ' + e.url);
+       return true;
+   }, 'twimg.com');
+   ```
 
-Create a `.js` file in the `scripts/` directory:
+3. Start ggg. Scripts are loaded at startup and run for every download. The
+   last argument, `'twimg.com'`, limits the handler to matching URLs.
 
-**Example: `scripts/twitter_referer.js`**
-```javascript
-// Add referer header for Twitter images
-ggg.on('beforeRequest', function(e) {
-    if (e.url.includes('twimg.com')) {
-        e.headers['Referer'] = 'https://twitter.com/';
-        ggg.log('Added Twitter referer for: ' + e.url);
-    }
-    return true;
-});
-```
+## Hooks
 
-### 3. Run Your Download Manager
+Register a handler with `ggg.on(eventName, callback, [filter])`. The callback
+receives one event object. Change the fields marked "writable" and ggg uses
+the new values. Changes to other fields are ignored.
 
-Scripts are automatically loaded on startup and execute for every download.
+| Hook              | Runs                                      | Waits for the handler |
+| ----------------- | ----------------------------------------- | --------------------- |
+| `beforeRequest`   | Before the HTTP request is sent           | yes                   |
+| `headersReceived` | After the server answers, before the body | yes                   |
+| `authRequired`    | When the server answers 401 or 407        | yes                   |
+| `completed`       | After the file has been downloaded        | yes                   |
+| `error`           | After a download failed for good          | no                    |
+| `progress`        | While a download runs                     | no                    |
 
-## Available Hooks
-
-All hooks are now fully implemented! ✅
+Fields shown as "may be null" are `null` when the value is unknown.
 
 ### beforeRequest
 
-**When:** Before HTTP request is made
-**Can Modify:** URL, headers, user-agent
-**Example Use Cases:**
-- Add custom headers (Referer, Authorization)
-- Modify URLs (add parameters, change domains)
-- Set custom user-agents per site
-
-**Event Object:**
 ```javascript
 {
-    url: string,           // Download URL (modifiable)
-    headers: object,       // HTTP headers (modifiable)
-    userAgent: string,     // User-Agent string (modifiable)
-    downloadId: string     // Unique download ID (read-only)
+    url,        // writable
+    headers,    // writable, object of string values
+    userAgent,  // writable, may be null
+    downloadId  // read-only
 }
 ```
 
-**Example:**
 ```javascript
-ggg.on('beforeRequest', function(e) {
-    // Add authentication header
-    if (e.url.includes('private-site.com')) {
-        e.headers['Authorization'] = 'Bearer YOUR_TOKEN';
-    }
-
-    // Modify URL
-    if (e.url.includes('old-domain.com')) {
-        e.url = e.url.replace('old-domain.com', 'new-domain.com');
-    }
-
-    return true; // Continue to next handler
-});
+ggg.on('beforeRequest', function (e) {
+    e.url = e.url.replace('old-domain.com', 'new-domain.com');
+    e.headers['Authorization'] = 'Bearer YOUR_TOKEN';
+    return true;
+}, 'old-domain.com');
 ```
 
 ### headersReceived
 
-**When:** After receiving server response headers (before download starts)
-**Can Modify:** None (read-only inspection)
-**Example Use Cases:**
-- Log server information
-- Validate content-type
-- Check file size before downloading
+Read-only; the event cannot be changed.
 
-**Event Object:**
 ```javascript
 {
-    url: string,              // Original request URL
-    status: number,           // HTTP status code
-    headers: object,          // Response headers
-    contentLength: number,    // File size in bytes (if known)
-    etag: string,            // ETag header (if present)
-    lastModified: string,    // Last-Modified header (if present)
-    contentType: string      // Content-Type header (if present)
+    url, status, headers,
+    contentLength,  // may be null
+    etag,           // may be null
+    lastModified,   // may be null
+    contentType     // may be null
 }
 ```
 
-**Example:**
 ```javascript
-ggg.on('headersReceived', function(e) {
-    ggg.log('Downloading: ' + e.url);
-    ggg.log('Size: ' + (e.contentLength / 1024 / 1024).toFixed(2) + ' MB');
-    ggg.log('Type: ' + e.contentType);
-    return true;
+ggg.on('headersReceived', function (e) {
+    ggg.log(e.url + ': ' + e.status + ' ' + e.contentType);
 });
+```
+
+### authRequired
+
+```javascript
+{
+    url,
+    realm,     // may be null
+    username,  // writable, always null on entry
+    password   // writable, always null on entry
+}
+```
+
+ggg never passes stored credentials to scripts. If a handler sets both
+`username` and `password`, ggg sends them as an HTTP Basic `Authorization`
+header and repeats the request. If the server rejects them, or if no handler
+sets both fields, the download fails.
+
+```javascript
+ggg.on('authRequired', function (e) {
+    e.username = 'user';
+    e.password = 'secret';
+    return true;
+}, 'files.example.com');
 ```
 
 ### completed
 
-**When:** After download completes successfully
-**Can Modify:** Filename (rename), save path (move)
-**Example Use Cases:**
-- Rename files based on patterns
-- Move files to different folders
-- Clean up filenames
-- Organize downloads by type
-
-**Event Object:**
 ```javascript
 {
-    url: string,              // Original download URL
-    filename: string,         // Current filename
-    savePath: string,         // Current directory path
-    size: number,            // File size in bytes
-    duration: number,        // Download duration in seconds
-    newFilename: string,     // Set to rename file (modifiable)
-    moveToPath: string       // Set to move file (modifiable)
+    url, filename,
+    savePath,      // directory the file was saved to
+    size,          // bytes
+    duration,      // seconds, may be null
+    newFilename,   // writable, null on entry: set it to rename the file
+    moveToPath     // writable, null on entry: set it to move the file
 }
 ```
 
-**Example:**
+- `newFilename` is reduced to a bare file name (path separators and other
+  unsafe characters are removed). If the name already exists in the folder, ggg
+  makes it unique.
+- `moveToPath` is a directory that must already exist; ggg does not create it.
+  Use an absolute path. A path containing `..` is rejected.
+- The rename happens first, then the move. A failed rename or move is logged
+  and the file stays where it is.
+
 ```javascript
-ggg.on('completed', function(e) {
-    // Clean up filename
-    let cleaned = e.filename.replace(/[<>:"/\\|?*]/g, '_');
-    if (cleaned !== e.filename) {
-        e.newFilename = cleaned;
-        ggg.log('Renamed: ' + e.filename + ' -> ' + cleaned);
+ggg.on('completed', function (e) {
+    if (/\.(jpg|png|gif)$/i.test(e.filename)) {
+        e.moveToPath = '/path/to/images';
     }
-
-    // Move images to Images folder
-    if (e.filename.match(/\.(jpg|png|gif)$/i)) {
-        e.moveToPath = './downloads/images';
-        ggg.log('Moved image to images folder');
-    }
-
     return true;
 });
 ```
 
 ### error
 
-**When:** When download fails
-**Can Modify:** None (fire-and-forget notification)
-**Example Use Cases:**
-- Log errors
-- Send notifications
-- Track failure patterns
+Read-only. Runs once per download, after all retries are used up.
 
-**Event Object:**
 ```javascript
 {
-    url: string,           // Download URL
-    filename: string,      // Filename (if known)
-    error: string,         // Error message
-    retryCount: number,    // Number of retries attempted
-    statusCode: number     // HTTP status code (if applicable)
+    url,
+    filename,    // may be null
+    error,       // message
+    retryCount,
+    statusCode   // may be null
 }
 ```
 
-**Example:**
 ```javascript
-ggg.on('error', function(e) {
-    ggg.log('ERROR: Failed to download ' + e.url);
-    ggg.log('Reason: ' + e.error);
-    if (e.statusCode) {
-        ggg.log('HTTP Status: ' + e.statusCode);
-    }
-    return true;
+ggg.on('error', function (e) {
+    ggg.log('Failed: ' + e.url + ' (' + e.error + ')');
 });
 ```
 
 ### progress
 
-**When:** Periodically during download (throttled to ~500ms intervals)
-**Can Modify:** None (fire-and-forget notification)
-**Example Use Cases:**
-- Log progress milestones
-- Track download statistics
-- Custom progress notifications
+Read-only. Runs at most about twice per second for each download.
 
-**Event Object:**
 ```javascript
 {
-    url: string,           // Download URL
-    filename: string,      // Filename
-    downloaded: number,    // Bytes downloaded so far
-    total: number,         // Total bytes (if known)
-    speed: number,         // Download speed (bytes/sec)
-    percentage: number     // Download percentage (0-100, if total known)
+    url, filename,
+    downloaded,   // bytes so far
+    total,        // bytes, may be null
+    speed,        // average bytes per second since the download started, may be null
+    percentage    // currently always null: compute it from downloaded and total
 }
 ```
 
-**Example:**
 ```javascript
-ggg.on('progress', function(e) {
-    if (e.percentage && e.percentage % 25 === 0) {
-        ggg.log(e.filename + ': ' + e.percentage + '% complete');
-        let speedMB = (e.speed / 1024 / 1024).toFixed(2);
-        ggg.log('Speed: ' + speedMB + ' MB/s');
+ggg.on('progress', function (e) {
+    if (e.total) {
+        ggg.log(e.filename + ': ' + (e.downloaded / e.total * 100).toFixed(0) + '%');
     }
-    return true;
 });
 ```
 
-## API Reference
+## API
 
 ### ggg.on(eventName, callback, [filter])
 
-Register a hook handler.
+- `eventName`: one of `beforeRequest`, `headersReceived`, `authRequired`,
+  `completed`, `error`, `progress`. The aliases `onBeforeRequest`,
+  `onHeadersReceived`, `onAuthRequired`, `complete`, `onCompleted`,
+  `errorOccurred`, `onErrorOccurred` and `onProgress` are also accepted.
+- `callback`: a function that receives the event object.
+- `filter` (optional string): the handler only runs for URLs that match.
 
-**Parameters:**
-- `eventName` (string): Event to listen for
-  - `'beforeRequest'` - Before HTTP request
-  - `'headersReceived'` - After receiving server headers
-  - `'completed'` - After download completes
-  - `'error'` - When download fails
-  - `'progress'` - During download progress
-- `callback` (function): Handler function receiving event object
-- `filter` (string, optional): URL pattern to filter (substring or regex)
+`ggg.on` returns `true`, which is not useful. It throws if `callback` is not a
+function. An unknown `eventName` is detected when the script finishes loading.
+In both cases the script registers no handlers.
 
-**Returns:** `true` (success)
+**Filters.** The filter is matched against the event's `url` and is not
+anchored.
 
-**Example with Filter:**
-```javascript
-// Only execute for Twitter URLs
-ggg.on('beforeRequest', function(e) {
-    e.headers['Referer'] = 'https://twitter.com/';
-    return true;
-}, 'twimg.com');
+- A filter containing `*`, `^` or `$` is a regular expression (Rust `regex`
+  syntax). Write `'\\.jpg$'`, not `'*.jpg'`: `*` is not a glob wildcard.
+- Any other filter is a plain substring match; `.` and other special
+  characters are taken literally.
+- An invalid regular expression makes the whole script fail to load.
+- Pass a string. Other values (such as a `RegExp` object) are ignored and the
+  handler runs for every URL.
 
-// Regex filter
-ggg.on('beforeRequest', function(e) {
-    ggg.log('Downloading image: ' + e.url);
-    return true;
-}, '^https://.*\\.(jpg|png|gif)$');
+### ggg.log(message) and console
+
+`ggg.log` and the `console` methods write to the application log (see
+[Troubleshooting](#troubleshooting)) as `[Script] <message>`. `console.log`
+and `console.info` add nothing to the message; `console.warn`, `console.error`
+and `console.debug` prepend `[WARN]`, `[ERROR]` and `[DEBUG]`. All entries are
+logged at INFO level.
+
+### Return values
+
+A handler may return nothing. Only an explicit `false` has an effect: later
+handlers for the same event are skipped. The download itself continues, and
+changes the handler made to the event are still applied.
+
+A handler that throws, or runs longer than `timeout`, is logged and skipped,
+and its changes to the event are discarded. The remaining handlers still run.
+
+## Loading and reloading
+
+### Loading order
+
+ggg loads the `.js` files directly inside the scripts directory, sorted by
+file name. Subdirectories and symbolic links are skipped, and a file larger
+than 1 MiB is rejected. Each file is run once at startup, and its `ggg.on`
+calls register the handlers. If the directory does not exist, ggg creates it.
+
+Because the order follows the file names, use numeric prefixes to control it:
+`01_headers.js` runs before `02_rename.js`.
+
+For each event, handlers run in this order:
+
+1. Scripts in file-name order.
+2. Within a script, handlers in the order of their `ggg.on` calls.
+3. Handlers stop at the first one that returns `false`.
+
+A script that throws while loading, or that uses an unknown event name or an
+invalid filter, registers no handlers. The other scripts still load, and the
+error is logged.
+
+### Reloading
+
+To pick up edits to scripts without restarting:
+
+- **Daemon:** start ggg with `ggg --headless`, then run `ggg script reload`.
+  Without a running daemon the command only prints a notice.
+- **TUI:** open Settings (`x`), switch to the Scripts tab and press the
+  reload key (`R` by default, see
+  [Keybindings](Keybindings.md#default-bindings)).
+
+A reload runs every script again. It does not re-read `enabled`, `directory`
+or `timeout` from the settings; those take effect at the next start.
+
+## Configuration
+
+See [examples/settings.toml.example](../examples/settings.toml.example) for
+the full syntax.
+
+| Setting               | Default                | Notes                                                             |
+| --------------------- | ---------------------- | ----------------------------------------------------------------- |
+| `[scripts] enabled`   | `true`                 | `false` turns scripting off. Takes effect at the next start.      |
+| `[scripts] directory` | `<config_dir>/scripts` | A relative path is resolved against the config directory.         |
+| `[scripts] timeout`   | `30`                   | Seconds. Applies to each handler call and to loading each script. |
+
+### Disabling single scripts
+
+List a file name under `[scripts.script_files]` to switch that script off:
+
+```toml
+[scripts.script_files]
+"pixiv.js" = false
 ```
 
-### ggg.log(message)
+A script that is not listed is enabled. A folder's settings file
+(`<config_dir>/<folder_name>/settings.toml`) can override this for that folder
+with its own `[script_files]` table. These maps are read each time a hook runs,
+so changes do not need a reload.
 
-Log a message to the application log.
+The same switches are available in the Settings > Scripts tab (select a script
+and press `Enter` or `Space`), in the folder settings editor, and with
+`ggg script list`, `ggg script enable <file>` and `ggg script disable <file>`.
 
-**Parameters:**
-- `message` (string): Message to log
+A folder file may also contain `scripts_enabled`, but hooks do not check it;
+use `script_files` to switch scripts off for a folder.
 
-**Example:**
-```javascript
-ggg.log('Script executed for: ' + e.url);
-```
+## Example scripts
 
-### Return Values
-
-Handlers should return a boolean:
-- `true` - Continue to next handler
-- `false` - Stop propagation (no further handlers execute)
-
-**Example:**
-```javascript
-ggg.on('beforeRequest', function(e) {
-    if (e.url.includes('blocked-site.com')) {
-        ggg.log('Blocking download from: ' + e.url);
-        return false; // Stop here, don't download
-    }
-    return true; // Continue normally
-});
-```
-
-## Script Loading
-
-### Loading Order
-
-Scripts are loaded **alphabetically** by filename:
-1. `01_first.js`
-2. `02_second.js`
-3. `10_tenth.js`
-4. `script.js`
-
-**Tip:** Use numeric prefixes to control execution order.
-
-### Reloading Scripts
-
-Scripts are otherwise loaded once at startup. To pick up edits (new
-scripts, changed handlers, enable/disable toggles) without restarting:
-
-- **Daemon mode:** start ggg as a daemon (`ggg --headless`) and run
-  `ggg script reload` against it from another terminal. Without a daemon
-  running, `ggg script reload` prints a notice instead, since there is
-  nothing to reload.
-- **TUI:** open Settings (`x`) and switch to the Scripts tab, then press
-  the reload-settings key (`R` by default; see
-  [KeyBindings.md](KeyBindings.md#default-bindings)) to reload scripts
-  instead of `settings.toml`.
-
-### Handler Execution Order
-
-For each event:
-1. Scripts execute in alphabetical order
-2. Within each script, handlers execute in registration order
-3. If any handler returns `false`, remaining handlers are skipped
-
-## Example Scripts
-
-### Twitter Image Downloads
+### Custom user agent per domain
 
 ```javascript
-// scripts/01_twitter_referer.js
-ggg.on('beforeRequest', function(e) {
-    if (e.url.includes('pbs.twimg.com') || e.url.includes('twimg.com')) {
-        e.headers['Referer'] = 'https://twitter.com/';
-        e.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-        ggg.log('Added Twitter headers for: ' + e.url);
-    }
-    return true;
-}, 'twimg.com');
-```
-
-### Pixiv Downloads
-
-```javascript
-// scripts/02_pixiv_headers.js
-ggg.on('beforeRequest', function(e) {
-    if (e.url.includes('pixiv.net') || e.url.includes('pximg.net')) {
-        e.headers['Referer'] = 'https://www.pixiv.net/';
-        e.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-        ggg.log('Added Pixiv headers');
-    }
-    return true;
-}, 'pxi');
-```
-
-### Custom User-Agent Per Domain
-
-```javascript
-// scripts/03_custom_ua.js
-const domains = {
+const agents = {
     'example.com': 'MyCustomBot/1.0',
     'test.org': 'TestClient/2.0'
 };
 
-ggg.on('beforeRequest', function(e) {
-    for (let domain in domains) {
+ggg.on('beforeRequest', function (e) {
+    for (const domain in agents) {
         if (e.url.includes(domain)) {
-            e.userAgent = domains[domain];
-            ggg.log('Set user-agent for ' + domain);
+            e.userAgent = agents[domain];
             break;
         }
     }
@@ -361,144 +313,56 @@ ggg.on('beforeRequest', function(e) {
 });
 ```
 
-## Configuration
+### Scripts in `examples/scripts/`
 
-### Script Directory
-
-Default: `<config_dir>/scripts` (resolved at runtime)
-
-All `.js` files in this directory are loaded. Subdirectories are ignored.
-Relative paths are resolved against the config directory.
-
-```toml
-[scripts]
-directory = "./my-scripts"  # Relative to config directory
-```
-
-### Timeout
-
-Maximum execution time for script handlers (default: 30 seconds).
-
-```toml
-[scripts]
-timeout = 60  # Increase for slow scripts
-```
-
-### Enable/Disable
-
-```toml
-[scripts]
-enabled = false  # Disable all scripts
-```
-
-## Debugging
-
-### View Logs
-
-Scripts use `ggg.log()` to output messages:
-
-```bash
-# Run with logging
-RUST_LOG=info cargo run
-```
-
-Logs appear as:
-```
-[Script] Added Twitter referer for: https://pbs.twimg.com/media/...
-```
-
-### Test Scripts
-
-1. Create a test script:
-```javascript
-ggg.on('beforeRequest', function(e) {
-    ggg.log('=== BEFORE REQUEST ===');
-    ggg.log('URL: ' + e.url);
-    ggg.log('Headers: ' + JSON.stringify(e.headers));
-    return true;
-});
-```
-
-2. Start a download and watch logs
+- `pixiv.js`: sets the Referer and User-Agent for Pixiv image downloads.
+- `filename_cleanup.js`: after a download, decodes URL-encoded names, collapses
+  repeated spaces and removes a trailing "(...)" part.
+- `error_notifier.js`: logs the URL, error and retry count of failed downloads.
+- `progress_logger.js`: logs progress and speed at 25, 50, 75 and 100 percent.
+  It only logs when an update lands exactly on one of those values, so treat it
+  as a starting point.
 
 ## Troubleshooting
 
-### Script Not Loading
+**Where the log is.** ggg writes JSON lines to
+`<config_dir>/.logs/app.jsonl.<date>`, one file per day, at INFO level
+(`-v` or `--verbose` lowers it to TRACE). Show it with `ggg logs`, or follow
+it with `ggg logs -f`. Script messages start with `[Script] `.
 
-- Check `settings.toml` has `enabled = true`
-- Verify script is in correct directory
-- Check file extension is `.js`
-- Look for syntax errors in application logs
+**A script does nothing.**
 
-### Script Not Executing
+- `[scripts] enabled` must be `true`, and ggg must have been restarted after
+  you changed it.
+- The file must end in `.js` and sit directly in the scripts directory.
+- Run `ggg script list` to see which scripts ggg finds and whether they are
+  enabled.
+- Look in the log for `Failed to load script`. The cause is usually a syntax
+  error, an unknown event name or an invalid filter.
+- Check the filter. It is matched against the event's URL, not the file name.
+- An earlier handler may have returned `false`.
 
-- Verify event name is correct (`'beforeRequest'`)
-- Check URL filter matches your download
-- Ensure script returns `true` to continue
+**A handler runs but has no effect.** Look in the log for `Script execution
+error` (the handler threw) or `Script timeout` (it ran longer than `timeout`).
+In both cases its changes were discarded.
 
-### Syntax Errors
+**Edits are not picked up.** Reload the scripts, see [Reloading](#reloading).
 
-Scripts are JavaScript (ES5+). Common issues:
-- Missing semicolons
-- Incorrect function syntax
-- Typos in API calls (use `ggg.log`, `console.log` also works but prefer `ggg.log`)
+**Try a script without a download.** `ggg script test <file>.js --event
+beforeRequest --url <url>` runs the script's `beforeRequest` handlers against a
+test URL and prints the resulting URL and headers. Other events are not
+supported by this command.
 
-## Best Practices
+**Keep handlers short.** One script thread runs every handler one at a time,
+and the hooks marked "yes" in the table above hold up the download until the
+handler returns. Use a filter so a handler only runs for the URLs it needs.
 
-1. **Use Filters** - Only execute for relevant URLs
-   ```javascript
-   ggg.on('beforeRequest', handler, 'specific-domain.com');
-   ```
+## Limits and security
 
-2. **Log Sparingly** - Avoid logging every request
-   ```javascript
-   if (e.url.includes('debug')) {
-       ggg.log('Debug info: ' + e.url);
-   }
-   ```
-
-3. **Handle Errors Gracefully** - Scripts shouldn't crash
-   ```javascript
-   ggg.on('beforeRequest', function(e) {
-       try {
-           // Your code here
-       } catch (err) {
-           ggg.log('Error: ' + err);
-       }
-       return true;
-   });
-   ```
-
-4. **Test Incrementally** - Start simple, add features gradually
-
-5. **Use Numeric Prefixes** - Control script order
-   ```
-   01_essential.js
-   02_optional.js
-   99_debug.js
-   ```
-
-## Limitations
-
-### Current Implementation
-
-- Scripts run in a sandboxed Deno runtime with controlled access
-- Hook execution has timeout limits (configurable, default 30 seconds)
-- All hooks are fully implemented and production-ready
-
-### Future Enhancements
-
-- TypeScript support with automatic type checking
-- Script debugging tools and REPL
-- More granular URL pattern matching (glob patterns)
-
-## Security
-
-- Scripts run with **full system access** via Deno runtime
-- Only load scripts you trust
-- Review scripts before enabling
-- Scripts can modify downloads, headers, and file operations
-
-## Getting Help
-
-- Check example scripts in `examples/scripts` directory
+- Scripts run in an embedded V8 engine (`deno_core`). ggg adds no
+  file-system or network API; the only additions are `ggg.*` and `console.*`.
+- A handler call, and the loading of a script, is stopped after `timeout`
+  seconds. The V8 heap is capped at 256 MiB.
+- Scripts can still change request URLs, headers and user agents, provide
+  login credentials, and rename and move finished files. They also see the
+  request headers of every download. Only install scripts you trust.
