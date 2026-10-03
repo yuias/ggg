@@ -5,8 +5,8 @@
     Builds ggg in release mode and packages it as ggg-<version>-<hash>.zip.
 
 .DESCRIPTION
-    Builds the release binaries, then stages the binaries, docs, examples,
-    locales and the Chrome extension into a single top-level folder and zips it.
+    Builds the release binaries, stages them with the docs, examples, locales
+    and the Chrome extension, and zips the staged files at the archive root.
 
     The archive never contains a config/ directory: ggg treats <exe_dir>/config
     as its live config directory, so shipping one would turn every extracted
@@ -136,10 +136,9 @@ function New-Package {
         }
 
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        # $true includes the base directory, giving the ggg-<version>-<hash>/ top folder.
         [System.IO.Compression.ZipFile]::CreateFromDirectory(
             $stagingDir, $archivePath,
-            [System.IO.Compression.CompressionLevel]::Optimal, $true)
+            [System.IO.Compression.CompressionLevel]::Optimal, $false)
 
         $zip = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
         try {
