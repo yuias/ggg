@@ -9,7 +9,8 @@
 #   2. GGG_CONFIG_DIR environment variable
 #   3. <exe_dir>/config/ (executable directory)
 #   4. ~/.config/ggg/ (all platforms; %USERPROFILE%\.config\ggg on Windows)
-#   5. %APPDATA%\ggg\ (Windows) / ~/.config/ggg/ (Linux/macOS)
+#   5. %APPDATA%\ggg\ (Windows) / ~/Library/Application Support/ggg/ (macOS)
+# The first existing directory wins; if none exists, ~/.config/ggg/ is created.
 #
 # Path escaping (Windows): prefer single quotes 'C:\path' or escape
 # backslashes "C:\\path".
