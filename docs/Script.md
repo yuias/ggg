@@ -170,14 +170,14 @@ Read-only. Runs at most about twice per second for each download.
     downloaded,   // bytes so far
     total,        // bytes, may be null
     speed,        // average bytes per second since the download started, may be null
-    percentage    // currently always null: compute it from downloaded and total
+    percentage    // 0-100, null when total is unknown
 }
 ```
 
 ```javascript
 ggg.on('progress', function (e) {
-    if (e.total) {
-        ggg.log(e.filename + ': ' + (e.downloaded / e.total * 100).toFixed(0) + '%');
+    if (e.percentage !== null) {
+        ggg.log(e.filename + ': ' + e.percentage.toFixed(0) + '%');
     }
 });
 ```
@@ -319,9 +319,10 @@ ggg.on('beforeRequest', function (e) {
 - `filename_cleanup.js`: after a download, decodes URL-encoded names, collapses
   repeated spaces and removes a trailing "(...)" part.
 - `error_notifier.js`: logs the URL, error and retry count of failed downloads.
-- `progress_logger.js`: logs progress and speed at 25, 50, 75 and 100 percent.
-  It only logs when an update lands exactly on one of those values, so treat it
-  as a starting point.
+- `progress_logger.js`: logs one line (with speed) when a download crosses 25,
+  50 or 75 percent, and a final line when it completes. Updates are throttled,
+  so it tracks the highest milestone crossed rather than waiting for an exact
+  value.
 
 ## Troubleshooting
 

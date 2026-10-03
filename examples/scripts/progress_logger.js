@@ -1,15 +1,41 @@
 // Progress logger script
-// Logs download progress milestones
+// Logs each 25/50/75% milestone once, plus a final line on completion.
+// Progress updates are throttled, so exact values are rarely hit; the script
+// tracks the highest milestone already crossed instead.
 
-ggg.on('progress', function(e) {
-    if (e.total) {
-        const percent = (e.downloaded / e.total * 100).toFixed(1);
-        const speedMB = (e.speed / 1024 / 1024).toFixed(2);
+(function () {
+    var MILESTONES = [25, 50, 75];
+    // Highest milestone logged so far, keyed by URL (progress events carry no id).
+    var lastMilestone = {};
 
-        // Log at 25%, 50%, 75%, 100% milestones
-        if (percent == '25.0' || percent == '50.0' || percent == '75.0' || percent == '100.0') {
-            ggg.log('Progress: ' + percent + '% - ' + speedMB + ' MB/s - ' + e.url);
+    ggg.on('progress', function (e) {
+        if (typeof e.percentage !== 'number') {
+            return true;
         }
-    }
-    return true;
-});
+
+        var crossed = 0;
+        for (var i = 0; i < MILESTONES.length; i++) {
+            if (MILESTONES[i] <= e.percentage) {
+                crossed = MILESTONES[i];
+            }
+        }
+
+        if (crossed > (lastMilestone[e.url] || 0)) {
+            lastMilestone[e.url] = crossed;
+            var speedMB = ((e.speed || 0) / 1024 / 1024).toFixed(2);
+            ggg.log('Progress: ' + crossed + '% - ' + speedMB + ' MB/s - ' + e.url);
+        }
+        return true;
+    });
+
+    ggg.on('completed', function (e) {
+        ggg.log('Progress: 100% - ' + e.filename + ' (' + e.size + ' bytes)');
+        delete lastMilestone[e.url];
+        return true;
+    });
+
+    ggg.on('error', function (e) {
+        delete lastMilestone[e.url];
+        return true;
+    });
+})();
