@@ -50,6 +50,9 @@ pub struct ViewOutput {
     /// Commands that need the core or the window; the view already handled
     /// the others.
     pub commands: Vec<GuiCommand>,
+    /// Text that arrived with a `PasteUrls` command from the paste shortcut;
+    /// `None` for the same command from a context menu.
+    pub pasted: Option<String>,
     /// Confirmed dialog results.
     pub actions: Vec<Action>,
 }
@@ -197,7 +200,8 @@ impl MainView {
         self.refresh_target_state(kind, &rows, &ids);
         self.handle_keys(ui, kind, &ids, &rows, config);
         let pressed = shortcuts::poll(ui.ctx(), &self.command_context(), self.table_active);
-        self.pending.extend(pressed);
+        self.pending.extend(pressed.commands);
+        let pasted = pressed.pasted;
         let summary = status_summary(snapshot, rows.len(), self.selection.len(), tr);
 
         Panel::bottom("status_bar").show(ui, |ui| {
@@ -267,6 +271,7 @@ impl MainView {
                 output.commands.push(core);
             }
         }
+        output.pasted = pasted.filter(|_| output.commands.contains(&GuiCommand::PasteUrls));
         output
     }
 
@@ -1053,6 +1058,7 @@ mod tests {
         view: Rc<RefCell<MainView>>,
         actions: Rc<RefCell<Vec<Action>>>,
         commands: Rc<RefCell<Vec<GuiCommand>>>,
+        pasted: Rc<RefCell<Vec<String>>>,
         undo_depth: Rc<Cell<usize>>,
     }
 
@@ -1061,14 +1067,16 @@ mod tests {
             view: Rc::new(RefCell::new(MainView::default())),
             actions: Rc::new(RefCell::new(Vec::new())),
             commands: Rc::new(RefCell::new(Vec::new())),
+            pasted: Rc::new(RefCell::new(Vec::new())),
             undo_depth: Rc::new(Cell::new(0)),
         };
         let tr = Tr::load("en-US");
         let mut config = GuiConfig::default();
-        let (view, actions, commands, undo_depth) = (
+        let (view, actions, commands, pasted, undo_depth) = (
             rig.view.clone(),
             rig.actions.clone(),
             rig.commands.clone(),
+            rig.pasted.clone(),
             rig.undo_depth.clone(),
         );
         let harness = Harness::builder()
@@ -1078,6 +1086,7 @@ mod tests {
                 let out = view.borrow_mut().show(ui, &snapshot, &tr, &mut config, None, env);
                 actions.borrow_mut().extend(out.actions);
                 commands.borrow_mut().extend(out.commands);
+                pasted.borrow_mut().extend(out.pasted);
             });
         (harness, rig)
     }
@@ -1562,6 +1571,34 @@ mod tests {
         }
 
         #[test]
+        fn paste_event_text_reaches_the_app() {
+            let (mut harness, rig) = rig(sample_snapshot());
+            harness.run();
+            let text = "https://example.com/a[1-2].bin
+https://example.com/b.bin";
+            harness.event(Event::Paste(text.to_string()));
+            harness.run();
+            assert_eq!(rig.pasted.borrow().as_slice(), &[text.to_string()]);
+            // What the app does with that text: a dialog prefilled with both lines.
+            let source = crate::registration::Source::PasteKey { shift: false };
+            match crate::registration::resolve(source, &rig.pasted.borrow()[0], true, "f1") {
+                crate::registration::Resolved::Dialog { prefill, .. } => assert_eq!(prefill, text),
+                _ => panic!("expected the dialog"),
+            }
+        }
+
+        #[test]
+        fn context_menu_paste_carries_no_text() {
+            let (mut harness, rig) = rig(sample_snapshot());
+            harness.run();
+            secondary_click_at(&mut harness, egui::pos2(500.0, 200.0));
+            harness.get_by_label("Paste URLs...").click();
+            harness.run();
+            assert_eq!(rig.commands.borrow().as_slice(), &[GuiCommand::PasteUrls]);
+            assert!(rig.pasted.borrow().is_empty());
+        }
+
+        #[test]
         fn ctrl_shift_v_requests_direct_paste() {
             let (mut harness, rig) = rig(sample_snapshot());
             harness.run();
@@ -1571,6 +1608,8 @@ mod tests {
                 rig.commands.borrow().as_slice(),
                 &[GuiCommand::PasteUrlsDirect]
             );
+            // The app reads the clipboard itself for this one.
+            assert!(rig.pasted.borrow().is_empty());
         }
 
         #[test]

@@ -682,6 +682,24 @@ mod tests {
     }
 
     #[test]
+    fn paste_inside_the_url_field_goes_into_the_field_and_opens_nothing() {
+        let (mut harness, rig) = open_dialog("", false);
+        harness.run();
+        assert!(field(&harness, URLS).is_focused());
+        harness.event(egui::Event::Paste("https://example.com/a[1-2].bin
+https://example.com/b.bin".to_string()));
+        harness.run();
+        // A dialog frame is the only consumer: no second dialog, no submit.
+        assert_eq!(
+            rig.dialog.borrow().model.urls_text,
+            "https://example.com/a[1-2].bin
+https://example.com/b.bin"
+        );
+        assert!(rig.submitted.borrow().is_empty());
+        assert_eq!(rig.cancelled.get(), 0);
+    }
+
+    #[test]
     fn ok_submits_the_request() {
         let (mut harness, rig) = open_dialog("https://example.com/a.bin", false);
         harness.run();

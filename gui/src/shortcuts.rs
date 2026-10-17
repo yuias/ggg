@@ -146,22 +146,43 @@ fn take_event(events: &mut Vec<Event>, is_kind: impl Fn(&Event) -> bool) -> bool
     events.len() != before
 }
 
+/// Removes every paste event and returns the text of the first one.
+fn take_paste(events: &mut Vec<Event>) -> Option<String> {
+    let first = events.iter().find_map(|event| match event {
+        Event::Paste(text) => Some(text.clone()),
+        _ => None,
+    });
+    events.retain(|event| !matches!(event, Event::Paste(_)));
+    first
+}
+
+/// Result of [`poll`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Polled {
+    /// Commands whose shortcut was used, in table order.
+    pub commands: Vec<GuiCommand>,
+    /// Clipboard text that came with a `PasteUrls` hit. Only the shortcut
+    /// path has it; a menu click has to read the clipboard itself.
+    pub pasted: Option<String>,
+}
+
 /// Commands whose shortcut was used this frame, in table order. The matching
 /// events are consumed so nothing else reacts to them.
 ///
 /// Paste is classified by what egui-winit emits: any `Event::Paste` is
 /// `PasteUrls`, and only a real Ctrl+Shift+V key event is `PasteUrlsDirect`,
 /// so one key press never produces both. Ctrl+V is deliberately not matched as
-/// a key. The pasted text is dropped here; the command carries no payload.
-pub fn poll(ctx: &egui::Context, command_ctx: &CommandContext, table_active: bool) -> Vec<GuiCommand> {
+/// a key. The text of the paste event is returned next to the command because
+/// egui-winit has already read the clipboard for it.
+pub fn poll(ctx: &egui::Context, command_ctx: &CommandContext, table_active: bool) -> Polled {
     // A dialog owns Enter and Esc, and an open popup closes itself on Esc
     // later in the frame; consuming the key first would break both.
     if command_ctx.modal_open || egui::Popup::is_any_open(ctx) {
-        return Vec::new();
+        return Polled::default();
     }
     let typing = ctx.egui_wants_keyboard_input();
     let table_has_keys = table_active && !typing;
-    let mut fired = Vec::new();
+    let mut polled = Polled::default();
     ctx.input_mut(|input| {
         for binding in BINDINGS {
             let allowed = match binding.scope {
@@ -173,18 +194,25 @@ pub fn poll(ctx: &egui::Context, command_ctx: &CommandContext, table_active: boo
             }
             let hit = match binding.trigger {
                 // Clipboard events belong to a focused text field.
-                Trigger::Paste => !typing && take_event(&mut input.events, |e| matches!(e, Event::Paste(_))),
+                Trigger::Paste if !typing => match take_paste(&mut input.events) {
+                    Some(text) => {
+                        polled.pasted = Some(text);
+                        true
+                    }
+                    None => false,
+                },
+                Trigger::Paste => false,
                 Trigger::Copy => !typing && take_event(&mut input.events, |e| matches!(e, Event::Copy)),
                 Trigger::Key => input.consume_key(binding.shortcut.modifiers(), binding.shortcut.key),
                 Trigger::System => false,
             };
             if hit {
                 tracing::info!("shortcut command {:?}", binding.command);
-                fired.push(binding.command);
+                polled.commands.push(binding.command);
             }
         }
     });
-    fired
+    polled
 }
 
 #[cfg(test)]
@@ -259,7 +287,7 @@ mod tests {
         let mut harness = Harness::builder()
             .with_size(egui::vec2(300.0, 100.0))
             .build_ui(move |ui| {
-                sink.borrow_mut().extend(poll(ui.ctx(), &command_ctx, true));
+                sink.borrow_mut().extend(poll(ui.ctx(), &command_ctx, true).commands);
                 let label = ui.label("Field");
                 let field = ui.text_edit_singleline(&mut text).labelled_by(label.id);
                 if focus.take() {
@@ -294,6 +322,25 @@ mod tests {
 
         rig.press(CTRL_SHIFT, Key::V);
         assert_eq!(rig.fired(), [GuiCommand::PasteUrls, GuiCommand::PasteUrlsDirect]);
+    }
+
+    #[test]
+    fn paste_text_is_returned_with_the_command() {
+        let polled = Rc::new(RefCell::new(Vec::new()));
+        let sink = polled.clone();
+        let command_ctx = CommandContext::default();
+        let mut harness = Harness::builder().build_ui(move |ui| {
+            sink.borrow_mut().push(poll(ui.ctx(), &command_ctx, true));
+        });
+        harness.run();
+        harness.event(Event::Paste("https://example.com/a
+https://example.com/b".to_string()));
+        harness.run();
+        let polled = polled.borrow();
+        let hit = polled.iter().find(|p| !p.commands.is_empty()).expect("a hit");
+        assert_eq!(hit.commands, [GuiCommand::PasteUrls]);
+        assert_eq!(hit.pasted.as_deref(), Some("https://example.com/a
+https://example.com/b"));
     }
 
     #[test]
@@ -349,7 +396,7 @@ mod tests {
         let sink = fired.clone();
         let mut harness = Harness::builder().build_ui(move |ui| {
             // No targets and nothing to undo.
-            sink.borrow_mut().extend(poll(ui.ctx(), &CommandContext::default(), true));
+            sink.borrow_mut().extend(poll(ui.ctx(), &CommandContext::default(), true).commands);
         });
         harness.run();
         harness.key_press(Key::Delete);

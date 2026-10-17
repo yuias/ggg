@@ -11,7 +11,7 @@ use crate::{
     i18n::Tr,
     menu::MenuBar,
     platform,
-    registration::{Plan, Source, plan},
+    registration::{Plan, Resolved, Source, plan, resolve},
     render::SharedRender,
     ui::{
         add_dialog::{self, AddDialog, AddDialogModel, AddOutcome},
@@ -26,7 +26,9 @@ use ggg::{
     app::bootstrap::Core,
     download::task::DownloadTask,
     ui::queue_ops::{MAX_UNDO_BATCHES, open_in_file_manager},
+    util::url_input::MAX_URLS_PER_REGISTRATION,
 };
+use fluent_bundle::FluentArgs;
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 use tokio::runtime::Handle;
 use winit::{
@@ -71,6 +73,9 @@ pub struct GuiApp {
     results: ActionResults,
     /// Text for the status bar; replaced by each finished action.
     status: Option<String>,
+    /// Appended to the status of the next finished add, which would
+    /// otherwise hide that the list was cut.
+    add_note: Option<String>,
     /// Delete batches, newest last, for undo.
     undo: Vec<Vec<DownloadTask>>,
     view: MainView,
@@ -127,6 +132,7 @@ impl GuiApp {
             actions,
             results,
             status: None,
+            add_note: None,
             undo: Vec::new(),
             view: MainView::default(),
             windows: HashMap::new(),
@@ -166,7 +172,14 @@ impl GuiApp {
     /// Turns finished actions into a status message and undo entries.
     fn drain_results(&mut self) {
         for result in self.results.drain() {
-            self.status = Some(status_text(&self.tr, &result));
+            let mut text = status_text(&self.tr, &result);
+            if matches!(result, ActionResult::Added(_)) {
+                if let Some(note) = self.add_note.take() {
+                    text.push(' ');
+                    text.push_str(&note);
+                }
+            }
+            self.status = Some(text);
             if let ActionResult::Deleted { batch, .. } = result {
                 if !batch.is_empty() {
                     self.undo.push(batch);
@@ -209,9 +222,68 @@ impl GuiApp {
         for action in output.actions {
             self.dispatch(action);
         }
+        // egui-winit has already read the clipboard for the paste shortcut;
+        // the text belongs to the first PasteUrls command.
+        let mut pasted = output.pasted;
         for cmd in output.commands {
-            self.run_command(cmd);
+            match cmd {
+                GuiCommand::PasteUrls if pasted.is_some() => {
+                    let text = pasted.take().unwrap_or_default();
+                    self.register(Source::PasteKey { shift: false }, &text);
+                }
+                GuiCommand::PasteUrlsDirect => {
+                    self.register_clipboard(Source::PasteKey { shift: true });
+                }
+                cmd => self.run_command(cmd),
+            }
         }
+    }
+
+    fn set_status(&mut self, text: String) {
+        self.status = Some(text);
+        // The status bar is drawn by the main window only.
+        if let Some(main) = self.main_window() {
+            main.window.request_redraw();
+        }
+    }
+
+    /// Adds the URLs in `text` or opens the dialog for them, as `source` says.
+    pub fn register(&mut self, source: Source, text: &str) {
+        let folder_id = {
+            let snapshot = self.snapshot.rx.borrow();
+            add_dialog::initial_folder(self.view.target_folder(), &snapshot)
+        };
+        let expand = self.gui_config.expand_ranges_on_direct_add;
+        match resolve(source, text, expand, &folder_id) {
+            Resolved::Dialog { prefill, expand_checked } => {
+                if self.modal.is_some() {
+                    let text = self.tr.t("gui-status-close-dialog-first");
+                    self.set_status(text);
+                    return;
+                }
+                self.open_add_dialog(prefill, expand_checked);
+            }
+            Resolved::NoUrl => {
+                let text = self.tr.t("gui-status-no-url");
+                self.set_status(text);
+            }
+            Resolved::Add { request, truncated } => {
+                if truncated {
+                    let mut args = FluentArgs::new();
+                    args.set("max", MAX_URLS_PER_REGISTRATION);
+                    self.add_note = Some(self.tr.t_args("gui-status-add-truncated", &args));
+                }
+                self.dispatch(Action::Add(request));
+            }
+        }
+    }
+
+    /// `register` for a paste that has to read the clipboard itself. Text-less
+    /// clipboards count as empty text, so the dialog opens empty and a direct
+    /// add reports that nothing was found.
+    fn register_clipboard(&mut self, source: Source) {
+        let text = platform::clipboard_text().unwrap_or_default();
+        self.register(source, &text);
     }
 
     /// Runs a command from a menu, shortcut or context menu. Commands that
@@ -293,10 +365,12 @@ impl GuiApp {
                     self.open_add_dialog(String::new(), expand_checked);
                 }
             }
-            // The dialogs and windows behind these do not exist yet.
-            GuiCommand::PasteUrls
-            | GuiCommand::PasteUrlsDirect
-            | GuiCommand::OpenSettings
+            GuiCommand::PasteUrls => self.register_clipboard(Source::MenuPaste { shift: false }),
+            GuiCommand::PasteUrlsDirect => {
+                self.register_clipboard(Source::MenuPaste { shift: true });
+            }
+            // The windows behind these do not exist yet.
+            GuiCommand::OpenSettings
             | GuiCommand::FolderSettings => {
                 tracing::debug!("command {cmd:?} is not available yet");
             }
@@ -678,6 +752,11 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                     return;
                 };
                 tracing::info!("menu command {cmd:?} shift={shift}");
+                // Shift on Edit > Paste URLs skips the dialog.
+                let cmd = match cmd {
+                    GuiCommand::PasteUrls if shift => GuiCommand::PasteUrlsDirect,
+                    cmd => cmd,
+                };
                 self.run_command(cmd);
                 self.apply_requests(event_loop);
                 if let Some(main) = self.main_window() {
@@ -697,6 +776,29 @@ impl ApplicationHandler<UserEvent> for GuiApp {
             }
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registration_statuses_exist_in_every_locale() {
+        for language in ["en-US", "ja-JP"] {
+            let tr = Tr::load(language);
+            let mut args = FluentArgs::new();
+            args.set("max", MAX_URLS_PER_REGISTRATION);
+            for key in [
+                "gui-status-close-dialog-first",
+                "gui-status-no-url",
+                "gui-status-add-truncated",
+            ] {
+                let text = tr.t_args(key, &args);
+                assert!(!text.is_empty() && !text.contains(key), "{language}: {key} -> {text:?}");
+            }
+            assert!(tr.t_args("gui-status-add-truncated", &args).contains("1000"));
         }
     }
 }

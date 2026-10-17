@@ -101,6 +101,9 @@ gui-status-folder-created = Folder created.
 gui-status-folder-deleted = Folder removed.
 gui-status-scripts-reloaded = Scripts reloaded.
 gui-status-config-reloaded = Settings reloaded from disk.
+gui-status-close-dialog-first = Close the open dialog first.
+gui-status-no-url = No URL found.
+gui-status-add-truncated = Only the first { $max } URLs were added.
 
 # Dialog buttons
 gui-button-ok = OK

@@ -1,8 +1,14 @@
 //! Decides whether a request to add URLs opens the Add Downloads dialog or
 //! registers the URLs at once. Pure so the whole matrix can be tested.
 
-// The paste, menu, drop and IPC paths that call this are added after it.
+// The drop and IPC sources are constructed by input paths added after paste.
 #![allow(dead_code)]
+
+use ggg::{
+    download::enqueue::EnqueueOptions,
+    ui::queue_ops::AddRequest,
+    util::url_input::{expand_for_registration, parse_url_text},
+};
 
 /// Where a registration request came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,9 +47,48 @@ pub fn plan(source: Source, expand_setting: bool) -> Plan {
     }
 }
 
+/// What to do with the URLs found in a registration request.
+pub enum Resolved {
+    /// Open the Add Downloads dialog with `prefill` (one URL per line).
+    Dialog { prefill: String, expand_checked: bool },
+    /// Register at once. `truncated` says the list was cut at the per-request limit.
+    Add { request: AddRequest, truncated: bool },
+    /// Direct registration found nothing to add.
+    NoUrl,
+}
+
+/// Applies [`plan`] to the URLs in `text`. Pure: the caller handles windows,
+/// status text and dispatch. Invalid ranges stay in the list as written, as
+/// in the TUI.
+pub fn resolve(source: Source, text: &str, expand_setting: bool, folder_id: &str) -> Resolved {
+    let urls = parse_url_text(text);
+    match plan(source, expand_setting) {
+        Plan::Dialog { expand_checked } => Resolved::Dialog {
+            prefill: urls.join("
+"),
+            expand_checked,
+        },
+        Plan::Direct { .. } if urls.is_empty() => Resolved::NoUrl,
+        Plan::Direct { expand } => {
+            let outcome = expand_for_registration(&urls, expand);
+            Resolved::Add {
+                request: AddRequest {
+                    urls: outcome.urls,
+                    folder_id: folder_id.to_string(),
+                    options: EnqueueOptions::default(),
+                    immediate: false,
+                    save_as: None,
+                },
+                truncated: outcome.truncated,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::add_dialog::AddDialogModel;
 
     fn dialog(setting: bool) -> Plan {
         Plan::Dialog { expand_checked: setting }
@@ -111,5 +156,87 @@ mod tests {
             let source = Source::MenuPaste { shift: true };
             assert_eq!(plan(source, setting), direct(setting));
         }
+    }
+
+    const CLIPBOARD: &str = "https://example.com/a[1-2].bin
+https://example.com/b.bin";
+
+    fn added(resolved: Resolved) -> (AddRequest, bool) {
+        match resolved {
+            Resolved::Add { request, truncated } => (request, truncated),
+            _ => panic!("expected a direct add"),
+        }
+    }
+
+    #[test]
+    fn ctrl_v_prefills_the_dialog_with_both_lines() {
+        let source = Source::PasteKey { shift: false };
+        let Resolved::Dialog { prefill, expand_checked } = resolve(source, CLIPBOARD, true, "f1") else {
+            panic!("expected the dialog");
+        };
+        assert_eq!(prefill, CLIPBOARD);
+        assert!(expand_checked);
+        let model = AddDialogModel::new(prefill, expand_checked, "f1".to_string());
+        assert_eq!(model.preview().count, 3);
+    }
+
+    #[test]
+    fn dialog_text_without_urls_opens_an_empty_dialog() {
+        let source = Source::MenuPaste { shift: false };
+        let Resolved::Dialog { prefill, .. } = resolve(source, "just words", true, "f1") else {
+            panic!("expected the dialog");
+        };
+        assert_eq!(prefill, "");
+    }
+
+    #[test]
+    fn direct_add_expands_ranges_when_the_setting_is_on() {
+        let (request, truncated) = added(resolve(Source::PasteKey { shift: true }, CLIPBOARD, true, "f1"));
+        assert_eq!(request.urls.len(), 3);
+        assert_eq!(request.folder_id, "f1");
+        assert!(!request.immediate);
+        assert!(request.save_as.is_none());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn direct_add_keeps_lines_when_the_setting_is_off() {
+        let (request, _) = added(resolve(Source::PasteKey { shift: true }, CLIPBOARD, false, "f1"));
+        assert_eq!(
+            request.urls,
+            ["https://example.com/a[1-2].bin", "https://example.com/b.bin"]
+        );
+    }
+
+    #[test]
+    fn shift_click_on_the_menu_adds_directly() {
+        let (request, _) = added(resolve(Source::MenuPaste { shift: true }, CLIPBOARD, true, "f2"));
+        assert_eq!(request.urls.len(), 3);
+        assert_eq!(request.folder_id, "f2");
+    }
+
+    #[test]
+    fn direct_add_without_urls_reports_none_found() {
+        let resolved = resolve(Source::PasteKey { shift: true }, "nothing here
+", true, "f1");
+        assert!(matches!(resolved, Resolved::NoUrl));
+        let resolved = resolve(Source::Ipc, "", true, "f1");
+        assert!(matches!(resolved, Resolved::NoUrl));
+    }
+
+    #[test]
+    fn invalid_range_is_added_as_written() {
+        let text = "https://example.com/a[5-1].bin";
+        let (request, _) = added(resolve(Source::Ipc, text, true, "f1"));
+        assert_eq!(request.urls, [text]);
+    }
+
+    #[test]
+    fn direct_add_reports_truncation() {
+        let text = "https://example.com/a[1-999].bin
+https://example.com/b[1-999].bin";
+        let (request, truncated) = added(resolve(Source::Ipc, text, true, "f1"));
+        assert_eq!(request.urls.len(), ggg::util::url_input::MAX_URLS_PER_REGISTRATION);
+        assert!(truncated);
     }
 }

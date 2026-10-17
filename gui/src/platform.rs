@@ -34,6 +34,19 @@ pub fn shift_down() -> bool {
     false
 }
 
+/// Text on the system clipboard, if it holds any. Read on the calling thread
+/// only when the user asked for a paste that has no clipboard event (menu
+/// click, Ctrl+Shift+V).
+pub fn clipboard_text() -> Option<String> {
+    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+        Ok(text) => Some(text),
+        Err(e) => {
+            tracing::debug!("No clipboard text: {e}");
+            None
+        }
+    }
+}
+
 /// Forwards menu clicks to the event loop. muda accepts the handler only once
 /// per process, and a handler replaces its polling channel.
 #[cfg(windows)]

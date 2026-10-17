@@ -50,6 +50,9 @@ gui-status-folder-created = フォルダーを作成しました。
 gui-status-folder-deleted = フォルダーを削除しました。
 gui-status-scripts-reloaded = スクリプトを再読み込みしました。
 gui-status-config-reloaded = ディスクから設定を再読み込みしました。
+gui-status-close-dialog-first = 先に開いているダイアログを閉じてください。
+gui-status-no-url = URL が見つかりません。
+gui-status-add-truncated = 先頭の { $max } 件のみ追加しました。
 
 # Dialog buttons
 gui-button-ok = OK
