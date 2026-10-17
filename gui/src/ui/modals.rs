@@ -5,6 +5,7 @@ use crate::{
     bridge::{actions::Action, snapshot::Snapshot},
     commands::{GuiCommand, find_task},
     i18n::Tr,
+    menu, shortcuts,
 };
 use egui::{Button, Id, Key, Modifiers, RichText, ScrollArea, TextEdit, Ui};
 use fluent_bundle::FluentArgs;
@@ -15,6 +16,7 @@ use uuid::Uuid;
 const DIALOG_WIDTH: f32 = 420.0;
 const LIST_MAX_HEIGHT: f32 = 240.0;
 const HEADERS_MAX_HEIGHT: f32 = 90.0;
+const SHORTCUTS_MAX_HEIGHT: f32 = 320.0;
 
 pub enum Modal {
     ConfirmDelete {
@@ -149,7 +151,7 @@ pub fn show(
         }
         Modal::EditItem(edit) => edit_dialog(ctx, tr, edit),
         Modal::Shortcuts => info_dialog(ctx, tr, "shortcuts_modal", "gui-shortcuts-title", |ui| {
-            ui.label(tr.t("gui-shortcuts-placeholder"));
+            shortcut_list(ui, tr);
         }),
         Modal::About => info_dialog(ctx, tr, "about_modal", "gui-about-title", |ui| {
             ui.label(RichText::new(tr.t("gui-app-title")).strong());
@@ -402,6 +404,43 @@ fn submit_edit(edit: &mut EditModal) -> Outcome {
         new_save_path,
         new_filename,
     })
+}
+
+/// Table navigation keys, which are not commands and so not in the shortcut
+/// table: (shortcut text, message id).
+const NAVIGATION_KEYS: &[(&str, &str)] = &[
+    ("Up / Down", "gui-shortcuts-move"),
+    ("Home / End", "gui-shortcuts-edge"),
+    ("PgUp / PgDn", "gui-shortcuts-page"),
+    ("Enter", "gui-shortcuts-open"),
+    ("Ctrl+Space", "gui-shortcuts-toggle"),
+];
+
+/// Every shortcut with the name its menu item has, then the navigation keys.
+fn shortcut_list(ui: &mut Ui, tr: &Tr) {
+    ScrollArea::vertical()
+        .id_salt("shortcut_list")
+        .max_height(SHORTCUTS_MAX_HEIGHT)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            egui::Grid::new("shortcut_grid")
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    let commands = menu::commands().filter_map(|(cmd, key)| {
+                        Some((shortcuts::shortcut_text(cmd)?, menu::plain_label(tr, key)))
+                    });
+                    let navigation = NAVIGATION_KEYS
+                        .iter()
+                        .map(|(keys, key)| (keys.to_string(), tr.t(key)));
+                    for (keys, name) in commands.chain(navigation) {
+                        ui.label(RichText::new(keys).monospace());
+                        ui.label(name);
+                        ui.end_row();
+                    }
+                });
+        });
 }
 
 fn info_dialog(

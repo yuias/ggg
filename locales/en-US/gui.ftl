@@ -131,7 +131,11 @@ gui-move-current = (current)
 
 # Shortcut help and About dialogs
 gui-shortcuts-title = Keyboard Shortcuts
-gui-shortcuts-placeholder = The shortcut list is not available yet.
+gui-shortcuts-move = Move the focus (Shift extends the selection)
+gui-shortcuts-edge = First / last row
+gui-shortcuts-page = Page up / down
+gui-shortcuts-open = Show details, or open the folder of a finished download
+gui-shortcuts-toggle = Toggle the focused row
 gui-about-title = About ggg
 gui-about-version = Version { $version }
 gui-about-description = Download manager

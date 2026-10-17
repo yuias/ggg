@@ -74,7 +74,11 @@ gui-move-current = (現在)
 
 # Shortcut help and About dialogs
 gui-shortcuts-title = キーボード ショートカット
-gui-shortcuts-placeholder = ショートカットの一覧はまだ表示できません。
+gui-shortcuts-move = フォーカスを移動 (Shift で選択範囲を拡張)
+gui-shortcuts-edge = 先頭 / 末尾の行
+gui-shortcuts-page = 1 ページ上 / 下
+gui-shortcuts-open = 詳細を表示、完了したダウンロードはフォルダーを開く
+gui-shortcuts-toggle = フォーカス中の行の選択を切り替え
 gui-about-title = ggg について
 gui-about-version = バージョン { $version }
 gui-about-description = ダウンロード マネージャー

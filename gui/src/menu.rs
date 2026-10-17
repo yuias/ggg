@@ -4,16 +4,17 @@
 use crate::{
     commands::GuiCommand,
     i18n::Tr,
+    shortcuts::shortcut_text,
 };
 
 /// One entry of a drop-down menu.
 #[derive(Clone, Copy)]
 enum Item {
-    /// Label message id and the shortcut text shown right-aligned after a tab.
-    /// Shortcuts are handled elsewhere; the text only documents them.
-    Command(GuiCommand, &'static str, &'static str),
+    /// Label message id. The shortcut text after the tab comes from the
+    /// shortcut table, which also handles the keys.
+    Command(GuiCommand, &'static str),
     /// A command with a check mark that follows the details-pane setting.
-    Details(&'static str, &'static str),
+    Details(&'static str),
     Separator,
 }
 
@@ -21,75 +22,101 @@ const LAYOUT: &[(&str, &[Item])] = &[
     (
         "gui-menu-file",
         &[
-            Item::Command(GuiCommand::NewDownload, "gui-menu-new-download", "Ctrl+N"),
-            Item::Command(GuiCommand::PasteUrlsDirect, "gui-menu-paste-and-add", "Ctrl+Shift+V"),
+            Item::Command(GuiCommand::NewDownload, "gui-menu-new-download"),
+            Item::Command(GuiCommand::PasteUrlsDirect, "gui-menu-paste-and-add"),
             Item::Separator,
-            Item::Command(GuiCommand::Exit, "gui-menu-exit", "Alt+F4"),
+            Item::Command(GuiCommand::Exit, "gui-menu-exit"),
         ],
     ),
     (
         "gui-menu-edit",
         &[
-            Item::Command(GuiCommand::Undo, "gui-menu-undo", "Ctrl+Z"),
+            Item::Command(GuiCommand::Undo, "gui-menu-undo"),
             Item::Separator,
-            Item::Command(GuiCommand::CopyUrls, "gui-menu-copy-urls", "Ctrl+C"),
-            Item::Command(GuiCommand::PasteUrls, "gui-menu-paste-urls", "Ctrl+V"),
-            Item::Command(GuiCommand::Delete, "gui-menu-delete", "Delete"),
+            Item::Command(GuiCommand::CopyUrls, "gui-menu-copy-urls"),
+            Item::Command(GuiCommand::PasteUrls, "gui-menu-paste-urls"),
+            Item::Command(GuiCommand::Delete, "gui-menu-delete"),
             Item::Separator,
-            Item::Command(GuiCommand::SelectAll, "gui-menu-select-all", "Ctrl+A"),
-            Item::Command(GuiCommand::SelectNone, "gui-menu-select-none", "Esc"),
+            Item::Command(GuiCommand::SelectAll, "gui-menu-select-all"),
+            Item::Command(GuiCommand::SelectNone, "gui-menu-select-none"),
             Item::Separator,
-            Item::Command(GuiCommand::Find, "gui-menu-find", "Ctrl+F"),
+            Item::Command(GuiCommand::Find, "gui-menu-find"),
         ],
     ),
     (
         "gui-menu-download",
         &[
-            Item::Command(GuiCommand::StartPause, "gui-menu-start-pause", "Space"),
-            Item::Command(GuiCommand::Retry, "gui-menu-retry", "Ctrl+R"),
+            Item::Command(GuiCommand::StartPause, "gui-menu-start-pause"),
+            Item::Command(GuiCommand::Retry, "gui-menu-retry"),
             Item::Separator,
-            Item::Command(GuiCommand::EditItem, "gui-menu-edit-item", "F2"),
-            Item::Command(GuiCommand::MoveToFolder, "gui-menu-move-to-folder", "Ctrl+M"),
-            Item::Command(
-                GuiCommand::OpenContainingFolder,
-                "gui-menu-open-containing-folder",
-                "",
-            ),
+            Item::Command(GuiCommand::EditItem, "gui-menu-edit-item"),
+            Item::Command(GuiCommand::MoveToFolder, "gui-menu-move-to-folder"),
+            Item::Command(GuiCommand::OpenContainingFolder, "gui-menu-open-containing-folder"),
             Item::Separator,
-            Item::Command(GuiCommand::ResumeAll, "gui-menu-start-all", ""),
-            Item::Command(GuiCommand::PauseAll, "gui-menu-pause-all", ""),
+            Item::Command(GuiCommand::ResumeAll, "gui-menu-start-all"),
+            Item::Command(GuiCommand::PauseAll, "gui-menu-pause-all"),
         ],
     ),
     (
         "gui-menu-view",
         &[
-            Item::Details("gui-menu-details-pane", "Ctrl+I"),
-            Item::Command(GuiCommand::Refresh, "gui-menu-refresh", "F5"),
+            Item::Details("gui-menu-details-pane"),
+            Item::Command(GuiCommand::Refresh, "gui-menu-refresh"),
         ],
     ),
     (
         "gui-menu-tools",
-        &[Item::Command(GuiCommand::OpenSettings, "gui-menu-settings", "Ctrl+,")],
+        &[Item::Command(GuiCommand::OpenSettings, "gui-menu-settings")],
     ),
     (
         "gui-menu-help",
         &[
-            Item::Command(GuiCommand::ShowShortcuts, "gui-menu-shortcuts", "F1"),
+            Item::Command(GuiCommand::ShowShortcuts, "gui-menu-shortcuts"),
             Item::Separator,
-            Item::Command(GuiCommand::About, "gui-menu-about", ""),
+            Item::Command(GuiCommand::About, "gui-menu-about"),
         ],
     ),
 ];
 
+/// Commands in menu order with their label message ids; the check item for
+/// the details pane stands for `ToggleDetails`.
+pub fn commands() -> impl Iterator<Item = (GuiCommand, &'static str)> {
+    LAYOUT
+        .iter()
+        .flat_map(|(_, items)| items.iter())
+        .filter_map(|item| match item {
+            Item::Command(cmd, key) => Some((*cmd, *key)),
+            Item::Details(key) => Some((GuiCommand::ToggleDetails, *key)),
+            Item::Separator => None,
+        })
+}
+
+/// Label without the mnemonic marker, for places that are not menus.
+pub fn plain_label(tr: &Tr, key: &str) -> String {
+    strip_mnemonic(&tr.t(key))
+}
+
+/// Japanese catalogs write the marker as "(&X)", which goes away with it.
+fn strip_mnemonic(text: &str) -> String {
+    let mut text = text.to_string();
+    if let Some(open) = text.find("(&") {
+        let marker = &text[open + 2..];
+        if let Some(close) = marker.find(')').filter(|close| marker[..*close].chars().count() == 1)
+        {
+            text.replace_range(open..open + 2 + close + 1, "");
+        }
+    }
+    text.replace('&', "")
+}
+
 /// Label with the shortcut text after a tab, which Windows aligns in a column.
 /// The tab is added here because Fluent does not expand `\t` escapes.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn label(tr: &Tr, key: &str, shortcut: &str) -> String {
+fn label(tr: &Tr, key: &str, command: GuiCommand) -> String {
     let text = tr.t(key);
-    if shortcut.is_empty() {
-        text
-    } else {
-        format!("{text}\t{shortcut}")
+    match shortcut_text(command) {
+        Some(shortcut) => format!("{text}\t{shortcut}"),
+        None => text,
     }
 }
 
@@ -163,20 +190,20 @@ mod win {
                 let submenu = Submenu::new(tr.t(title), true);
                 for entry in *entries {
                     match *entry {
-                        Item::Command(cmd, key, shortcut) => {
+                        Item::Command(cmd, key) => {
                             let item = MenuItem::with_id(
                                 format!("{cmd:?}"),
-                                label(tr, key, shortcut),
+                                label(tr, key, cmd),
                                 false,
                                 None,
                             );
                             submenu.append(&item)?;
                             items.push((cmd, item));
                         }
-                        Item::Details(key, shortcut) => {
+                        Item::Details(key) => {
                             let item = CheckMenuItem::with_id(
                                 DETAILS_ID,
-                                label(tr, key, shortcut),
+                                label(tr, key, GuiCommand::ToggleDetails),
                                 false,
                                 false,
                                 None,
@@ -267,11 +294,20 @@ mod tests {
     }
 
     #[test]
+    fn mnemonic_marker_is_dropped_in_both_styles() {
+        assert_eq!(strip_mnemonic("&New Download..."), "New Download...");
+        assert_eq!(strip_mnemonic("Paste and &Add"), "Paste and Add");
+        assert_eq!(strip_mnemonic("削除(&D)..."), "削除...");
+        assert_eq!(strip_mnemonic("ggg について(&A)"), "ggg について");
+        assert_eq!(plain_label(&Tr::load("en"), "gui-menu-select-all"), "Select All");
+    }
+
+    #[test]
     fn labels_come_from_the_catalog_with_a_mnemonic() {
         let tr = Tr::load("en");
         for (title, items) in LAYOUT {
             let keys = std::iter::once(*title).chain(items.iter().filter_map(|item| match item {
-                Item::Command(_, key, _) | Item::Details(key, _) => Some(*key),
+                Item::Command(_, key) | Item::Details(key) => Some(*key),
                 Item::Separator => None,
             }));
             let mut mnemonics = Vec::new();

@@ -13,6 +13,7 @@ use crate::{
     commands::{CommandContext, GuiCommand, is_enabled},
     gui_config::GuiConfig,
     i18n::Tr,
+    shortcuts,
 };
 use egui::{Button, CursorIcon, Frame, Key, Panel, Sense, Stroke, Ui};
 use fluent_bundle::FluentArgs;
@@ -197,6 +198,8 @@ impl MainView {
         self.selection.retain(&ids);
         self.refresh_target_state(kind, &rows, &ids);
         self.handle_keys(ui, kind, &ids, &rows, config);
+        let pressed = shortcuts::poll(ui.ctx(), &self.command_context(), self.table_active);
+        self.pending.extend(pressed);
         let summary = status_summary(snapshot, rows.len(), self.selection.len(), tr);
 
         Panel::bottom("status_bar").show(ui, |ui| {
@@ -530,9 +533,6 @@ impl MainView {
                         Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown => true,
                         Key::Home | Key::End | Key::Enter => true,
                         Key::Space => modifiers.command,
-                        // Interim: the shortcut table will own every command key
-                        // (Undo included) and this arm goes away with it.
-                        Key::Z => modifiers.command && !modifiers.shift,
                         _ => false,
                     };
                 if handled {
@@ -554,10 +554,6 @@ impl MainView {
                 Key::Home => self.selection.focus_edge(false, ids, mods),
                 Key::End => self.selection.focus_edge(true, ids, mods),
                 Key::Space => self.selection.toggle_focused(),
-                Key::Z => {
-                    self.pending.push(GuiCommand::Undo);
-                    continue;
-                }
                 Key::Enter => {
                     if let Some(id) = self.selection.focus() {
                         self.activate(id, kind, rows, config);
@@ -1481,5 +1477,134 @@ mod tests {
         harness.get_by_label("Retry").click();
         harness.run();
         assert_eq!(rig.commands.borrow().as_slice(), &[GuiCommand::Retry]);
+    }
+
+    mod shortcuts {
+        use super::*;
+        use egui::{Event, Modifiers};
+
+        const CTRL: Modifiers = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        const CTRL_SHIFT: Modifiers =
+            Modifiers { ctrl: true, shift: true, ..Modifiers::NONE };
+
+        fn focus_history_search(harness: &mut Harness<'_, ()>) {
+            harness.get_by_label("Completed (1)").click();
+            harness.run();
+            harness
+                .get_by_role(egui::accesskit::Role::TextInput)
+                .click();
+            harness.run();
+        }
+
+        #[test]
+        fn delete_key_opens_confirm_when_row_selected() {
+            let (mut harness, _rig) = rig(sample_snapshot());
+            harness.run();
+            harness.get_by_label("alpha.iso").click();
+            harness.run();
+            harness.key_press(egui::Key::Delete);
+            harness.run();
+            harness.get_by_label("Delete this download?");
+        }
+
+        #[test]
+        fn delete_key_does_nothing_without_a_selection() {
+            let (mut harness, _rig) = rig(sample_snapshot());
+            harness.run();
+            harness.key_press(egui::Key::Delete);
+            harness.run();
+            assert!(harness.query_by_label("Delete this download?").is_none());
+        }
+
+        #[test]
+        fn delete_key_ignored_while_text_field_focused() {
+            let (mut harness, _rig) = rig(sample_snapshot());
+            harness.run();
+            focus_history_search(&mut harness);
+            harness
+                .get_by_role(egui::accesskit::Role::TextInput)
+                .type_text("ab");
+            harness.run();
+            // Nothing in the history matches "ab", and Delete must edit the field.
+            assert!(harness.query_by_label("old.bin").is_none());
+            harness.key_press(egui::Key::Home);
+            harness.key_press(egui::Key::Delete);
+            harness.run();
+            harness.get_by_label("old.bin");
+            assert!(harness.query_by_label("Delete this download?").is_none());
+        }
+
+        #[test]
+        fn ctrl_a_selects_all_rows() {
+            let (mut harness, _rig) = rig(sample_snapshot());
+            harness.run();
+            harness.get_by_label("alpha.iso").click();
+            harness.run();
+            harness.get_by_label_contains("1 selected");
+            harness.key_press_modifiers(CTRL, egui::Key::A);
+            harness.run();
+            harness.get_by_label_contains("2 selected");
+        }
+
+        #[test]
+        fn paste_event_requests_paste_urls() {
+            let (mut harness, rig) = rig(sample_snapshot());
+            harness.run();
+            harness.event(Event::Paste("https://example.com/a".to_string()));
+            harness.run();
+            assert_eq!(rig.commands.borrow().as_slice(), &[GuiCommand::PasteUrls]);
+        }
+
+        #[test]
+        fn ctrl_shift_v_requests_direct_paste() {
+            let (mut harness, rig) = rig(sample_snapshot());
+            harness.run();
+            harness.key_press_modifiers(CTRL_SHIFT, egui::Key::V);
+            harness.run();
+            assert_eq!(
+                rig.commands.borrow().as_slice(),
+                &[GuiCommand::PasteUrlsDirect]
+            );
+        }
+
+        #[test]
+        fn paste_is_ignored_while_the_search_field_has_focus() {
+            let (mut harness, rig) = rig(sample_snapshot());
+            harness.run();
+            focus_history_search(&mut harness);
+            harness.event(Event::Paste("old".to_string()));
+            harness.key_press_modifiers(CTRL_SHIFT, egui::Key::V);
+            harness.run();
+            assert!(rig.commands.borrow().is_empty());
+            // The text field took the pasted text.
+            harness.get_by_label("old.bin");
+        }
+
+        #[test]
+        fn f1_lists_the_shortcuts_and_esc_closes_the_list() {
+            let (mut harness, _rig) = rig(sample_snapshot());
+            harness.run();
+            harness.key_press(egui::Key::F1);
+            harness.run();
+            harness.get_by_label("F1");
+            harness.get_by_label("Ctrl+Shift+V");
+            harness.get_by_label("Paste and Add");
+            harness.get_by_label("Ctrl+V");
+
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            assert!(harness.query_by_label("Ctrl+Shift+V").is_none());
+        }
+
+        #[test]
+        fn esc_clears_the_selection_when_the_table_has_the_keys() {
+            let (mut harness, _rig) = rig(sample_snapshot());
+            harness.run();
+            harness.get_by_label("alpha.iso").click();
+            harness.run();
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            assert!(harness.query_by_label_contains("1 selected").is_none());
+        }
     }
 }
