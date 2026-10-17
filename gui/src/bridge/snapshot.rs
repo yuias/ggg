@@ -87,8 +87,6 @@ pub async fn build_snapshot(
     }
 }
 
-// `refresh` is used once actions exist to request an immediate rebuild.
-#[allow(dead_code)]
 pub struct SnapshotHandle {
     pub rx: watch::Receiver<Arc<Snapshot>>,
     /// Asks the task for a rebuild without waiting for the next core event.

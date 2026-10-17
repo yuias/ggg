@@ -85,8 +85,6 @@ impl Selection {
         self.anchor = Some(id);
     }
 
-    // Used by the Select All command and by actions on the selection.
-    #[allow(dead_code)]
     pub fn select_all(&mut self, rows: &[Uuid]) {
         self.selected = rows.iter().copied().collect();
     }
@@ -105,7 +103,6 @@ impl Selection {
 
     /// Rows an action applies to: the selection in display order, or just the
     /// focused row when nothing is selected.
-    #[allow(dead_code)]
     pub fn targets(&self, rows: &[Uuid]) -> Vec<Uuid> {
         let selected: Vec<Uuid> = rows
             .iter()

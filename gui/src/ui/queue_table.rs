@@ -110,6 +110,9 @@ pub struct TableOutput {
     pub page_rows: usize,
 }
 
+/// Fills the context menu of a row.
+pub type RowMenu<'a> = &'a mut dyn FnMut(&mut egui::Ui, &DownloadTask);
+
 /// Draws the table. Column widths are read from and written back to `widths`
 /// so they persist; columns without an entry use their default.
 pub fn show(
@@ -117,6 +120,7 @@ pub fn show(
     tr: &Tr,
     params: &TableParams<'_>,
     widths: &mut Vec<ColumnWidth>,
+    row_menu: RowMenu<'_>,
 ) -> TableOutput {
     let TableParams { kind, rows, selection, sort, scroll_to } = *params;
     let defs = column_defs(kind);
@@ -303,6 +307,7 @@ pub fn show(
                 } else if response.secondary_clicked() {
                     out.secondary_clicked = Some(task.id);
                 }
+                response.context_menu(|ui| row_menu(ui, task));
             });
         });
 

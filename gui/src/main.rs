@@ -2,6 +2,7 @@
 
 mod app;
 mod bridge;
+mod commands;
 mod event;
 mod gui_config;
 mod i18n;

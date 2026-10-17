@@ -1,12 +1,19 @@
 //! Main window layout: folder tree, download table, details pane and status bar.
 
 use super::{
+    context_menu,
     details::{self, DetailsTab},
+    modals::{self, Modal},
     queue_table::{self, TableKind, TableOutput, TableParams},
     selection::{Mods, Selection},
     sort,
 };
-use crate::{bridge::snapshot::Snapshot, gui_config::GuiConfig, i18n::Tr};
+use crate::{
+    bridge::{actions::Action, snapshot::Snapshot},
+    commands::{CommandContext, GuiCommand, is_enabled},
+    gui_config::GuiConfig,
+    i18n::Tr,
+};
 use egui::{Button, CursorIcon, Frame, Key, Panel, Sense, Stroke, Ui};
 use fluent_bundle::FluentArgs;
 use ggg::{
@@ -27,6 +34,25 @@ const DETAILS_MIN_HEIGHT: f32 = 80.0;
 const TABLE_MIN_HEIGHT: f32 = 120.0;
 const SPLITTER_THICKNESS: f32 = 6.0;
 
+/// What the view cannot know by itself.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ViewEnv {
+    /// Delete batches the app can restore.
+    pub undo_depth: usize,
+    /// An OS-modal window (add dialog, settings) is open.
+    pub os_modal_open: bool,
+}
+
+/// What the app has to run after a frame.
+#[derive(Default)]
+pub struct ViewOutput {
+    /// Commands that need the core or the window; the view already handled
+    /// the others.
+    pub commands: Vec<GuiCommand>,
+    /// Confirmed dialog results.
+    pub actions: Vec<Action>,
+}
+
 /// View state that is not persisted.
 #[derive(Default)]
 pub struct MainView {
@@ -43,6 +69,16 @@ pub struct MainView {
     scroll_to: Option<Uuid>,
     search: String,
     tab: DetailsTab,
+    modal: Option<Modal>,
+    env: ViewEnv,
+    /// Commands requested during the frame, routed once it is drawn.
+    pending: Vec<GuiCommand>,
+    /// Row ids in display order, as of the last frame.
+    ids: Vec<Uuid>,
+    has_targets: bool,
+    has_error_target: bool,
+    /// Move the keyboard focus to the history search box.
+    focus_search: bool,
 }
 
 impl MainView {
@@ -53,6 +89,79 @@ impl MainView {
         self.target_folder.as_deref()
     }
 
+    /// Rows an action applies to: the selection, or the focused row.
+    pub fn targets(&self) -> Vec<Uuid> {
+        self.selection.targets(&self.ids)
+    }
+
+    /// The focused row, which start/pause uses to decide between the two.
+    pub fn focus(&self) -> Option<Uuid> {
+        self.selection.focus()
+    }
+
+    /// Folder of the selected tree node; `None` on the Completed node.
+    pub fn tree_folder(&self) -> Option<&str> {
+        match &self.view {
+            Some(QueueView::Folder(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn command_context(&self) -> CommandContext {
+        CommandContext {
+            view_is_history: self.view == Some(QueueView::History),
+            has_targets: self.has_targets,
+            has_error_target: self.has_error_target,
+            undo_depth: self.env.undo_depth,
+            modal_open: self.modal.is_some() || self.env.os_modal_open,
+            tree_folder: self.tree_folder().map(str::to_string),
+        }
+    }
+
+    /// Runs `cmd` if it only concerns the view (selection, search, details
+    /// pane, dialogs). Returns the command back when the app has to run it,
+    /// and `None` when it was handled or is not enabled.
+    pub fn route(
+        &mut self,
+        cmd: GuiCommand,
+        snapshot: &Snapshot,
+        config: &mut GuiConfig,
+    ) -> Option<GuiCommand> {
+        if !is_enabled(cmd, &self.command_context()) {
+            return None;
+        }
+        match cmd {
+            GuiCommand::SelectAll => self.selection.select_all(&self.ids),
+            GuiCommand::SelectNone => {
+                self.selection.clear();
+                self.search.clear();
+            }
+            GuiCommand::Find => {
+                self.view = Some(QueueView::History);
+                self.selection.clear();
+                self.focus_search = true;
+            }
+            GuiCommand::ToggleDetails => config.details_visible = !config.details_visible,
+            GuiCommand::Delete
+            | GuiCommand::MoveToFolder
+            | GuiCommand::EditItem
+            | GuiCommand::DeleteFolderTasks
+            | GuiCommand::ClearHistory
+            | GuiCommand::ShowShortcuts
+            | GuiCommand::About => {
+                self.modal = Modal::for_command(
+                    cmd,
+                    &self.targets(),
+                    self.selection.focus(),
+                    self.tree_folder(),
+                    snapshot,
+                );
+            }
+            other => return Some(other),
+        }
+        None
+    }
+
     pub fn show(
         &mut self,
         ui: &mut Ui,
@@ -60,7 +169,9 @@ impl MainView {
         tr: &Tr,
         config: &mut GuiConfig,
         status: Option<&str>,
-    ) {
+        env: ViewEnv,
+    ) -> ViewOutput {
+        self.env = env;
         self.normalize(snapshot);
 
         let mut rows = match &self.view {
@@ -84,6 +195,7 @@ impl MainView {
         }
         let ids: Vec<Uuid> = rows.iter().map(|task| task.id).collect();
         self.selection.retain(&ids);
+        self.refresh_target_state(kind, &rows, &ids);
         self.handle_keys(ui, kind, &ids, &rows, config);
         let summary = status_summary(snapshot, rows.len(), self.selection.len(), tr);
 
@@ -138,6 +250,35 @@ impl MainView {
             egui::CentralPanel::default()
                 .show(ui, |ui| self.table(ui, tr, kind, &rows, &ids, config));
         });
+
+        let mut output = ViewOutput::default();
+        if let Some(action) = modals::show(ui.ctx(), tr, &mut self.modal, snapshot) {
+            output.actions.push(action);
+        }
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() || !output.actions.is_empty() {
+            // Opening or closing a dialog changes the next frame, which no
+            // input event is going to ask for.
+            ui.ctx().request_repaint();
+        }
+        for cmd in pending {
+            if let Some(core) = self.route(cmd, snapshot, config) {
+                output.commands.push(core);
+            }
+        }
+        output
+    }
+
+    /// Caches what the command gates need, so commands that arrive between
+    /// frames (menu, shortcuts) can be checked without the rows.
+    fn refresh_target_state(&mut self, kind: TableKind, rows: &[&DownloadTask], ids: &[Uuid]) {
+        self.ids = ids.to_vec();
+        let targets = self.selection.targets(ids);
+        self.has_targets = !targets.is_empty();
+        self.has_error_target = kind == TableKind::Queue
+            && rows
+                .iter()
+                .any(|task| task.status == DownloadStatus::Error && targets.contains(&task.id));
     }
 
     /// Keeps the selected node valid when folders appear or disappear.
@@ -167,6 +308,7 @@ impl MainView {
     }
 
     fn tree(&mut self, ui: &mut Ui, snapshot: &Snapshot, tr: &Tr) {
+        let base = self.command_context();
         egui::ScrollArea::vertical()
             .id_salt("tree_scroll")
             .auto_shrink([false, false])
@@ -181,29 +323,51 @@ impl MainView {
                                 "gui-tree-folder",
                                 &count_args(Some(name.as_str()), count),
                             );
-                            self.tree_node(ui, node, text);
+                            self.tree_node(ui, tr, &base, node, text);
                         }
                         let text = tr.t_args(
                             "gui-tree-completed",
                             &count_args(None, snapshot.history.len()),
                         );
-                        self.tree_node(ui, QueueView::History, text);
+                        self.tree_node(ui, tr, &base, QueueView::History, text);
                     },
                 );
             });
     }
 
-    fn tree_node(&mut self, ui: &mut Ui, node: QueueView, text: String) {
+    fn tree_node(
+        &mut self,
+        ui: &mut Ui,
+        tr: &Tr,
+        base: &CommandContext,
+        node: QueueView,
+        text: String,
+    ) {
         let selected = self.view.as_ref() == Some(&node);
         // The trailing grow atom left-aligns the text inside the full-width button.
         let button = Button::selectable(selected, (text, egui::Atom::grow()));
-        if ui.add(button).clicked() {
+        let response = ui.add(button);
+        // A right click selects the node too, so the folder commands of its
+        // menu act on the node that was clicked.
+        if response.clicked() || response.secondary_clicked() {
             self.table_active = false;
             if !selected {
-                self.view = Some(node);
+                self.view = Some(node.clone());
                 self.selection.clear();
             }
         }
+        let mut menu = base.clone();
+        match &node {
+            QueueView::Folder(id) => {
+                menu.view_is_history = false;
+                menu.tree_folder = Some(id.clone());
+            }
+            QueueView::History => {
+                menu.view_is_history = true;
+                menu.tree_folder = None;
+            }
+        }
+        response.context_menu(|ui| context_menu::tree_menu(ui, tr, &menu, &mut self.pending));
     }
 
     fn table_kind(&self) -> TableKind {
@@ -229,10 +393,27 @@ impl MainView {
                     .hint_text(tr.t("gui-history-search-hint"))
                     .desired_width(f32::INFINITY),
             );
+            if std::mem::take(&mut self.focus_search) {
+                search.request_focus();
+            }
             if search.gained_focus() {
                 self.table_active = false;
             }
             ui.add_space(ui.spacing().item_spacing.y);
+        }
+        let base = self.command_context();
+        let mut requested = Vec::new();
+        if kind == TableKind::Queue {
+            // Declared before the table so its rows stay on top and only the
+            // empty area below them reaches this menu.
+            let background = ui.interact(
+                ui.available_rect_before_wrap(),
+                ui.scope_id().with("queue_background"),
+                Sense::click(),
+            );
+            background.context_menu(|ui| {
+                context_menu::background_menu(ui, tr, &base, &mut requested);
+            });
         }
         let params = TableParams {
             kind,
@@ -248,7 +429,23 @@ impl MainView {
             TableKind::Queue => &mut config.queue_columns,
             TableKind::History => &mut config.history_columns,
         };
-        let output = queue_table::show(ui, tr, &params, widths);
+        // The selection a right click makes is applied after the table is
+        // drawn, so the menu works out for itself which rows it acts on.
+        let selection = &self.selection;
+        let mut row_menu = |ui: &mut Ui, task: &DownloadTask| {
+            let mut ctx = base.clone();
+            ctx.has_targets = true;
+            ctx.has_error_target = if selection.is_selected(task.id) {
+                rows.iter().any(|row| {
+                    row.status == DownloadStatus::Error && selection.is_selected(row.id)
+                })
+            } else {
+                task.status == DownloadStatus::Error
+            };
+            context_menu::row_menu(ui, tr, &ctx, &mut requested);
+        };
+        let output = queue_table::show(ui, tr, &params, widths, &mut row_menu);
+        self.pending.append(&mut requested);
         self.apply_table_output(output, kind, rows, ids, config);
     }
 
@@ -314,7 +511,12 @@ impl MainView {
     ) {
         // A focused text field or button owns the keys (egui moves focus with
         // the arrows), so only act while nothing else has focus.
-        if !self.table_active || ui.ctx().egui_wants_keyboard_input() {
+        // A dialog owns Enter and Esc while it is open.
+        if !self.table_active
+            || self.modal.is_some()
+            || self.env.os_modal_open
+            || ui.ctx().egui_wants_keyboard_input()
+        {
             return;
         }
         let pressed = ui.input_mut(|input| {
@@ -328,6 +530,7 @@ impl MainView {
                         Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown => true,
                         Key::Home | Key::End | Key::Enter => true,
                         Key::Space => modifiers.command,
+                        Key::Z => modifiers.command && !modifiers.shift,
                         _ => false,
                     };
                 if handled {
@@ -349,6 +552,10 @@ impl MainView {
                 Key::Home => self.selection.focus_edge(false, ids, mods),
                 Key::End => self.selection.focus_edge(true, ids, mods),
                 Key::Space => self.selection.toggle_focused(),
+                Key::Z => {
+                    self.pending.push(GuiCommand::Undo);
+                    continue;
+                }
                 Key::Enter => {
                     if let Some(id) = self.selection.focus() {
                         self.activate(id, kind, rows, config);
@@ -470,7 +677,13 @@ mod tests {
     use egui_kittest::{Harness, kittest::Queryable};
     use crate::gui_config::{ColumnWidth, SortState};
     use ggg::app::config::Config;
-    use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::HashMap,
+        path::PathBuf,
+        rc::Rc,
+        sync::Arc,
+    };
 
     fn task(name: &str, folder: &str) -> DownloadTask {
         let mut task = DownloadTask::new(format!("https://host/{name}"), PathBuf::from("."));
@@ -507,7 +720,9 @@ mod tests {
         let mut config = config;
         Harness::builder()
             .with_size(egui::vec2(900.0, 600.0))
-            .build_ui(move |ui| view.show(ui, &snapshot, &tr, &mut config, None))
+            .build_ui(move |ui| {
+                view.show(ui, &snapshot, &tr, &mut config, None, ViewEnv::default());
+            })
     }
 
     #[test]
@@ -603,7 +818,9 @@ mod tests {
         let mut view = MainView::default();
         Harness::builder()
             .with_size(size)
-            .build_ui(move |ui| view.show(ui, &snapshot, &tr, &mut config.borrow_mut(), None))
+            .build_ui(move |ui| {
+                view.show(ui, &snapshot, &tr, &mut config.borrow_mut(), None, ViewEnv::default());
+            })
     }
 
     fn top_of(harness: &Harness<'_, ()>, label: &str) -> f32 {
@@ -832,5 +1049,349 @@ mod tests {
         view.view = Some(QueueView::History);
         view.normalize(&snapshot);
         assert_eq!(view.target_folder(), Some("f2"));
+    }
+
+    /// A main view with its outputs collected, as `GuiApp` would receive them.
+    /// Nothing here reaches the core, so no config isolation is needed.
+    struct Rig {
+        view: Rc<RefCell<MainView>>,
+        actions: Rc<RefCell<Vec<Action>>>,
+        commands: Rc<RefCell<Vec<GuiCommand>>>,
+        undo_depth: Rc<Cell<usize>>,
+    }
+
+    fn rig(snapshot: Snapshot) -> (Harness<'static, ()>, Rig) {
+        let rig = Rig {
+            view: Rc::new(RefCell::new(MainView::default())),
+            actions: Rc::new(RefCell::new(Vec::new())),
+            commands: Rc::new(RefCell::new(Vec::new())),
+            undo_depth: Rc::new(Cell::new(0)),
+        };
+        let tr = Tr::load("en-US");
+        let mut config = GuiConfig::default();
+        let (view, actions, commands, undo_depth) = (
+            rig.view.clone(),
+            rig.actions.clone(),
+            rig.commands.clone(),
+            rig.undo_depth.clone(),
+        );
+        let harness = Harness::builder()
+            .with_size(egui::vec2(900.0, 600.0))
+            .build_ui(move |ui| {
+                let env = ViewEnv { undo_depth: undo_depth.get(), os_modal_open: false };
+                let out = view.borrow_mut().show(ui, &snapshot, &tr, &mut config, None, env);
+                actions.borrow_mut().extend(out.actions);
+                commands.borrow_mut().extend(out.commands);
+            });
+        (harness, rig)
+    }
+
+    fn id_of(snapshot: &Snapshot, folder: &str, index: usize) -> Uuid {
+        snapshot.folder_downloads[folder][index].id
+    }
+
+    fn secondary_click_at(harness: &mut Harness<'_, ()>, pos: egui::Pos2) {
+        harness.hover_at(pos);
+        harness.run();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+    }
+
+    #[test]
+    fn right_click_row_shows_delete_entry() {
+        let (mut harness, _rig) = rig(sample_snapshot());
+        harness.run();
+        assert!(harness.query_by_label("Delete...").is_none());
+
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Delete...");
+        harness.get_by_label("Edit...");
+        harness.get_by_label("Move to Folder...");
+        harness.get_by_label("Copy URLs");
+    }
+
+    #[test]
+    fn confirm_delete_cancel_keeps_rows() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Delete...").click();
+        harness.run();
+        harness.get_by_label("Delete this download?");
+
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        assert!(harness.query_by_label("Delete this download?").is_none());
+        harness.get_by_label("alpha.iso");
+        harness.get_by_label("beta.zip");
+        assert!(rig.actions.borrow().is_empty(), "cancel must not delete");
+    }
+
+    #[test]
+    fn confirm_delete_runs_the_action_for_every_selected_row() {
+        let snapshot = sample_snapshot();
+        let (alpha, beta) = (id_of(&snapshot, "f1", 0), id_of(&snapshot, "f1", 1));
+        let (mut harness, rig) = rig(snapshot);
+        harness.run();
+
+        harness.get_by_label("alpha.iso").click();
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(
+            egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+        ));
+        harness.run();
+        harness.get_by_label("beta.zip").click();
+        harness.run();
+        harness.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        harness.run();
+        // A right click on a selected row keeps the whole selection.
+        harness.get_by_label("beta.zip").click_secondary();
+        harness.run();
+        harness.get_by_label("Delete...").click();
+        harness.run();
+        harness.get_by_label("Delete 2 downloads?");
+
+        harness.get_by_label("Delete").click();
+        harness.run();
+        {
+            let actions = rig.actions.borrow();
+            match actions.as_slice() {
+                [Action::Delete { targets }] => assert_eq!(targets, &vec![alpha, beta]),
+                _ => panic!("expected one delete action, got {} actions", actions.len()),
+            }
+        }
+        assert!(harness.query_by_label("Delete 2 downloads?").is_none());
+    }
+
+    #[test]
+    fn enter_confirms_the_delete_dialog() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Delete...").click();
+        harness.run();
+
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert!(matches!(rig.actions.borrow().as_slice(), [Action::Delete { .. }]));
+    }
+
+    #[test]
+    fn move_dialog_sends_the_chosen_folder() {
+        let snapshot = sample_snapshot();
+        let alpha = id_of(&snapshot, "f1", 0);
+        let (mut harness, rig) = rig(snapshot);
+        harness.run();
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Move to Folder...").click();
+        harness.run();
+        harness.get_by_label_contains("(current)");
+
+        harness.get_by_label("Videos").click();
+        harness.run();
+        harness.get_by_label("Move").click();
+        harness.run();
+        let actions = rig.actions.borrow();
+        match actions.as_slice() {
+            [Action::MoveToFolder { targets, folder_id }] => {
+                assert_eq!(targets, &vec![alpha]);
+                assert_eq!(folder_id, "f2");
+            }
+            _ => panic!("expected one move action, got {} actions", actions.len()),
+        }
+    }
+
+    #[test]
+    fn edit_dialog_sends_the_new_referrer() {
+        let snapshot = sample_snapshot();
+        let alpha = id_of(&snapshot, "f1", 0);
+        let (mut harness, rig) = rig(snapshot);
+        harness.run();
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Edit...").click();
+        harness.run();
+        harness.get_by_label("Edit item");
+
+        // The referrer field has the focus when the dialog opens.
+        let fields: Vec<_> = harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .collect();
+        assert_eq!(fields.len(), 2);
+        assert!(fields[1].is_focused());
+        fields[1].type_text("https://ref.example/");
+        harness.run();
+        harness.get_by_label("OK").click();
+        harness.run();
+
+        let actions = rig.actions.borrow();
+        match actions.as_slice() {
+            [Action::EditItems { targets, header_edit, new_save_path }] => {
+                assert_eq!(targets, &vec![alpha]);
+                let referrer = header_edit.as_ref().and_then(|edit| edit.referrer.as_deref());
+                assert_eq!(referrer, Some("https://ref.example/"));
+                assert!(new_save_path.is_none());
+            }
+            _ => panic!("expected one edit action, got {} actions", actions.len()),
+        }
+    }
+
+    #[test]
+    fn edit_dialog_without_changes_sends_nothing() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Edit...").click();
+        harness.run();
+        harness.get_by_label("OK").click();
+        harness.run();
+        assert!(rig.actions.borrow().is_empty());
+        assert!(harness.query_by_label("Edit item").is_none());
+    }
+
+    #[test]
+    fn tree_menu_offers_folder_commands_and_asks_before_deleting() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        harness.get_by_label("Videos (1)").click_secondary();
+        harness.run();
+        harness.get_by_label("Start All").click();
+        harness.run();
+        assert_eq!(rig.commands.borrow().as_slice(), &[GuiCommand::StartFolder]);
+        // The right click selected the node, so the command acts on it.
+        harness.get_by_label("gamma.mp4");
+
+        harness.get_by_label("Videos (1)").click_secondary();
+        harness.run();
+        harness.get_by_label("Delete All...").click();
+        harness.run();
+        harness.get_by_label_contains("Delete the 1 download in \"Videos\"?");
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        assert!(rig.actions.borrow().is_empty());
+    }
+
+    #[test]
+    fn completed_node_menu_clears_history_after_confirmation() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        harness.get_by_label("Completed (1)").click_secondary();
+        harness.run();
+        harness.get_by_label("Clear History...").click();
+        harness.run();
+        harness.get_by_label_contains("Remove 1 entry from the history?");
+
+        harness.get_by_label("Delete").click();
+        harness.run();
+        assert!(matches!(rig.actions.borrow().as_slice(), [Action::ClearHistory]));
+    }
+
+    #[test]
+    fn history_row_menu_lists_only_commands_that_apply() {
+        let (mut harness, _rig) = rig(sample_snapshot());
+        harness.run();
+        harness.get_by_label("Completed (1)").click();
+        harness.run();
+        harness.get_by_label("old.bin").click_secondary();
+        harness.run();
+        harness.get_by_label("Copy URLs");
+        harness.get_by_label("Open Containing Folder");
+        assert!(harness.query_by_label("Delete...").is_none());
+    }
+
+    #[test]
+    fn right_click_on_the_empty_table_area_offers_paste() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        // Well below the two rows, inside the table pane.
+        secondary_click_at(&mut harness, egui::pos2(500.0, 200.0));
+        harness.get_by_label("Paste URLs...").click();
+        harness.run();
+        assert_eq!(rig.commands.borrow().as_slice(), &[GuiCommand::PasteUrls]);
+    }
+
+    #[test]
+    fn commands_are_ignored_while_a_dialog_is_open() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Delete...").click();
+        harness.run();
+
+        rig.view.borrow_mut().pending.push(GuiCommand::SelectAll);
+        rig.view.borrow_mut().pending.push(GuiCommand::Refresh);
+        harness.run();
+        assert!(rig.commands.borrow().is_empty());
+        harness.get_by_label_contains("1 selected");
+    }
+
+    #[test]
+    fn select_all_and_select_none_work_through_commands() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        rig.view.borrow_mut().pending.push(GuiCommand::SelectAll);
+        harness.run();
+        harness.get_by_label_contains("2 selected");
+
+        rig.view.borrow_mut().pending.push(GuiCommand::SelectNone);
+        harness.run();
+        assert!(harness.query_by_label_contains("2 selected").is_none());
+    }
+
+    #[test]
+    fn ctrl_z_requests_undo_only_when_a_batch_exists() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        harness.get_by_label("alpha.iso").click();
+        harness.run();
+
+        harness.key_press_modifiers(
+            egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            egui::Key::Z,
+        );
+        harness.run();
+        assert!(rig.commands.borrow().is_empty());
+
+        rig.undo_depth.set(1);
+        harness.key_press_modifiers(
+            egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            egui::Key::Z,
+        );
+        harness.run();
+        assert_eq!(rig.commands.borrow().as_slice(), &[GuiCommand::Undo]);
+    }
+
+    #[test]
+    fn retry_entry_follows_the_error_state_of_the_clicked_row() {
+        let mut snapshot = sample_snapshot();
+        snapshot.folder_downloads.get_mut("f1").unwrap()[1].status = DownloadStatus::Error;
+        let (mut harness, rig) = rig(snapshot);
+        harness.run();
+
+        // Not an error row: the entry is disabled, so the click does nothing.
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Retry").click();
+        harness.run();
+        assert!(rig.commands.borrow().is_empty());
+
+        harness.get_by_label("beta.zip").click_secondary();
+        harness.run();
+        harness.get_by_label("Retry").click();
+        harness.run();
+        assert_eq!(rig.commands.borrow().as_slice(), &[GuiCommand::Retry]);
     }
 }
