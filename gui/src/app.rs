@@ -6,6 +6,7 @@ use crate::{
         snapshot::{SnapshotHandle, spawn_snapshot_task},
     },
     event::UserEvent,
+    gui_config::GuiConfig,
     i18n::Tr,
     window::{OsWindow, main_window_attributes},
 };
@@ -25,6 +26,7 @@ use winit::{
 pub struct GuiApp {
     proxy: EventLoopProxy<UserEvent>,
     tr: Tr,
+    gui_config: GuiConfig,
     /// Kept so the runtime handle outlives every dispatched action.
     #[allow(dead_code)]
     rt: Handle,
@@ -46,7 +48,13 @@ pub struct GuiApp {
 
 impl GuiApp {
     /// Must be called while the runtime is alive; it starts the snapshot task.
-    pub fn new(rt: Handle, core: Core, tr: Tr, proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub fn new(
+        rt: Handle,
+        core: Core,
+        tr: Tr,
+        gui_config: GuiConfig,
+        proxy: EventLoopProxy<UserEvent>,
+    ) -> Self {
         let wake_proxy = proxy.clone();
         let snapshot = spawn_snapshot_task(&rt, core.manager.clone(), core.state.clone(), move || {
             // The loop may already be gone during shutdown; nothing to wake then.
@@ -65,6 +73,7 @@ impl GuiApp {
         Self {
             proxy,
             tr,
+            gui_config,
             rt,
             core,
             snapshot,
@@ -75,6 +84,11 @@ impl GuiApp {
             main: None,
             repaint_at: None,
         }
+    }
+
+    /// Current GUI state, written to disk by the caller once the loop ends.
+    pub fn gui_config(&self) -> &GuiConfig {
+        &self.gui_config
     }
 
     /// Starts `action` on the runtime; the result arrives through `drain_results`.

@@ -3,6 +3,7 @@
 mod app;
 mod bridge;
 mod event;
+mod gui_config;
 mod i18n;
 mod window;
 
@@ -46,16 +47,42 @@ fn main() -> Result<()> {
     let language = rt.block_on(core.state.config.read()).general.language.clone();
     let tr = i18n::Tr::load(&language);
 
+    // After init_core so the config directory is already resolved and created.
+    let gui_config_path = match gui_config::GuiConfig::default_path() {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::warn!("GUI state will not be persisted: {e:#}");
+            None
+        }
+    };
+    let gui_config = gui_config_path
+        .as_deref()
+        .map(gui_config::GuiConfig::load_from)
+        .unwrap_or_default();
+
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("create event loop")?;
-    let mut app = app::GuiApp::new(rt.handle().clone(), core, tr, event_loop.create_proxy());
+    let mut app = app::GuiApp::new(
+        rt.handle().clone(),
+        core,
+        tr,
+        gui_config,
+        event_loop.create_proxy(),
+    );
     let run_result = event_loop.run_app(&mut app);
 
     // The loop is done, so blocking here cannot stall the UI.
     match rt.block_on(manager.save_queue_to_folders()) {
         Ok(()) => tracing::info!("GUI shutdown: queue saved"),
         Err(e) => tracing::error!("GUI shutdown: failed to save queue: {e:#}"),
+    }
+
+    if let Some(path) = &gui_config_path {
+        match app.gui_config().save_to(path) {
+            Ok(()) => tracing::info!("GUI shutdown: GUI state saved"),
+            Err(e) => tracing::error!("GUI shutdown: failed to save GUI state: {e:#}"),
+        }
     }
 
     drop(app);
