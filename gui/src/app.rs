@@ -3,7 +3,7 @@
 use crate::{
     bridge::{
         actions::{Action, ActionResult, ActionResults, Actions, status_text},
-        snapshot::{SnapshotHandle, spawn_snapshot_task},
+        snapshot::{Snapshot, SnapshotHandle, spawn_snapshot_task},
     },
     commands::{GuiCommand, find_task},
     dnd,
@@ -24,7 +24,8 @@ use crate::{
     },
     window::{
         ADD_DIALOG_MIN_SIZE, ADD_DIALOG_SIZE, OsWindow, PxRect, SETTINGS_MIN_SIZE, SETTINGS_SIZE,
-        centered_on, dialog_attributes, dialog_size, main_window_attributes, overlaps_any,
+        MonitorArea, centered_on, dialog_attributes, dialog_size, main_placement,
+        main_window_attributes, overlaps_any,
     },
 };
 use ggg::{
@@ -95,6 +96,12 @@ pub struct GuiApp {
     /// Every open OS window, the main one included.
     windows: HashMap<WindowId, OsWindow>,
     main_id: Option<WindowId>,
+    /// Geometry of the main window while it is neither maximized nor
+    /// minimized. A maximized window reports the screen rectangle, so this is
+    /// what gets saved to make "restore" return to the size the user chose.
+    main_normal: Option<WindowGeometry>,
+    /// Title last given to the main window, to set it only when it changes.
+    main_title: String,
     modal: Option<OpenModal>,
     /// Set by a command; the window is created from the event loop callback.
     open_request: Option<OpenRequest>,
@@ -155,6 +162,8 @@ impl GuiApp {
             drop_target: None,
             windows: HashMap::new(),
             main_id: None,
+            main_normal: None,
+            main_title: String::new(),
             modal: None,
             open_request: None,
             add_dialog: None,
@@ -275,6 +284,7 @@ impl GuiApp {
         if let Some(menu) = menu {
             menu.sync(&view.command_context(), gui_config.details_visible);
         }
+        self.update_main_title(&snapshot);
         for action in output.actions {
             self.dispatch(action);
         }
@@ -492,10 +502,29 @@ fn start_ipc(_rt: &Handle, _proxy: &EventLoopProxy<UserEvent>) -> Option<String>
 /// is not cut off: a menu bar takes room from the client area.
 fn attach_menu(menu: &MenuBar, window: &mut OsWindow, hwnd: isize, dark: bool) {
     let size = window.window.inner_size();
+    let maximized = window.window.is_maximized();
     menu.attach(hwnd, dark);
-    // winit adds the menu height to the outer size when it resizes.
-    let _ = window.window.request_inner_size(size);
+    // winit adds the menu height to the outer size when it resizes. A
+    // maximized window fills the monitor whatever the menu takes, and asking
+    // winit for a size would also restore it.
+    if !maximized {
+        let _ = window.window.request_inner_size(size);
+    }
     window.resize(window.window.inner_size());
+}
+
+/// Monitors with their scale factors.
+fn monitor_areas(event_loop: &ActiveEventLoop) -> Vec<MonitorArea> {
+    event_loop
+        .available_monitors()
+        .map(|m| {
+            let (pos, size) = (m.position(), m.size());
+            MonitorArea {
+                rect: (pos.x, pos.y, size.width, size.height),
+                scale: m.scale_factor(),
+            }
+        })
+        .collect()
 }
 
 /// Monitors as physical px rectangles.
@@ -688,7 +717,57 @@ impl GuiApp {
             main.window.focus_window();
             main.window.request_redraw();
         }
+        self.store_main_geometry();
         self.save_gui_config();
+    }
+
+    /// Remembers the main window's rectangle while it is in its normal state.
+    fn track_main_geometry(&mut self) {
+        let Some(main) = self.main_window() else {
+            return;
+        };
+        let window = &main.window;
+        // A minimized window reports a position far off-screen.
+        if window.is_maximized()
+            || window.is_minimized() == Some(true)
+            || window.fullscreen().is_some()
+        {
+            return;
+        }
+        if let Some(geometry) = window_geometry(window) {
+            self.main_normal = Some(geometry);
+        }
+    }
+
+    /// Copies the main window's state into `gui_config`; the caller writes it.
+    fn store_main_geometry(&mut self) {
+        let Some(main) = self.main_window() else {
+            return;
+        };
+        let maximized = main.window.is_maximized();
+        let normal = self.main_normal.or_else(|| window_geometry(&main.window));
+        if let Some(geometry) = normal {
+            self.gui_config.main_window = Some(WindowGeometry { maximized, ..geometry });
+        }
+    }
+
+    /// Shows the folder that new downloads go to in the title bar.
+    fn update_main_title(&mut self, snapshot: &Snapshot) {
+        let folder = self.view.target_folder().and_then(|id| {
+            snapshot
+                .folders
+                .iter()
+                .find(|(folder_id, _)| folder_id == id)
+                .map(|(_, name)| name.as_str())
+        });
+        let title = main_title(&self.tr, folder);
+        if title == self.main_title {
+            return;
+        }
+        if let Some(main) = self.main_window() {
+            main.window.set_title(&title);
+        }
+        self.main_title = title;
     }
 
     fn save_gui_config(&self) {
@@ -763,6 +842,7 @@ impl GuiApp {
             None => {}
         }
         if self.exit_requested {
+            self.store_main_geometry();
             self.drop_target = None;
             event_loop.exit();
         }
@@ -773,6 +853,18 @@ impl GuiApp {
             window.window.request_redraw();
         }
     }
+}
+
+/// Window title: the target folder's name and the application name.
+fn main_title(tr: &Tr, folder: Option<&str>) -> String {
+    let app = tr.t("gui-app-title");
+    let Some(folder) = folder else {
+        return app;
+    };
+    let mut args = FluentArgs::new();
+    args.set("folder", folder);
+    args.set("app", app);
+    tr.t_args("gui-window-title", &args)
 }
 
 /// Outer position in physical px and inner size in logical px.
@@ -794,9 +886,15 @@ impl ApplicationHandler<UserEvent> for GuiApp {
         if self.main_id.is_some() {
             return;
         }
+        let placement = main_placement(self.gui_config.main_window, &monitor_areas(event_loop));
+        if self.gui_config.main_window.is_some() && placement.is_none() {
+            tracing::info!("Saved main window position is off-screen; using the default placement");
+        }
+        // Until a frame knows the target folder the title is the plain name.
+        self.main_title = self.tr.t("gui-app-title");
         match OsWindow::new(
             event_loop,
-            main_window_attributes(&self.tr.t("gui-app-title")),
+            main_window_attributes(&self.main_title, placement),
             &mut self.shared,
             self.proxy.clone(),
         ) {
@@ -822,6 +920,13 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 let id = window.window.id();
                 self.windows.insert(id, window);
                 self.main_id = Some(id);
+                // A window created maximized keeps the saved normal rectangle
+                // until the user changes it; otherwise read the real one.
+                if placement.is_some_and(|p| p.maximized) {
+                    self.main_normal = self.gui_config.main_window;
+                } else {
+                    self.track_main_geometry();
+                }
             }
             Err(e) => {
                 tracing::error!("Failed to create the main window: {e:#}");
@@ -864,6 +969,7 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 if let Some(modal) = self.modal.as_ref().map(|m| m.id) {
                     self.close_modal(modal);
                 }
+                self.store_main_geometry();
                 self.drop_target = None;
                 event_loop.exit();
                 return;
@@ -872,7 +978,9 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 if let Some(main) = self.windows.get_mut(&id) {
                     main.resize(*size);
                 }
+                self.track_main_geometry();
             }
+            WindowEvent::Moved(_) => self.track_main_geometry(),
             WindowEvent::ThemeChanged(theme) => {
                 if let (Some(menu), Some(hwnd)) = (
                     &self.menu,
@@ -996,6 +1104,18 @@ mod tests {
             args.set("name", r"\\.\pipe\ggg-dnd-42");
             let text = Tr::load(language).t_args("gui-statusbar-pipe-tooltip", &args);
             assert!(text.contains(r"\\.\pipe\ggg-dnd-42"), "{language}: {text:?}");
+        }
+    }
+
+    #[test]
+    fn title_names_the_target_folder_in_every_locale() {
+        for language in ["en-US", "ja-JP"] {
+            let tr = Tr::load(language);
+            let app = tr.t("gui-app-title");
+            assert_eq!(main_title(&tr, None), app);
+            let title = main_title(&tr, Some("Music"));
+            assert!(title.contains("Music") && title.contains(&app), "{language}: {title:?}");
+            assert!(!title.contains("gui-window-title"), "{language}: {title:?}");
         }
     }
 

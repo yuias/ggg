@@ -2,6 +2,8 @@
 # Every key defined in en-US/gui.ftl must also be defined here.
 
 gui-app-title = ggg
+# Main window title: the folder that new downloads go to, then the application name
+gui-window-title = { $folder } - { $app }
 
 # Folder tree
 gui-tree-folder = { $name } ({ $count })

@@ -2,6 +2,8 @@
 # Shared strings stay in the other files; add a key here only when the GUI needs its own.
 
 gui-app-title = ggg
+# Main window title: the folder that new downloads go to, then the application name
+gui-window-title = { $folder } - { $app }
 
 # Folder tree
 gui-tree-folder = { $name } ({ $count })

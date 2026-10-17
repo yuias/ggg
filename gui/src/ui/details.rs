@@ -3,7 +3,10 @@
 use super::queue_table::{progress_fraction, status_text};
 use crate::i18n::Tr;
 use chrono::Local;
-use egui::{Label, RichText, ScrollArea};
+use egui::{
+    Label, RichText, ScrollArea, TextStyle,
+    text::{LayoutJob, TextFormat},
+};
 use ggg::{
     download::{
         http_errors::HttpErrorInfo,
@@ -47,7 +50,7 @@ fn info(ui: &mut egui::Ui, tr: &Tr, task: &DownloadTask) {
                 .show(ui, |ui| {
                     for (label, value) in info_rows(tr, task) {
                         ui.label(RichText::new(label).strong());
-                        ui.add(Label::new(value).wrap());
+                        wrapped_value(ui, value);
                         ui.end_row();
                     }
                 });
@@ -62,6 +65,20 @@ fn info(ui: &mut egui::Ui, tr: &Tr, task: &DownloadTask) {
                 ui.label(error_suggestion(task, error));
             }
         });
+}
+
+/// A selectable value that wraps at the pane edge. URLs and paths have no
+/// spaces, so the default word wrap would let them run past the edge and be
+/// clipped; breaking anywhere keeps the whole value visible and copyable.
+fn wrapped_value(ui: &mut egui::Ui, value: String) {
+    let format = TextFormat {
+        font_id: TextStyle::Body.resolve(ui.style()),
+        color: ui.visuals().text_color(),
+        ..TextFormat::default()
+    };
+    let mut job = LayoutJob::single_section(value, format);
+    job.wrap.break_anywhere = true;
+    ui.add(Label::new(job).wrap());
 }
 
 /// `(label, value)` pairs for the Info grid, in display order.
@@ -130,13 +147,19 @@ fn log(ui: &mut egui::Ui, tr: &Tr, task: &DownloadTask) {
         .stick_to_bottom(true)
         .show(ui, |ui| {
             for entry in &task.logs {
-                let mut text = RichText::new(log_line(entry)).monospace();
-                match entry.level {
-                    LogLevel::Info => {}
-                    LogLevel::Warn => text = text.color(ui.visuals().warn_fg_color),
-                    LogLevel::Error => text = text.color(ui.visuals().error_fg_color),
-                }
-                ui.add(Label::new(text).wrap());
+                let color = match entry.level {
+                    LogLevel::Info => ui.visuals().text_color(),
+                    LogLevel::Warn => ui.visuals().warn_fg_color,
+                    LogLevel::Error => ui.visuals().error_fg_color,
+                };
+                let format = TextFormat {
+                    font_id: TextStyle::Monospace.resolve(ui.style()),
+                    color,
+                    ..TextFormat::default()
+                };
+                let mut job = LayoutJob::single_section(log_line(entry), format);
+                job.wrap.break_anywhere = true;
+                ui.add(Label::new(job).wrap());
             }
         });
 }
@@ -187,5 +210,30 @@ mod tests {
             .expect("headers row");
         assert!(headers.1.starts_with("Authorization:"));
         assert!(!headers.1.contains("secret-token"));
+    }
+
+    #[test]
+    fn long_unbroken_values_wrap_inside_the_pane() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        const WIDTH: f32 = 320.0;
+        let tr = Tr::load("en-US");
+        let url = format!("https://example.com/{}", "a".repeat(200));
+        let mut t = DownloadTask::new(url.clone(), PathBuf::from("dl"));
+        t.save_path = PathBuf::from(format!("downloads/{}", "b".repeat(200)));
+        let save_path = t.save_path.to_string_lossy().into_owned();
+
+        let mut tab = DetailsTab::Info;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(WIDTH, 400.0))
+            .build_ui(move |ui| show(ui, &tr, Some(&t), &mut tab));
+        harness.run();
+
+        for value in [&url, &save_path] {
+            let rect = harness.get_by_label(value.as_str()).rect();
+            assert!(rect.right() <= WIDTH, "{value} ends at {} past {WIDTH}", rect.right());
+            // More than one row: the value was wrapped, not clipped.
+            assert!(rect.height() > 2.0 * 14.0, "{value} is a single row: {rect:?}");
+        }
     }
 }
