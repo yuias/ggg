@@ -1,5 +1,6 @@
 //! Events delivered to the winit loop from other threads.
 
+use crate::dnd::DropPayload;
 use std::time::Duration;
 use winit::window::WindowId;
 
@@ -14,4 +15,8 @@ pub enum UserEvent {
     // Only the Windows menu sends it.
     #[cfg_attr(not(windows), allow(dead_code))]
     Menu { id: String, shift: bool },
+    /// Something was dropped on the main window.
+    // Only the Windows drop target sends it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Drop(DropPayload),
 }

@@ -6,12 +6,13 @@ use crate::{
         snapshot::{SnapshotHandle, spawn_snapshot_task},
     },
     commands::{GuiCommand, find_task},
+    dnd,
     event::UserEvent,
     gui_config::{GuiConfig, WindowGeometry},
     i18n::Tr,
     menu::MenuBar,
     platform,
-    registration::{Plan, Resolved, Source, plan, resolve},
+    registration::{Plan, Resolved, Source, plan, resolve_urls},
     render::SharedRender,
     ui::{
         add_dialog::{self, AddDialog, AddDialogModel, AddOutcome},
@@ -79,6 +80,8 @@ pub struct GuiApp {
     /// Delete batches, newest last, for undo.
     undo: Vec<Vec<DownloadTask>>,
     view: MainView,
+    /// Declared before `windows` so it is revoked before the window goes.
+    drop_target: Option<dnd::DropRegistration>,
     /// Every open OS window, the main one included.
     windows: HashMap<WindowId, OsWindow>,
     main_id: Option<WindowId>,
@@ -135,6 +138,7 @@ impl GuiApp {
             add_note: None,
             undo: Vec::new(),
             view: MainView::default(),
+            drop_target: None,
             windows: HashMap::new(),
             main_id: None,
             modal: None,
@@ -249,12 +253,18 @@ impl GuiApp {
 
     /// Adds the URLs in `text` or opens the dialog for them, as `source` says.
     pub fn register(&mut self, source: Source, text: &str) {
+        self.register_urls(source, ggg::util::url_input::parse_url_text(text));
+    }
+
+    /// [`Self::register`] for URLs that were already extracted, such as the
+    /// ones in dropped `.url` files.
+    pub fn register_urls(&mut self, source: Source, urls: Vec<String>) {
         let folder_id = {
             let snapshot = self.snapshot.rx.borrow();
             add_dialog::initial_folder(self.view.target_folder(), &snapshot)
         };
         let expand = self.gui_config.expand_ranges_on_direct_add;
-        match resolve(source, text, expand, &folder_id) {
+        match resolve_urls(source, urls, expand, &folder_id) {
             Resolved::Dialog { prefill, expand_checked } => {
                 if self.modal.is_some() {
                     let text = self.tr.t("gui-status-close-dialog-first");
@@ -602,6 +612,7 @@ impl GuiApp {
             None => {}
         }
         if self.exit_requested {
+            self.drop_target = None;
             event_loop.exit();
         }
     }
@@ -645,6 +656,16 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 if let (Some(menu), Some(hwnd)) = (&self.menu, platform::hwnd(&window.window)) {
                     let dark = window.window.theme() == Some(Theme::Dark);
                     attach_menu(menu, &mut window, hwnd, dark);
+                }
+                if let Some(hwnd) = platform::hwnd(&window.window) {
+                    let proxy = self.proxy.clone();
+                    self.drop_target = dnd::register_drop_target(hwnd, move |payload| {
+                        // The loop may already be gone during shutdown.
+                        let _ = proxy.send_event(UserEvent::Drop(payload));
+                    });
+                    if self.drop_target.is_some() {
+                        tracing::info!("Drop target registered on the main window");
+                    }
                 }
                 window.window.request_redraw();
                 let id = window.window.id();
@@ -692,6 +713,7 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 if let Some(modal) = self.modal.as_ref().map(|m| m.id) {
                     self.close_modal(modal);
                 }
+                self.drop_target = None;
                 event_loop.exit();
                 return;
             }
@@ -737,6 +759,24 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 }
             }
             UserEvent::Snapshot | UserEvent::ActionDone => {
+                if let Some(main) = self.main_window() {
+                    main.window.request_redraw();
+                }
+            }
+            UserEvent::Drop(payload) => {
+                tracing::info!(
+                    "dropped {} URL(s) ctrl={} shift={}",
+                    payload.urls.len(),
+                    payload.ctrl,
+                    payload.shift
+                );
+                let source = Source::Drop {
+                    ctrl: payload.ctrl,
+                    shift: payload.shift,
+                };
+                self.register_urls(source, payload.urls);
+                // A Ctrl+drop asks for the dialog, which needs the event loop.
+                self.apply_requests(event_loop);
                 if let Some(main) = self.main_window() {
                     main.window.request_redraw();
                 }

@@ -3,6 +3,7 @@
 mod app;
 mod bridge;
 mod commands;
+mod dnd;
 mod event;
 mod gui_config;
 mod i18n;
@@ -66,6 +67,10 @@ fn main() -> Result<()> {
         .as_deref()
         .map(gui_config::GuiConfig::load_from)
         .unwrap_or_default();
+
+    // Drag and drop needs OLE in a single-threaded apartment on this thread.
+    // Declared before the loop so it is released after every window is gone.
+    let _ole = dnd::init_ole();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()

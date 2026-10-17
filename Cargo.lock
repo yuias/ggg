@@ -2075,6 +2075,7 @@ dependencies = [
  "tracing",
  "uuid",
  "windows",
+ "windows-core",
  "winit",
 ]
 

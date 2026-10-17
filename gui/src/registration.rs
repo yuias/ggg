@@ -1,7 +1,7 @@
 //! Decides whether a request to add URLs opens the Add Downloads dialog or
 //! registers the URLs at once. Pure so the whole matrix can be tested.
 
-// The drop and IPC sources are constructed by input paths added after paste.
+// The IPC source is constructed by an input path added after the drop target.
 #![allow(dead_code)]
 
 use ggg::{
@@ -61,7 +61,17 @@ pub enum Resolved {
 /// status text and dispatch. Invalid ranges stay in the list as written, as
 /// in the TUI.
 pub fn resolve(source: Source, text: &str, expand_setting: bool, folder_id: &str) -> Resolved {
-    let urls = parse_url_text(text);
+    resolve_urls(source, parse_url_text(text), expand_setting, folder_id)
+}
+
+/// [`resolve`] for URLs that are already separated, such as the ones read from
+/// dropped `.url` files.
+pub fn resolve_urls(
+    source: Source,
+    urls: Vec<String>,
+    expand_setting: bool,
+    folder_id: &str,
+) -> Resolved {
     match plan(source, expand_setting) {
         Plan::Dialog { expand_checked } => Resolved::Dialog {
             prefill: urls.join("
