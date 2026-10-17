@@ -1,0 +1,26 @@
+[package]
+name = "ggg-gui"
+version = "0.1.0"
+edition = "2024"
+authors = ["yuinshielAs"]
+description = "Native GUI front end for ggg"
+license = "MIT"
+
+[[bin]]
+name = "ggg-gui"
+path = "src/main.rs"
+
+[dependencies]
+ggg = { path = ".." }
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard", "links"] }
+egui-wgpu = { version = "0.37", features = ["winit"] }
+egui_extras = "0.37"
+egui_system_font_provider = "0.37"
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+raw-window-handle = "0.6"
+pollster = "0.4"

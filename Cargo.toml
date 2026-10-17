@@ -1,6 +1,6 @@
 [workspace]
-members = [".", "windows/ggg-ipc", "windows/ggg-dnd", "windows/ggg-bridge"]
-default-members = [".", "windows/ggg-ipc", "windows/ggg-dnd", "windows/ggg-bridge"]
+members = [".", "windows/ggg-ipc", "windows/ggg-dnd", "windows/ggg-bridge", "gui"]
+default-members = [".", "windows/ggg-ipc", "windows/ggg-dnd", "windows/ggg-bridge", "gui"]
 resolver = "2"
 
 [package]
