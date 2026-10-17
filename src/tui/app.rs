@@ -39,23 +39,6 @@ enum TextEdit {
     Ignored,
 }
 
-/// Scan a scripts directory for `.js` filenames, sorted. Returns an empty list
-/// on any error. Used to populate `TuiState::cached_script_files`.
-fn scan_script_files(dir: &std::path::Path) -> Vec<String> {
-    match std::fs::read_dir(dir) {
-        Ok(entries) => {
-            let mut files: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("js"))
-                .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
-                .collect();
-            files.sort();
-            files
-        }
-        Err(_) => Vec::new(),
-    }
-}
-
 /// Main TUI application
 pub struct TuiApp {
     pub state: TuiState,
@@ -130,7 +113,7 @@ impl TuiApp {
             let config = self.state.app_state.config.read().await;
             config.scripts.directory.clone()
         };
-        self.state.cached_script_files = scan_script_files(&dir);
+        self.state.cached_script_files = crate::util::script_files::scan_script_files(&dir);
 
         // The script rows are flattened onto the end of the field list, so a
         // shrunk file list can leave the selected row index past the end.
@@ -3068,7 +3051,7 @@ pub async fn run_tui(
             let config = app.state.app_state.config.read().await;
             if config.general.auto_launch_dnd {
                 drop(config);
-                auto_launch_ggg_dnd(&pipe_name);
+                crate::ipc::dnd_launch::auto_launch_ggg_dnd(&pipe_name);
             }
         }
     }
@@ -3116,50 +3099,6 @@ pub async fn run_tui(
     app.save_queue().await?;
 
     Ok(())
-}
-
-/// Auto-launch ggg-dnd.exe if not already running (detected via Named Mutex).
-#[cfg(windows)]
-fn auto_launch_ggg_dnd(pipe_name: &str) {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::OpenMutexW;
-
-    // Check if ggg-dnd is already running via Named Mutex
-    let already_running = unsafe {
-        match OpenMutexW(
-            windows::Win32::System::Threading::MUTEX_ALL_ACCESS,
-            false,
-            windows::core::w!("Global\\ggg-dnd-running"),
-        ) {
-            Ok(handle) => {
-                let _ = CloseHandle(handle);
-                true
-            }
-            Err(_) => false,
-        }
-    };
-
-    if already_running {
-        tracing::info!("ggg-dnd is already running, skipping auto-launch");
-        return;
-    }
-
-    // Look for ggg-dnd.exe next to ggg.exe
-    let dnd_exe = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("ggg-dnd.exe")));
-
-    match dnd_exe {
-        Some(exe_path) if exe_path.exists() => {
-            match std::process::Command::new(&exe_path).arg(pipe_name).spawn() {
-                Ok(_) => tracing::info!("Auto-launched ggg-dnd: {:?}", exe_path),
-                Err(e) => tracing::warn!("Failed to auto-launch ggg-dnd: {}", e),
-            }
-        }
-        _ => {
-            tracing::debug!("ggg-dnd.exe not found next to ggg.exe, skipping auto-launch");
-        }
-    }
 }
 
 #[cfg(test)]
