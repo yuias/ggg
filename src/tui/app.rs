@@ -3,9 +3,10 @@ use super::item_editor;
 use super::state::{DeleteTarget, DetailsPosition, FocusPane, TuiState, UiMode};
 use crate::app::keybindings::{KeyAction, KeyContext};
 use crate::app::state::AppState;
-use crate::download::enqueue::{enqueue, EnqueueOutcome};
+use crate::download::enqueue::{enqueue, EnqueueOptions, EnqueueOutcome};
 use crate::download::manager::DownloadManager;
 use crate::download::task::DownloadStatus;
+use crate::ui::queue_ops;
 use anyhow::Result;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2339,25 +2340,7 @@ impl TuiApp {
             ContextMenuAction::OpenFolder => {
                 // Open download folder in file explorer
                 if let Some(task) = self.state.get_selected_download() {
-                    #[cfg(target_os = "windows")]
-                    {
-                        let _ = std::process::Command::new("explorer")
-                            .arg(task.save_path.to_string_lossy().to_string())
-                            .spawn();
-                    }
-                    #[cfg(target_os = "macos")]
-                    {
-                        let _ = std::process::Command::new("open")
-                            .arg(task.save_path.to_string_lossy().to_string())
-                            .spawn();
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        let _ = std::process::Command::new("xdg-open")
-                            .arg(task.save_path.to_string_lossy().to_string())
-                            .spawn();
-                    }
-                    tracing::info!("Opening folder: {}", task.save_path.display());
+                    queue_ops::open_in_file_manager(&task.save_path);
                 }
                 self.state.ui_mode = UiMode::Normal;
             }
@@ -2462,15 +2445,7 @@ impl TuiApp {
                 // Delete all downloads in the current folder
                 let mut busy_count = 0;
                 if let Some(folder_id) = self.state.selected_folder_id_from_tree() {
-                    if let Some(tasks) = self.state.folder_downloads.get(folder_id) {
-                        let ids: Vec<_> = tasks.iter().map(|t| t.id).collect();
-                        for (id, result) in ids.iter().copied().zip(self.manager.remove_many(&ids).await) {
-                            if let Err(e) = result {
-                                tracing::warn!("Failed to remove download {}: {}", id, e);
-                                busy_count += 1;
-                            }
-                        }
-                    }
+                    busy_count = queue_ops::delete_folder_tasks(&self.manager, folder_id).await.busy;
                 }
                 self.state.status_message = if busy_count > 0 {
                     let args = fluent::fluent_args! { "count" => busy_count };
@@ -2500,60 +2475,15 @@ impl TuiApp {
         // permit, in retry backoff, or mid-start) as the reference to decide
         // start vs pause.
         let reference_id = self.state.get_selected_download().map(|t| t.id);
-        let reference_in_flight = match reference_id {
-            Some(id) => self.manager.is_in_flight(id).await,
-            None => false,
-        };
 
         let target_ids = self.state.get_target_download_ids();
         if target_ids.is_empty() {
             return Ok(());
         }
 
-        let mut busy_count = 0;
-        if reference_in_flight {
-            // Reference item is in flight → pause in-flight targets, so a
-            // target still in retry backoff is paused too. A busy claim
-            // (start still running its beforeRequest script) is an expected
-            // outcome, not a reason to tear down the TUI. Pausing is done as
-            // one batch so N busy targets wait one claim-wait budget total,
-            // not N budgets.
-            let mut in_flight_ids = Vec::new();
-            for id in target_ids {
-                if self.manager.is_in_flight(id).await {
-                    in_flight_ids.push(id);
-                }
-            }
-            for (id, result) in in_flight_ids
-                .iter()
-                .copied()
-                .zip(self.manager.pause_many_if_in_flight(&in_flight_ids).await)
-            {
-                if let Err(e) = result {
-                    tracing::warn!("Failed to pause download {}: {}", id, e);
-                    busy_count += 1;
-                }
-            }
-        } else {
-            for id in target_ids {
-                if let Some(task) = self.manager.get_by_id(id).await {
-                    // Reference item is not in flight → start startable items
-                    match task.status {
-                        DownloadStatus::Pending | DownloadStatus::Paused | DownloadStatus::Error => {
-                            // A refused start (folder limit reached, circuit
-                            // breaker open) is an expected outcome, not a
-                            // reason to tear down the TUI.
-                            if let Err(e) = self.manager.start_download(id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await {
-                                tracing::warn!("Failed to start download {}: {}", id, e);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        self.state.status_message = if busy_count > 0 {
-            let args = fluent::fluent_args! { "count" => busy_count };
+        let report = queue_ops::toggle_tasks(&self.manager, &self.state.app_state, reference_id, &target_ids).await;
+        self.state.status_message = if report.busy > 0 {
+            let args = fluent::fluent_args! { "count" => report.busy };
             Some(self.state.t_with_args("status-normal-busy", Some(&args)))
         } else {
             None
@@ -2564,30 +2494,12 @@ impl TuiApp {
 
     /// Delete selected download(s) - supports multi-selection
     async fn delete_download(&mut self) -> Result<()> {
-        const MAX_UNDO_HISTORY: usize = 10;
-
         let ids_to_delete = self.state.get_target_download_ids();
         if !ids_to_delete.is_empty() {
-            // Collect the deleted tasks as one batch so undo restores them all.
-            let mut batch = Vec::new();
-            let mut busy_count = 0;
-            let results = self.manager.remove_many(&ids_to_delete).await;
-            for (id, result) in ids_to_delete.iter().copied().zip(results) {
-                match result {
-                    Ok(Some(mut task)) => {
-                        task.status = DownloadStatus::Deleted;
-                        self.manager.add_to_history(task.clone()).await;
-                        batch.push(task);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!("Failed to remove download {}: {}", id, e);
-                        busy_count += 1;
-                    }
-                }
-            }
-            self.state.status_message = if busy_count > 0 {
-                let args = fluent::fluent_args! { "count" => busy_count };
+            // The deleted tasks form one batch so undo restores them all.
+            let (batch, report) = queue_ops::delete_tasks(&self.manager, &ids_to_delete).await;
+            self.state.status_message = if report.busy > 0 {
+                let args = fluent::fluent_args! { "count" => report.busy };
                 Some(self.state.t_with_args("status-normal-busy", Some(&args)))
             } else {
                 None
@@ -2601,8 +2513,8 @@ impl TuiApp {
         }
 
         // Limit history size to prevent excessive memory usage
-        if self.state.delete_history.len() > MAX_UNDO_HISTORY {
-            let overflow = self.state.delete_history.len() - MAX_UNDO_HISTORY;
+        if self.state.delete_history.len() > queue_ops::MAX_UNDO_BATCHES {
+            let overflow = self.state.delete_history.len() - queue_ops::MAX_UNDO_BATCHES;
             self.state.delete_history.drain(0..overflow);
         }
 
@@ -2613,8 +2525,9 @@ impl TuiApp {
     async fn undo_delete(&mut self) -> Result<()> {
         if let Some(batch) = self.state.delete_history.pop() {
             let count = batch.len();
-            for task in batch {
-                self.add_download_with_auto_start(task).await?;
+            let report = queue_ops::restore_tasks(&self.manager, &self.state.app_state, batch).await;
+            if report.affected > 0 {
+                self.save_queue().await?;
             }
             tracing::info!("Undid delete of {} download(s)", count);
         }
@@ -2625,9 +2538,8 @@ impl TuiApp {
     async fn retry_download(&mut self) -> Result<()> {
         if let Some(task) = self.state.get_selected_download() {
             if task.status == DownloadStatus::Error {
-                if let Err(e) = self.manager.start_download(task.id, self.state.app_state.script_sender.clone(), self.state.app_state.config.clone()).await {
-                    tracing::warn!("Failed to retry download {}: {}", task.id, e);
-                }
+                let id = task.id;
+                queue_ops::retry_tasks(&self.manager, &self.state.app_state, &[id]).await;
                 self.save_queue().await?;
             }
         }
@@ -3041,21 +2953,26 @@ impl TuiApp {
         let urls = crate::util::url_expansion::expand_url(url);
         let urls = if urls.is_empty() { vec![url.to_string()] } else { urls };
 
-        for u in &urls {
-            let task = {
-                let config = self.state.app_state.config.read().await;
-                crate::download::task::DownloadTask::new_with_folder(
-                    u.clone(),
-                    folder_id.clone(),
-                    &config,
-                )
-            };
-            self.add_download_with_auto_start(task).await?;
+        let count = urls.len();
+        let report = queue_ops::add_urls(
+            &self.manager,
+            &self.state.app_state,
+            queue_ops::AddRequest {
+                urls,
+                folder_id: folder_id.clone(),
+                options: EnqueueOptions::default(),
+                immediate: false,
+                save_as: None,
+            },
+        )
+        .await;
+        if !report.added.is_empty() {
+            self.save_queue().await?;
         }
 
         tracing::debug!(
             "Auto-added {} download(s) from paste/D&D to folder '{}'",
-            urls.len(),
+            count,
             folder_id
         );
 

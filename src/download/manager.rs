@@ -2203,6 +2203,14 @@ impl DownloadManager {
         }
     }
 
+    /// Holds `id`'s claim until the returned guard is dropped, so a test
+    /// outside this module can make pause/remove report `TaskBusy` (a live
+    /// handle alone does not: those operations stop it).
+    #[cfg(test)]
+    pub(crate) fn hold_claim_for_test(&self, id: Uuid) -> impl Drop + use<> {
+        StartClaim::try_acquire(&self.start_claims, id).expect("claim must be free")
+    }
+
     /// Sets or clears the in-memory retry-backoff flag for `id`'s active
     /// entry, for tests that need `run_state` to report `RetryBackoff`
     /// without waiting out a real backoff sleep. No-op if `id` has no entry.
