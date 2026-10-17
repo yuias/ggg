@@ -1,13 +1,18 @@
 //! winit application handler: window registry, event routing and frame loop.
 
 use crate::{
-    bridge::snapshot::{SnapshotHandle, spawn_snapshot_task},
+    bridge::{
+        actions::{Action, ActionResult, ActionResults, Actions, status_text},
+        snapshot::{SnapshotHandle, spawn_snapshot_task},
+    },
     event::UserEvent,
     i18n::Tr,
     window::{OsWindow, main_window_attributes},
 };
 use fluent_bundle::FluentArgs;
-use ggg::app::bootstrap::Core;
+use ggg::{
+    app::bootstrap::Core, download::task::DownloadTask, ui::queue_ops::MAX_UNDO_BATCHES,
+};
 use std::time::Instant;
 use tokio::runtime::Handle;
 use winit::{
@@ -20,12 +25,20 @@ use winit::{
 pub struct GuiApp {
     proxy: EventLoopProxy<UserEvent>,
     tr: Tr,
-    /// Held for the action bridge, which dispatches onto the runtime.
+    /// Kept so the runtime handle outlives every dispatched action.
     #[allow(dead_code)]
     rt: Handle,
     #[allow(dead_code)]
     core: Core,
     snapshot: SnapshotHandle,
+    // Dispatched from the views added after the bridge.
+    #[allow(dead_code)]
+    actions: Actions,
+    results: ActionResults,
+    /// Text for the status bar; replaced by each finished action.
+    status: Option<String>,
+    /// Delete batches, newest last, for undo.
+    undo: Vec<Vec<DownloadTask>>,
     main: Option<OsWindow>,
     /// Earliest delayed repaint requested by egui, if any.
     repaint_at: Option<Instant>,
@@ -39,18 +52,55 @@ impl GuiApp {
             // The loop may already be gone during shutdown; nothing to wake then.
             let _ = wake_proxy.send_event(UserEvent::Snapshot);
         });
+        let action_proxy = proxy.clone();
+        let (actions, results) = Actions::new(
+            rt.clone(),
+            core.state.clone(),
+            core.manager.clone(),
+            snapshot.refresh.clone(),
+            move || {
+                let _ = action_proxy.send_event(UserEvent::ActionDone);
+            },
+        );
         Self {
             proxy,
             tr,
             rt,
             core,
             snapshot,
+            actions,
+            results,
+            status: None,
+            undo: Vec::new(),
             main: None,
             repaint_at: None,
         }
     }
 
+    /// Starts `action` on the runtime; the result arrives through `drain_results`.
+    #[allow(dead_code)]
+    pub fn dispatch(&self, action: Action) {
+        self.actions.dispatch(action);
+    }
+
+    /// Turns finished actions into a status message and undo entries.
+    fn drain_results(&mut self) {
+        for result in self.results.drain() {
+            self.status = Some(status_text(&self.tr, &result));
+            if let ActionResult::Deleted { batch, .. } = result {
+                if !batch.is_empty() {
+                    self.undo.push(batch);
+                    if self.undo.len() > MAX_UNDO_BATCHES {
+                        self.undo.remove(0);
+                    }
+                }
+            }
+        }
+    }
+
     fn draw_main(&mut self) {
+        self.drain_results();
+        let status = self.status.clone();
         let Some(main) = self.main.as_mut() else {
             return;
         };
@@ -65,6 +115,9 @@ impl GuiApp {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.label("ggg");
                 ui.label(&summary);
+                if let Some(status) = &status {
+                    ui.label(status);
+                }
                 ui.label("日本語の表示テスト: ダウンロード マネージャー");
             });
         });
@@ -130,7 +183,7 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                     self.repaint_at = Some(self.repaint_at.map_or(at, |old| old.min(at)));
                 }
             }
-            UserEvent::Snapshot => {
+            UserEvent::Snapshot | UserEvent::ActionDone => {
                 if let Some(main) = &self.main {
                     main.window.request_redraw();
                 }

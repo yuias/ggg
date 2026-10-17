@@ -28,6 +28,11 @@ impl Tr {
         self.0.get(key)
     }
 
+    /// Localized text for a command failure, shared with the other front ends.
+    pub fn command_error(&self, err: &ggg::ui::commands::CommandError) -> String {
+        ggg::ui::command_i18n::localize_command_error(&self.0, err)
+    }
+
     pub fn t_args(&self, key: &str, args: &FluentArgs) -> String {
         self.0.get_with_args(key, Some(args))
     }

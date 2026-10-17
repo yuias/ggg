@@ -8,4 +8,6 @@ pub enum UserEvent {
     Repaint { window: WindowId, delay: Duration },
     /// The snapshot task published a new revision.
     Snapshot,
+    /// An action finished and its result is waiting in the results channel.
+    ActionDone,
 }
