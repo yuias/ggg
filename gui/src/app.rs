@@ -128,7 +128,7 @@ impl GuiApp {
                 let _ = action_proxy.send_event(UserEvent::ActionDone);
             },
         );
-        let pipe_name = start_ipc(&rt, &core, &proxy);
+        let pipe_name = start_ipc(&rt, &proxy);
         Self {
             proxy,
             tr,
@@ -406,11 +406,11 @@ impl GuiApp {
     }
 }
 
-/// Starts the pipe server for ggg-dnd and the browser bridge and returns the
-/// pipe name it bound. Links arrive as `UserEvent::IpcText`, so nothing here
-/// blocks the event loop.
+/// Starts the pipe server for the browser bridge and returns the pipe name it
+/// bound. Links arrive as `UserEvent::IpcText`, so nothing here blocks the
+/// event loop.
 #[cfg(windows)]
-fn start_ipc(rt: &Handle, core: &Core, proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
+fn start_ipc(rt: &Handle, proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
     use ggg::ipc::pipe_server::{IpcEvent, start_pipe_server};
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
@@ -432,15 +432,13 @@ fn start_ipc(rt: &Handle, core: &Core, proxy: &EventLoopProxy<UserEvent>) -> Opt
         }
     });
 
-    // Not inside a loop callback: the config read is a one-off at start-up.
-    if rt.block_on(core.state.config.read()).general.auto_launch_dnd {
-        ggg::ipc::dnd_launch::auto_launch_ggg_dnd(&pipe_name);
-    }
+    // ggg-dnd is not launched here: it only exists because the TUI cannot
+    // take drops, and this window has its own drop target.
     Some(pipe_name)
 }
 
 #[cfg(not(windows))]
-fn start_ipc(_rt: &Handle, _core: &Core, _proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
+fn start_ipc(_rt: &Handle, _proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
     None
 }
 
