@@ -55,6 +55,13 @@ pub enum IpcRequest {
     /// Connection health check
     #[serde(rename = "ping")]
     Ping,
+
+    /// Bring the receiving GUI to the foreground and add `urls`
+    #[serde(rename = "activate")]
+    Activate {
+        #[serde(default)]
+        urls: Vec<String>,
+    },
 }
 
 /// Response sent from ggg back to a client.
@@ -77,6 +84,30 @@ pub enum IpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activate_round_trip_wire_format() {
+        let req = IpcRequest::Activate {
+            urls: vec!["http://127.0.0.1:1/a".to_string(), "http://127.0.0.1:1/b".to_string()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"activate","urls":["http://127.0.0.1:1/a","http://127.0.0.1:1/b"]}"#
+        );
+        match serde_json::from_str::<IpcRequest>(&json).unwrap() {
+            IpcRequest::Activate { urls } => assert_eq!(urls.len(), 2),
+            other => panic!("expected Activate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activate_without_urls_parses_with_empty_list() {
+        match serde_json::from_str::<IpcRequest>(r#"{"type":"activate"}"#).unwrap() {
+            IpcRequest::Activate { urls } => assert!(urls.is_empty()),
+            other => panic!("expected Activate, got {other:?}"),
+        }
+    }
 
     #[test]
     fn pipe_name_from_none_yields_default() {

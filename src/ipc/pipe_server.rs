@@ -185,6 +185,9 @@ async fn process_request(
             }
         }
         IpcRequest::Ping => IpcResponse::Pong,
+        IpcRequest::Activate { .. } => IpcResponse::Error {
+            message: "activate is not supported".to_string(),
+        },
     }
 }
 
@@ -227,5 +230,35 @@ mod tests {
         .expect("spawn_blocking task panicked");
 
         assert!(result.is_ok(), "expected same-user pipe to be trusted: {result:?}");
+    }
+
+    /// The server pid read from an open pipe is the creating process, which
+    /// here is the test process itself.
+    #[tokio::test]
+    async fn server_process_id_is_own_pid() {
+        let pipe_name = format!(r"\\.\pipe\ggg-test-{}", uuid::Uuid::new_v4());
+        let (event_tx, _event_rx) = mpsc::channel(1);
+
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .expect("create test pipe");
+
+        tokio::spawn(async move {
+            if server.connect().await.is_ok() {
+                handle_client(server, event_tx).await;
+            }
+        });
+
+        let query_name = pipe_name.clone();
+        let result = tokio::time::timeout(
+            TEST_TIMEOUT,
+            tokio::task::spawn_blocking(move || ggg_ipc::server_process_id(&query_name)),
+        )
+        .await
+        .expect("server_process_id did not complete within timeout")
+        .expect("spawn_blocking task panicked");
+
+        assert_eq!(result.expect("server pid"), std::process::id());
     }
 }

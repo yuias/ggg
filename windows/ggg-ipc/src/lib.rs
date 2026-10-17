@@ -19,4 +19,7 @@ pub use protocol::{
 };
 
 #[cfg(windows)]
-pub use client::{ping, send_request, send_url, ClientError};
+pub use client::{
+    ping, send_request, send_request_allowing_foreground, send_request_timeout, send_url,
+    server_process_id, ClientError,
+};
