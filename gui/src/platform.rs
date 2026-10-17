@@ -76,6 +76,38 @@ pub fn owned_by(attributes: WindowAttributes, _owner: isize) -> WindowAttributes
     attributes
 }
 
+/// Restores `hwnd` if minimized, then asks Windows to make it the foreground
+/// window. Returns whether the foreground was granted. winit's own focus call
+/// is avoided: it sends a synthetic Alt key press first. The grant here
+/// relies on the right the starting process gave this one
+/// (`AllowSetForegroundWindow`); without it Windows only flashes the taskbar
+/// button and this returns false.
+#[cfg(windows)]
+pub fn bring_to_front(hwnd: isize) -> bool {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow},
+    };
+    if hwnd == 0 {
+        return false;
+    }
+    let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+    // SAFETY: `hwnd` comes from a live winit window of this process. A stale
+    // handle only makes the calls fail.
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            // The return value is the previous visibility, not an error.
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd).as_bool()
+    }
+}
+
+#[cfg(not(windows))]
+pub fn bring_to_front(_hwnd: isize) -> bool {
+    false
+}
+
 /// Enables or disables mouse and keyboard input of a window. The main window is
 /// disabled while a dialog it owns is open, which is what makes the dialog
 /// modal for the OS (a click on the disabled window beeps).
@@ -91,3 +123,13 @@ pub fn set_enabled(hwnd: isize, enabled: bool) {
 
 #[cfg(not(windows))]
 pub fn set_enabled(_hwnd: isize, _enabled: bool) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bring_to_front_rejects_a_null_handle() {
+        assert!(!bring_to_front(0));
+    }
+}
