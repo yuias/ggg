@@ -23,6 +23,10 @@ pub struct OsWindow {
 pub const ADD_DIALOG_SIZE: (f64, f64) = (560.0, 440.0);
 pub const ADD_DIALOG_MIN_SIZE: (f64, f64) = (440.0, 340.0);
 
+/// Default and minimum client size of the Settings window, in logical px.
+pub const SETTINGS_SIZE: (f64, f64) = (760.0, 540.0);
+pub const SETTINGS_MIN_SIZE: (f64, f64) = (600.0, 420.0);
+
 /// Attributes for the main window. Drag and drop is disabled so winit does not
 /// register its own drop target, which would conflict with the OLE one the
 /// GUI installs itself.

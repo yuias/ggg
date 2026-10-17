@@ -14,20 +14,24 @@ use crate::{
     platform,
     registration::{Plan, Resolved, Source, plan, resolve_urls},
     render::SharedRender,
+    settings::{
+        model::SettingsModel,
+        view::{self as settings_view, SettingsOutcome, SettingsWindow},
+    },
     ui::{
         add_dialog::{self, AddDialog, AddDialogModel, AddOutcome},
         main_view::{MainView, ViewEnv, ViewOutput},
     },
     window::{
-        ADD_DIALOG_MIN_SIZE, ADD_DIALOG_SIZE, OsWindow, PxRect, centered_on, dialog_attributes,
-        dialog_size, main_window_attributes, overlaps_any,
+        ADD_DIALOG_MIN_SIZE, ADD_DIALOG_SIZE, OsWindow, PxRect, SETTINGS_MIN_SIZE, SETTINGS_SIZE,
+        centered_on, dialog_attributes, dialog_size, main_window_attributes, overlaps_any,
     },
 };
 use ggg::{
     app::bootstrap::Core,
     download::task::DownloadTask,
     ui::queue_ops::{MAX_UNDO_BATCHES, open_in_file_manager},
-    util::url_input::MAX_URLS_PER_REGISTRATION,
+    util::{script_files::scan_script_files, url_input::MAX_URLS_PER_REGISTRATION},
 };
 use fluent_bundle::FluentArgs;
 use std::{collections::HashMap, path::PathBuf, time::Instant};
@@ -44,6 +48,7 @@ use winit::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModalKind {
     AddDownloads,
+    Settings,
 }
 
 /// The OS-modal window that is open now. The main window is disabled until it
@@ -58,6 +63,8 @@ struct OpenModal {
 /// A window a command asked for; created from the event loop callback.
 enum OpenRequest {
     AddDownloads { prefill: String, expand_checked: bool },
+    /// `folder`: open on the Folders page with this folder selected.
+    Settings { folder: Option<String> },
 }
 
 pub struct GuiApp {
@@ -93,6 +100,8 @@ pub struct GuiApp {
     open_request: Option<OpenRequest>,
     /// Input of the open Add Downloads window; set exactly while it is open.
     add_dialog: Option<AddDialog>,
+    /// State of the open Settings window; set exactly while it is open.
+    settings: Option<SettingsWindow>,
     shared: SharedRender,
     /// Where `gui_config` is written when a dialog closes; `None` disables it.
     gui_config_path: Option<PathBuf>,
@@ -149,6 +158,7 @@ impl GuiApp {
             modal: None,
             open_request: None,
             add_dialog: None,
+            settings: None,
             shared: SharedRender::new(),
             gui_config_path: None,
             menu: None,
@@ -188,7 +198,17 @@ impl GuiApp {
                     text.push_str(&note);
                 }
             }
+            let close_settings = self.settings_result(&result);
+            // The window may close right after OK, taking its own notice with
+            // it, so the main window has to say that a restart is needed.
+            let restart_needed = self.settings.as_ref().is_some_and(|s| s.model.restart_needed);
+            if matches!(result, ActionResult::Settings { error: None, .. }) && restart_needed {
+                text = self.tr.t("gui-status-settings-applied-restart");
+            }
             self.status = Some(text);
+            if close_settings {
+                self.close_settings();
+            }
             if let ActionResult::Deleted { batch, .. } = result {
                 if !batch.is_empty() {
                     self.undo.push(batch);
@@ -197,6 +217,32 @@ impl GuiApp {
                     }
                 }
             }
+        }
+    }
+
+    /// Gives a finished action to the open Settings window, which started
+    /// some of them. Returns true when the window should close.
+    fn settings_result(&mut self, result: &ActionResult) -> bool {
+        let Some(settings) = self.settings.as_mut() else {
+            return false;
+        };
+        let close = settings.on_action_result(&self.tr, result);
+        if let Some(window) = self.settings_window_id().and_then(|id| self.windows.get(&id)) {
+            window.window.request_redraw();
+        }
+        close
+    }
+
+    fn settings_window_id(&self) -> Option<WindowId> {
+        self.modal
+            .as_ref()
+            .filter(|m| m.kind == ModalKind::Settings)
+            .map(|m| m.id)
+    }
+
+    fn close_settings(&mut self) {
+        if let Some(id) = self.settings_window_id() {
+            self.close_modal(id);
         }
     }
 
@@ -385,10 +431,10 @@ impl GuiApp {
             GuiCommand::PasteUrlsDirect => {
                 self.register_clipboard(Source::MenuPaste { shift: true });
             }
-            // The windows behind these do not exist yet.
-            GuiCommand::OpenSettings
-            | GuiCommand::FolderSettings => {
-                tracing::debug!("command {cmd:?} is not available yet");
+            GuiCommand::OpenSettings => self.open_settings(None),
+            GuiCommand::FolderSettings => {
+                let folder = self.view.tree_folder().map(str::to_string);
+                self.open_settings(folder);
             }
             // `route` handled these inside the view.
             GuiCommand::SelectAll
@@ -475,6 +521,32 @@ impl GuiApp {
         self.open_request = Some(OpenRequest::AddDownloads { prefill, expand_checked });
     }
 
+    /// Asks for the Settings window, on the Folders page when `folder` is set.
+    /// Does nothing while another OS-modal window is open.
+    pub fn open_settings(&mut self, folder: Option<String>) {
+        if self.modal.is_some() {
+            return;
+        }
+        self.open_request = Some(OpenRequest::Settings { folder });
+    }
+
+    fn open_settings_window(&mut self, event_loop: &ActiveEventLoop, folder: Option<String>) {
+        if self.modal.is_some() {
+            return;
+        }
+        let snapshot = self.snapshot.rx.borrow().clone();
+        let mut model = SettingsModel::new(&snapshot.config, &self.gui_config);
+        if let Some(folder) = folder {
+            model.open_folder(&folder);
+        }
+        let script_files = scan_script_files(&model.original.scripts.directory);
+        self.settings = Some(SettingsWindow::new(model, script_files));
+        self.open_modal(event_loop, ModalKind::Settings);
+        if self.modal.is_none() {
+            self.settings = None;
+        }
+    }
+
     fn open_add_downloads(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -511,6 +583,12 @@ impl GuiApp {
                 ADD_DIALOG_SIZE,
                 ADD_DIALOG_MIN_SIZE,
                 self.gui_config.add_dialog,
+            ),
+            ModalKind::Settings => (
+                self.tr.t("gui-settings-title"),
+                SETTINGS_SIZE,
+                SETTINGS_MIN_SIZE,
+                self.gui_config.settings_window,
             ),
         };
         let min = LogicalSize::new(min_size.0, min_size.1);
@@ -593,6 +671,9 @@ impl GuiApp {
                 ModalKind::AddDownloads => {
                     self.gui_config.add_dialog = geometry.or(self.gui_config.add_dialog);
                 }
+                ModalKind::Settings => {
+                    self.gui_config.settings_window = geometry.or(self.gui_config.settings_window);
+                }
             }
         }
         if let Some(owner) = modal.owner {
@@ -601,6 +682,7 @@ impl GuiApp {
         // Dropping the whole window releases the last handle to the native one.
         self.windows.remove(&id);
         self.add_dialog = None;
+        self.settings = None;
         tracing::info!("closed {:?} window; main window enabled again", modal.kind);
         if let Some(main) = self.main_window() {
             main.window.focus_window();
@@ -619,9 +701,35 @@ impl GuiApp {
     }
 
     fn draw_dialog(&mut self, id: WindowId) {
-        if !self.modal.as_ref().is_some_and(|m| m.id == id) {
-            return;
+        match self.modal.as_ref().filter(|m| m.id == id).map(|m| m.kind) {
+            Some(ModalKind::AddDownloads) => self.draw_add_dialog(id),
+            Some(ModalKind::Settings) => self.draw_settings(id),
+            None => {}
         }
+    }
+
+    fn draw_settings(&mut self, id: WindowId) {
+        // Results that arrived while the window was not repainting.
+        self.drain_results();
+        let Self { windows, settings, tr, .. } = self;
+        let (Some(window), Some(state)) = (windows.get_mut(&id), settings.as_mut()) else {
+            return;
+        };
+        let mut outcome = SettingsOutcome::default();
+        window.redraw(|ui| outcome = settings_view::show(ui, tr, state));
+        if let Some(expand) = outcome.expand_ranges {
+            self.gui_config.expand_ranges_on_direct_add = expand;
+            self.save_gui_config();
+        }
+        for action in outcome.actions {
+            self.dispatch(action);
+        }
+        if outcome.close {
+            self.close_modal(id);
+        }
+    }
+
+    fn draw_add_dialog(&mut self, id: WindowId) {
         // Read once per frame; the borrow must not outlive this statement.
         let snapshot = self.snapshot.rx.borrow().clone();
         let Self {
@@ -651,6 +759,7 @@ impl GuiApp {
             Some(OpenRequest::AddDownloads { prefill, expand_checked }) => {
                 self.open_add_downloads(event_loop, prefill, expand_checked);
             }
+            Some(OpenRequest::Settings { folder }) => self.open_settings_window(event_loop, folder),
             None => {}
         }
         if self.exit_requested {
@@ -800,10 +909,16 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                     self.repaint_at = Some(self.repaint_at.map_or(at, |old| old.min(at)));
                 }
             }
-            UserEvent::Snapshot | UserEvent::ActionDone => {
+            UserEvent::Snapshot => {
                 if let Some(main) = self.main_window() {
                     main.window.request_redraw();
                 }
+            }
+            UserEvent::ActionDone => {
+                // The Settings window waits on its results while the disabled
+                // main window may not repaint, so results are taken here.
+                self.drain_results();
+                self.request_redraw_all();
             }
             UserEvent::Drop(payload) => {
                 tracing::info!(

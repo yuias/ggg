@@ -119,9 +119,12 @@ pub enum ActionResult {
         error: Option<(usize, CommandError)>,
         config: Arc<Config>,
     },
+    /// `config` is read back after the command, so a window that shows the
+    /// configuration does not have to wait for the next snapshot.
     Command {
         action: ActionKind,
         result: Result<serde_json::Value, CommandError>,
+        config: Arc<Config>,
     },
 }
 
@@ -308,7 +311,8 @@ async fn command_result(
         CommandResponse::Success { data } => Ok(data),
         CommandResponse::Error(e) => Err(e),
     };
-    ActionResult::Command { action, result }
+    let config = Arc::new(state.config.read().await.clone());
+    ActionResult::Command { action, result, config }
 }
 
 /// Status-bar text for a finished action.
@@ -358,7 +362,7 @@ pub fn status_text(tr: &Tr, result: &ActionResult) -> String {
         ActionResult::Settings { error: Some((_, e)), .. } => {
             error_text(tr, "gui-status-settings-failed", e)
         }
-        ActionResult::Command { action, result: Ok(_) } => tr.t(match action {
+        ActionResult::Command { action, result: Ok(_), .. } => tr.t(match action {
             ActionKind::CreateFolder => "gui-status-folder-created",
             ActionKind::DeleteFolder => "gui-status-folder-deleted",
             ActionKind::ReloadScripts => "gui-status-scripts-reloaded",

@@ -1,5 +1,5 @@
-//! Settings window: the pure editing model, independent of any window.
+//! Settings window: the pure editing model and the view drawn into the
+//! window's own OS window.
 
-// The window that drives the model is added separately.
-#[allow(dead_code)]
 pub mod model;
+pub mod view;

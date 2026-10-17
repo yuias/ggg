@@ -103,6 +103,8 @@ impl SettingsModel {
     }
 
     /// Fields that differ between `original` and `draft` and need a restart.
+    // The pages mark every restart field instead; kept for the model tests.
+    #[allow(dead_code)]
     pub fn changed_restart_fields(&self) -> Vec<ApplicationSettingsField> {
         restart_fields_differing(&self.original, &self.draft)
     }
@@ -211,6 +213,8 @@ fn field_differs(field: ApplicationSettingsField, a: &Config, b: &Config) -> boo
     }
 }
 
+// The pages use drag values, so these text parsers are only exercised by tests.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumberError {
     Empty,
@@ -222,6 +226,7 @@ pub enum NumberError {
 }
 
 /// A count that must be at least 1: concurrency limits.
+#[allow(dead_code)]
 pub fn parse_positive(text: &str) -> Result<usize, NumberError> {
     match parse_count::<usize>(text)? {
         0 => Err(NumberError::Zero),
@@ -230,6 +235,7 @@ pub fn parse_positive(text: &str) -> Result<usize, NumberError> {
 }
 
 /// An optional limit: empty text means "no limit" (`None`).
+#[allow(dead_code)]
 pub fn parse_optional_positive(text: &str) -> Result<Option<usize>, NumberError> {
     match parse_positive(text) {
         Ok(n) => Ok(Some(n)),
@@ -239,10 +245,12 @@ pub fn parse_optional_positive(text: &str) -> Result<Option<usize>, NumberError>
 }
 
 /// A count where 0 is meaningful: retries and redirects.
+#[allow(dead_code)]
 pub fn parse_zero_ok(text: &str) -> Result<u32, NumberError> {
     parse_count(text)
 }
 
+#[allow(dead_code)]
 fn parse_count<T: std::str::FromStr>(text: &str) -> Result<T, NumberError> {
     let text = text.trim();
     if text.is_empty() {
