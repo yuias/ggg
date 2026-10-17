@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "ggg"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2051,7 +2051,7 @@ dependencies = [
 
 [[package]]
 name = "ggg-gui"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arboard",
