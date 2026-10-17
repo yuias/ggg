@@ -1,10 +1,12 @@
-//! Pure model for the item editor dialog (Save path + Referrer). Kept free of
+//! Pure model for the item editor dialog (Save path + Referrer, and the file
+//! name for front ends that offer it). Kept free of
 //! front-end state so it can be unit-tested without a UI harness and shared by
 //! every front end.
 
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use crate::download::manager::SetFilenameError;
 use crate::download::task::DownloadTask;
 use crate::ipc::control::protocol::HeaderEdit;
 
@@ -56,6 +58,11 @@ pub struct ItemEditorState {
     pub focus: ItemEditorField,
     pub save_path: TextField,
     pub referrer: TextField,
+    /// Current file name. Only edits made while `filename_editable` count.
+    pub filename: TextField,
+    /// True for a single target whose download has never started; the name is
+    /// locked afterwards (the core re-checks on apply).
+    pub filename_editable: bool,
     /// Non-Referer headers of the focused task, name-sorted, values already masked.
     pub other_headers: Vec<(String, String)>,
 }
@@ -65,10 +72,12 @@ impl ItemEditorState {
     pub fn from_task(task: &DownloadTask, targets: Vec<Uuid>) -> Self {
         let referrer = find_header(task, "Referer").unwrap_or("");
         Self {
-            targets,
             focus: ItemEditorField::Referrer,
             save_path: TextField::new(task.save_path.to_string_lossy().into_owned()),
             referrer: TextField::new(referrer),
+            filename: TextField::new(task.filename.clone()),
+            filename_editable: targets.len() == 1 && task.never_started(),
+            targets,
             other_headers: masked_headers(task),
         }
     }
@@ -108,14 +117,27 @@ impl ItemEditorState {
         }
     }
 
-    /// Err(message id) when the referrer contains control characters (CR/LF etc.),
-    /// which would fail in `HttpClient::build_headers` at download time.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if is_valid_referrer(&self.referrer.value) {
-            Ok(())
+    /// The new file name (trimmed) when the field is editable and was changed.
+    /// Validity is checked by `validate`; the core checks it again.
+    pub fn new_filename(&self) -> Option<String> {
+        if self.filename_editable && self.filename.is_changed() {
+            Some(self.filename.value.trim().to_string())
         } else {
-            Err("dialog-item-edit-invalid-referrer")
+            None
         }
+    }
+
+    /// Err(message id) when the referrer contains control characters (CR/LF etc.),
+    /// which would fail in `HttpClient::build_headers` at download time, or when
+    /// a changed file name is not a valid bare file name.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !is_valid_referrer(&self.referrer.value) {
+            return Err("dialog-item-edit-invalid-referrer");
+        }
+        if self.new_filename().is_some_and(|name| !is_valid_filename(&name)) {
+            return Err("gui-edit-filename-invalid");
+        }
+        Ok(())
     }
 }
 
@@ -146,6 +168,13 @@ pub fn is_valid_referrer(value: &str) -> bool {
     !value.chars().any(|c| c.is_control())
 }
 
+/// File name check shared with the add dialog: non-empty and unchanged by
+/// `sanitize_filename`, so it cannot leave the save directory or hit a
+/// reserved name.
+pub fn is_valid_filename(name: &str) -> bool {
+    !name.is_empty() && crate::file::naming::sanitize_filename(name) == name
+}
+
 /// Sets `Referer` on a newly built task when `referrer` (trimmed) is non-empty; no-op otherwise.
 pub fn apply_add_referrer(task: &mut DownloadTask, referrer: &str) {
     let trimmed = referrer.trim();
@@ -163,9 +192,10 @@ pub struct ItemEditReport {
     pub failed: usize,
 }
 
-/// Applies `header_edit`/`new_save_path` to every target, mirroring the CLI `modify` path
-/// (`edit_task_headers` + `apply_header_edit`) for the referrer and `change_save_path` for
-/// the path. A busy or not-found referrer edit skips the path for that target, since the
+/// Applies `header_edit`/`new_save_path`/`new_filename` to every target, mirroring the CLI
+/// `modify` path (`edit_task_headers` + `apply_header_edit`) for the referrer and
+/// `change_save_path` for the path. `new_filename` goes through `set_user_filename`, which
+/// refuses a task that has started; that counts as `failed`. A busy or not-found referrer edit skips the path for that target, since the
 /// task either does not exist or is about to overwrite this edit on its own. Does not
 /// persist; the caller runs `save_queue()` when `changed > 0`.
 pub async fn apply_item_edit(
@@ -173,6 +203,7 @@ pub async fn apply_item_edit(
     targets: &[Uuid],
     header_edit: Option<&HeaderEdit>,
     new_save_path: Option<&std::path::Path>,
+    new_filename: Option<&str>,
 ) -> ItemEditReport {
     let mut report = ItemEditReport::default();
     for &id in targets {
@@ -198,6 +229,16 @@ pub async fn apply_item_edit(
                 Ok(()) => applied = true,
                 Err(crate::download::manager::ChangeSavePathError::Busy(_)) => report.busy += 1,
                 Err(_) => report.failed += 1,
+            }
+        }
+        if let Some(name) = new_filename {
+            match manager.set_user_filename(id, name).await {
+                Ok(()) => applied = true,
+                Err(SetFilenameError::Busy(_)) => report.busy += 1,
+                Err(SetFilenameError::NotFound) => report.not_found += 1,
+                Err(SetFilenameError::AlreadyStarted | SetFilenameError::InvalidName) => {
+                    report.failed += 1;
+                }
             }
         }
         if applied {
@@ -336,7 +377,7 @@ mod tests {
         let (manager, id) = manager_with_task(&[]).await;
         let original_path = manager.get_by_id(id).await.expect("task queued").save_path;
         let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
-        let report = apply_item_edit(&manager, &[id], Some(&edit), None).await;
+        let report = apply_item_edit(&manager, &[id], Some(&edit), None, None).await;
         assert_eq!(report, ItemEditReport { changed: 1, ..Default::default() });
         let task = manager.get_by_id(id).await.expect("task still queued");
         assert_eq!(find_header(&task, "Referer"), Some("https://a.example/"));
@@ -347,7 +388,7 @@ mod tests {
     async fn apply_clears_referrer() {
         let (manager, id) = manager_with_task(&[("Referer", "https://a.example/")]).await;
         let edit = HeaderEdit { clear_referrer: true, ..Default::default() };
-        let report = apply_item_edit(&manager, &[id], Some(&edit), None).await;
+        let report = apply_item_edit(&manager, &[id], Some(&edit), None, None).await;
         assert_eq!(report, ItemEditReport { changed: 1, ..Default::default() });
         let task = manager.get_by_id(id).await.expect("task still queued");
         assert_eq!(find_header(&task, "Referer"), None);
@@ -357,7 +398,7 @@ mod tests {
     async fn apply_changes_save_path_only_when_given() {
         let (manager, id) = manager_with_task(&[]).await;
         let new_path = PathBuf::from("/tmp/new-name");
-        let report = apply_item_edit(&manager, &[id], None, Some(&new_path)).await;
+        let report = apply_item_edit(&manager, &[id], None, Some(&new_path), None).await;
         assert_eq!(report, ItemEditReport { changed: 1, ..Default::default() });
         let task = manager.get_by_id(id).await.expect("task still queued");
         assert_eq!(task.save_path, new_path);
@@ -369,7 +410,7 @@ mod tests {
         let (manager, id) = manager_with_task(&[]).await;
         let new_path = PathBuf::from("/tmp/new-name");
         let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
-        let report = apply_item_edit(&manager, &[id], Some(&edit), Some(&new_path)).await;
+        let report = apply_item_edit(&manager, &[id], Some(&edit), Some(&new_path), None).await;
         assert_eq!(
             report,
             ItemEditReport { changed: 1, ..Default::default() },
@@ -388,7 +429,7 @@ mod tests {
 
         let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
         let new_path = PathBuf::from("/tmp/new-name");
-        let report = apply_item_edit(&manager, &[id], Some(&edit), Some(&new_path)).await;
+        let report = apply_item_edit(&manager, &[id], Some(&edit), Some(&new_path), None).await;
         assert_eq!(report, ItemEditReport { busy: 1, ..Default::default() });
 
         let task = manager.get_by_id(id).await.expect("task still queued");
@@ -408,7 +449,7 @@ mod tests {
         manager.insert_active_handle_for_test(id, handle).await;
 
         let new_path = PathBuf::from("/tmp/new-name");
-        let report = apply_item_edit(&manager, &[id], None, Some(&new_path)).await;
+        let report = apply_item_edit(&manager, &[id], None, Some(&new_path), None).await;
         assert_eq!(
             report,
             ItemEditReport { busy: 1, ..Default::default() },
@@ -426,7 +467,7 @@ mod tests {
         let manager = DownloadManager::new();
         let unknown = Uuid::new_v4();
         let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
-        let report = apply_item_edit(&manager, &[unknown], Some(&edit), None).await;
+        let report = apply_item_edit(&manager, &[unknown], Some(&edit), None, None).await;
         assert_eq!(report, ItemEditReport { not_found: 1, ..Default::default() });
     }
 
@@ -439,7 +480,126 @@ mod tests {
         let unknown = Uuid::new_v4();
 
         let edit = HeaderEdit { referrer: Some("https://a.example/".to_string()), ..Default::default() };
-        let report = apply_item_edit(&manager, &[ok_id, unknown], Some(&edit), None).await;
+        let report = apply_item_edit(&manager, &[ok_id, unknown], Some(&edit), None, None).await;
         assert_eq!(report, ItemEditReport { changed: 1, not_found: 1, ..Default::default() });
+    }
+
+    /// File-name edits go through the manager's claim and queue lock; none of
+    /// these tests save the queue or touch the config.
+    mod user_filename_edit {
+        use super::*;
+        use crate::download::manager::SetFilenameError;
+        use crate::download::task::DownloadStatus;
+
+        #[tokio::test]
+        async fn edit_sets_user_filename_on_unstarted_task() {
+            let (manager, id) = manager_with_task(&[]).await;
+            let report = apply_item_edit(&manager, &[id], None, None, Some("mine.bin")).await;
+            assert_eq!(report, ItemEditReport { changed: 1, ..Default::default() });
+            let task = manager.get_by_id(id).await.expect("task still queued");
+            assert_eq!(task.filename, "mine.bin");
+            assert_eq!(task.user_filename.as_deref(), Some("mine.bin"));
+        }
+
+        #[tokio::test]
+        async fn edit_rejected_after_download_started() {
+            // Every state a started download can be in, including ones with
+            // no live handle (the check must not depend on the handle).
+            let cases: [(&str, fn(&mut DownloadTask)); 5] = [
+                ("downloading", |t| t.status = DownloadStatus::Downloading),
+                ("paused with bytes", |t| {
+                    t.status = DownloadStatus::Paused;
+                    t.downloaded = 10;
+                }),
+                ("pending but bytes on disk", |t| t.downloaded = 10),
+                ("pending but name settled", |t| t.filename_settled = true),
+                ("error", |t| t.status = DownloadStatus::Error),
+            ];
+            for (label, started) in cases {
+                let manager = DownloadManager::new();
+                let mut task = task_with_headers(&[]);
+                started(&mut task);
+                let id = task.id;
+                let original = task.filename.clone();
+                manager.add_download(task).await;
+
+                let report = apply_item_edit(&manager, &[id], None, None, Some("mine.bin")).await;
+                assert_eq!(report, ItemEditReport { failed: 1, ..Default::default() }, "{label}");
+                let task = manager.get_by_id(id).await.expect("task still queued");
+                assert_eq!(task.filename, original, "{label}");
+                assert_eq!(task.user_filename, None, "{label}");
+            }
+        }
+
+        #[tokio::test]
+        async fn edit_rejected_while_claim_or_handle_is_held() {
+            let (manager, id) = manager_with_task(&[]).await;
+            {
+                let _claim = manager.hold_claim_for_test(id);
+                assert_eq!(
+                    manager.set_user_filename(id, "mine.bin").await,
+                    Err(SetFilenameError::Busy(id))
+                );
+            }
+            let handle = tokio::spawn(std::future::pending::<()>());
+            manager.insert_active_handle_for_test(id, handle).await;
+            assert_eq!(
+                manager.set_user_filename(id, "mine.bin").await,
+                Err(SetFilenameError::Busy(id))
+            );
+            manager.abort_active_handle_for_test(id).await;
+            let task = manager.get_by_id(id).await.expect("task still queued");
+            assert_eq!(task.user_filename, None);
+        }
+
+        #[tokio::test]
+        async fn edit_rejects_unknown_id_and_invalid_names() {
+            let (manager, id) = manager_with_task(&[]).await;
+            assert_eq!(
+                manager.set_user_filename(Uuid::new_v4(), "mine.bin").await,
+                Err(SetFilenameError::NotFound)
+            );
+            for bad in ["", "a/b.bin", "..\\x", "trailing.", "NUL"] {
+                assert_eq!(
+                    manager.set_user_filename(id, bad).await,
+                    Err(SetFilenameError::InvalidName),
+                    "{bad:?}"
+                );
+            }
+            let task = manager.get_by_id(id).await.expect("task still queued");
+            assert_eq!(task.user_filename, None);
+        }
+
+        #[test]
+        fn model_offers_the_field_only_for_one_unstarted_target() {
+            let task = task_with_headers(&[]);
+            assert!(ItemEditorState::from_task(&task, vec![task.id]).filename_editable);
+            let two = vec![task.id, Uuid::new_v4()];
+            assert!(!ItemEditorState::from_task(&task, two).filename_editable);
+
+            let mut started = task_with_headers(&[]);
+            started.downloaded = 1;
+            let mut state = ItemEditorState::from_task(&started, vec![started.id]);
+            assert!(!state.filename_editable);
+            state.filename.value = "other.bin".to_string();
+            assert_eq!(state.new_filename(), None, "a locked field never produces an edit");
+        }
+
+        #[test]
+        fn model_validates_a_changed_name_only() {
+            let task = task_with_headers(&[]);
+            let mut state = ItemEditorState::from_task(&task, vec![task.id]);
+            assert_eq!(state.new_filename(), None);
+            assert_eq!(state.validate(), Ok(()));
+
+            state.filename.value = "  mine.bin ".to_string();
+            assert_eq!(state.new_filename().as_deref(), Some("mine.bin"));
+            assert_eq!(state.validate(), Ok(()));
+
+            for bad in ["", "   ", "a/b", "bad."] {
+                state.filename.value = bad.to_string();
+                assert_eq!(state.validate(), Err("gui-edit-filename-invalid"), "{bad:?}");
+            }
+        }
     }
 }

@@ -209,6 +209,13 @@ impl DownloadTask {
         self.user_filename = Some(safe_name);
     }
 
+    /// True while no attempt has written or settled a name for this task: it
+    /// is still pending, nothing is on disk and `filename` was never deduped.
+    /// A user-chosen name may only be changed in this state.
+    pub fn never_started(&self) -> bool {
+        self.status == DownloadStatus::Pending && self.downloaded == 0 && !self.filename_settled
+    }
+
     /// Add an info log entry
     pub fn log_info(&mut self, message: String) {
         self.logs.push(LogEntry::info(message));

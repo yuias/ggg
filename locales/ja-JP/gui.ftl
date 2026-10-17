@@ -63,6 +63,11 @@ gui-confirm-title = 削除の確認
 gui-confirm-delete-folder = 「{ $name }」の { $count } 件のダウンロードをすべて削除しますか？
 gui-confirm-clear-history = 履歴の { $count } 件をすべて削除しますか？
 
+# Edit item dialog
+gui-edit-filename = ファイル名
+gui-edit-filename-locked = ダウンロードを開始した後はファイル名を変更できません
+gui-edit-filename-invalid = 有効なファイル名を入力してください（\ / : * ? " < > | は使用不可、末尾のドットと空白も不可）
+
 # Move to folder dialog
 gui-move-title = フォルダーへ移動
 gui-move-current = (現在)

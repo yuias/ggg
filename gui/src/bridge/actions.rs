@@ -40,6 +40,8 @@ pub enum Action {
         targets: Vec<Uuid>,
         header_edit: Option<HeaderEdit>,
         new_save_path: Option<PathBuf>,
+        /// Only ever set for a single target that has not started.
+        new_filename: Option<String>,
     },
     Add(AddRequest),
     StartFolder(String),
@@ -225,10 +227,18 @@ async fn run(action: Action, manager: &DownloadManager, state: &AppState) -> Act
             }
             ActionResult::Report { action: kind, report }
         }
-        Action::EditItems { targets, header_edit, new_save_path } => ActionResult::Edited(
-            apply_item_edit(manager, &targets, header_edit.as_ref(), new_save_path.as_deref())
+        Action::EditItems { targets, header_edit, new_save_path, new_filename } => {
+            ActionResult::Edited(
+                apply_item_edit(
+                    manager,
+                    &targets,
+                    header_edit.as_ref(),
+                    new_save_path.as_deref(),
+                    new_filename.as_deref(),
+                )
                 .await,
-        ),
+            )
+        }
         Action::Add(request) => ActionResult::Added(queue_ops::add_urls(manager, state, request).await),
         Action::StartFolder(folder_id) => {
             let affected = manager

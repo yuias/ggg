@@ -120,6 +120,11 @@ gui-confirm-clear-history = { $count ->
    *[other] Remove all { $count } entries from the history?
 }
 
+# Edit item dialog
+gui-edit-filename = File name
+gui-edit-filename-locked = The file name is locked once the download has started
+gui-edit-filename-invalid = Enter a valid file name (no \ / : * ? " < > |, no trailing dot or space)
+
 # Move to folder dialog
 gui-move-title = Move to Folder
 gui-move-current = (current)

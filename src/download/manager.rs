@@ -98,6 +98,22 @@ pub enum ChangeSavePathError {
     InvalidStatus,
 }
 
+/// Failure modes for [`DownloadManager::set_user_filename`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SetFilenameError {
+    #[error("Download not found")]
+    NotFound,
+    /// Another operation holds the start claim or a live handle exists.
+    #[error("download {0} is busy; pause the download first")]
+    Busy(Uuid),
+    /// The download has already started, so a name may be on disk.
+    #[error("the file name cannot be changed once the download has started")]
+    AlreadyStarted,
+    /// Empty, or not a bare file name (`sanitize_filename` would change it).
+    #[error("invalid file name")]
+    InvalidName,
+}
+
 /// One running (or finished but not yet released) download.
 struct ActiveEntry {
     handle: JoinHandle<()>,
@@ -1847,6 +1863,53 @@ impl DownloadManager {
                 .ok_or(ChangeSavePathError::NotFound);
         }
         Err(ChangeSavePathError::NotFound)
+    }
+
+    /// Sets the user-chosen file name of a task that has never started.
+    ///
+    /// Same claim + in-flight check as `change_save_path`. The never-started
+    /// test runs again inside `FolderQueue::modify`, under the queue write
+    /// lock: a caller's earlier read (a dialog opened on a stale snapshot) says
+    /// nothing about a start that happened since, and renaming a task whose
+    /// file is already being written would orphan the partial file.
+    pub async fn set_user_filename(&self, id: Uuid, name: &str) -> Result<(), SetFilenameError> {
+        if name.is_empty() || crate::file::naming::sanitize_filename(name) != name {
+            return Err(SetFilenameError::InvalidName);
+        }
+        let Some(_claim) = StartClaim::try_acquire(&self.start_claims, id) else {
+            return Err(SetFilenameError::Busy(id));
+        };
+        if self.is_running(id).await {
+            return Err(SetFilenameError::Busy(id));
+        }
+
+        let queues: Vec<FolderQueue> = {
+            let guard = self.folder_queues.read().await;
+            guard.values().cloned().collect()
+        };
+        for queue in &queues {
+            if queue.get_by_id(id).await.is_none() {
+                continue;
+            }
+            let mut started = false;
+            let modified = queue
+                .modify(id, |task| {
+                    if task.never_started() {
+                        task.set_user_filename(name.to_string());
+                    } else {
+                        started = true;
+                    }
+                })
+                .await;
+            return match modified {
+                Some(_) if !started => Ok(()),
+                Some(_) => Err(SetFilenameError::AlreadyStarted),
+                // `modify` refuses a Downloading task; None for a vanished one.
+                None if queue.get_by_id(id).await.is_some() => Err(SetFilenameError::AlreadyStarted),
+                None => Err(SetFilenameError::NotFound),
+            };
+        }
+        Err(SetFilenameError::NotFound)
     }
 
     /// Resume all paused and error downloads

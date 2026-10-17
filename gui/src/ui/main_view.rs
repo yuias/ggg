@@ -1228,23 +1228,109 @@ mod tests {
         let fields: Vec<_> = harness
             .get_all_by_role(egui::accesskit::Role::TextInput)
             .collect();
-        assert_eq!(fields.len(), 2);
-        assert!(fields[1].is_focused());
-        fields[1].type_text("https://ref.example/");
+        assert_eq!(fields.len(), 3);
+        assert!(fields[2].is_focused());
+        fields[2].type_text("https://ref.example/");
         harness.run();
         harness.get_by_label("OK").click();
         harness.run();
 
         let actions = rig.actions.borrow();
         match actions.as_slice() {
-            [Action::EditItems { targets, header_edit, new_save_path }] => {
+            [Action::EditItems { targets, header_edit, new_save_path, new_filename }] => {
                 assert_eq!(targets, &vec![alpha]);
                 let referrer = header_edit.as_ref().and_then(|edit| edit.referrer.as_deref());
                 assert_eq!(referrer, Some("https://ref.example/"));
                 assert!(new_save_path.is_none());
+                assert!(new_filename.is_none());
             }
             _ => panic!("expected one edit action, got {} actions", actions.len()),
         }
+    }
+
+    /// The second text field of the Edit item dialog is the file name.
+    fn replace_name_field(harness: &mut Harness<'_, ()>, text: &str) {
+        let field = harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .nth(1)
+            .expect("file name field");
+        field.click();
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run();
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .nth(1)
+            .expect("file name field")
+            .type_text(text);
+        harness.run();
+    }
+
+    #[test]
+    fn edit_item_dialog_sends_the_new_filename() {
+        let snapshot = sample_snapshot();
+        let alpha = id_of(&snapshot, "f1", 0);
+        let (mut harness, rig) = rig(snapshot);
+        harness.run();
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Edit...").click();
+        harness.run();
+
+        replace_name_field(&mut harness, "renamed.bin");
+        harness.get_by_label("OK").click();
+        harness.run();
+
+        let actions = rig.actions.borrow();
+        match actions.as_slice() {
+            [Action::EditItems { targets, header_edit, new_save_path, new_filename }] => {
+                assert_eq!(targets, &vec![alpha]);
+                assert!(header_edit.is_none() && new_save_path.is_none());
+                assert_eq!(new_filename.as_deref(), Some("renamed.bin"));
+            }
+            _ => panic!("expected one edit action, got {} actions", actions.len()),
+        }
+    }
+
+    #[test]
+    fn edit_item_dialog_rejects_an_invalid_filename() {
+        let (mut harness, rig) = rig(sample_snapshot());
+        harness.run();
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Edit...").click();
+        harness.run();
+
+        replace_name_field(&mut harness, "/x");
+        harness.get_by_label("OK").click();
+        harness.run();
+
+        assert!(rig.actions.borrow().is_empty());
+        harness.get_by_label_contains("Enter a valid file name");
+        harness.get_by_label("Edit item");
+    }
+
+    #[test]
+    fn edit_item_dialog_locks_the_filename_of_a_started_task() {
+        let mut snapshot = sample_snapshot();
+        let started = snapshot.folder_downloads.get_mut("f1").unwrap();
+        started[0].status = DownloadStatus::Paused;
+        started[0].downloaded = 5;
+        let (mut harness, rig) = rig(snapshot);
+        harness.run();
+        harness.get_by_label("alpha.iso").click_secondary();
+        harness.run();
+        harness.get_by_label("Edit...").click();
+        harness.run();
+
+        let fields: Vec<_> = harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .collect();
+        assert_eq!(fields.len(), 3);
+        assert!(egui_kittest::kittest::NodeT::accesskit_node(&fields[1]).is_disabled(), "the name field must be read-only");
+        harness.get_by_label("OK").click();
+        harness.run();
+        assert!(rig.actions.borrow().is_empty());
     }
 
     #[test]

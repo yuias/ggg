@@ -303,6 +303,33 @@ fn edit_dialog(ctx: &egui::Context, tr: &Tr, edit: &mut EditModal) -> Outcome {
                 submit |= entered(ui, &response);
                 ui.end_row();
 
+                // A multi-selection has no single name to show or edit.
+                if edit.state.targets.len() == 1 {
+                    let label = ui.label(tr.t("gui-edit-filename"));
+                    if edit.state.filename_editable {
+                        let response = ui.add(
+                            TextEdit::singleline(&mut edit.state.filename.value)
+                                .id_salt("edit_item_filename")
+                                .desired_width(f32::INFINITY),
+                        )
+                        .labelled_by(label.id);
+                        submit |= entered(ui, &response);
+                    } else {
+                        // Shown from a copy so the stored value stays the
+                        // current name.
+                        let mut shown = edit.state.filename.value.clone();
+                        ui.add_enabled(
+                            false,
+                            TextEdit::singleline(&mut shown)
+                                .id_salt("edit_item_filename")
+                                .desired_width(f32::INFINITY),
+                        )
+                        .labelled_by(label.id)
+                        .on_disabled_hover_text(tr.t("gui-edit-filename-locked"));
+                    }
+                    ui.end_row();
+                }
+
                 let label = ui.label(tr.t("dialog-item-edit-referrer"));
                 let response = ui.add(
                     TextEdit::singleline(&mut edit.state.referrer.value)
@@ -365,13 +392,15 @@ fn submit_edit(edit: &mut EditModal) -> Outcome {
     }
     let header_edit = edit.state.header_edit();
     let new_save_path = edit.state.new_save_path();
-    if header_edit.is_none() && new_save_path.is_none() {
+    let new_filename = edit.state.new_filename();
+    if header_edit.is_none() && new_save_path.is_none() && new_filename.is_none() {
         return Outcome::Close;
     }
     Outcome::Run(Action::EditItems {
         targets: edit.state.targets.clone(),
         header_edit,
         new_save_path,
+        new_filename,
     })
 }
 
@@ -392,4 +421,66 @@ fn info_dialog(
             Outcome::Keep
         }
     })
+}
+
+#[cfg(test)]
+mod edit_item {
+    use super::*;
+    use ggg::{app::config::Config, download::task::{DownloadStatus, DownloadTask}};
+    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+    fn snapshot_with(task: DownloadTask) -> Snapshot {
+        let mut folder_downloads = HashMap::new();
+        folder_downloads.insert("f1".to_string(), vec![task]);
+        Snapshot {
+            revision: 1,
+            config: Arc::new(Config::default()),
+            folders: vec![("f1".to_string(), "Downloads".to_string())],
+            default_folder_id: "f1".to_string(),
+            folder_downloads,
+            history: Vec::new(),
+        }
+    }
+
+    fn open(task: DownloadTask) -> Box<EditModal> {
+        let id = task.id;
+        let snapshot = snapshot_with(task);
+        match Modal::for_command(GuiCommand::EditItem, &[id], Some(id), None, &snapshot) {
+            Some(Modal::EditItem(edit)) => edit,
+            _ => panic!("expected the edit dialog"),
+        }
+    }
+
+    fn task() -> DownloadTask {
+        let mut task = DownloadTask::new("https://host/a.bin".to_string(), PathBuf::from("."));
+        task.folder_id = "f1".to_string();
+        task
+    }
+
+    #[test]
+    fn filename_field_editable_for_unstarted_task() {
+        let edit = open(task());
+        assert!(edit.state.filename_editable);
+        assert_eq!(edit.state.filename.value, "a.bin");
+    }
+
+    #[test]
+    fn filename_field_locked_for_started_task() {
+        for started in [
+            |t: &mut DownloadTask| t.status = DownloadStatus::Downloading,
+            |t: &mut DownloadTask| t.downloaded = 1,
+            |t: &mut DownloadTask| t.filename_settled = true,
+        ] {
+            let mut task = task();
+            started(&mut task);
+            let mut edit = open(task);
+            assert!(!edit.state.filename_editable);
+            edit.state.filename.value = "other.bin".to_string();
+            // A locked field never leaves the dialog, even if its value changed.
+            match submit_edit(&mut edit) {
+                Outcome::Close => {}
+                _ => panic!("a locked name must not produce an action"),
+            }
+        }
+    }
 }

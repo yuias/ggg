@@ -2112,6 +2112,7 @@ impl TuiApp {
                     &editor.targets,
                     header_edit.as_ref(),
                     new_save_path.as_deref(),
+                    None,
                 )
                 .await;
                 if report.changed > 0 {
