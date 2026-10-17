@@ -2,7 +2,30 @@
 # Shared strings stay in the other files; add a key here only when the GUI needs its own.
 
 gui-app-title = ggg
-gui-snapshot-summary = { $tasks } tasks in { $folders } folders
+
+# Folder tree
+gui-tree-folder = { $name } ({ $count })
+gui-tree-completed = Completed ({ $count })
+
+# Table columns that have no shared string
+gui-column-added = Added
+gui-column-completed = Completed
+gui-column-url = URL
+gui-history-search-hint = Search completed downloads
+
+# Details panel
+gui-details-tab-info = Info
+gui-details-tab-log = Log
+gui-details-label-error = Error:
+gui-details-label-progress = Progress:
+
+# Status bar summary
+gui-statusbar-items = { $count ->
+    [one] { $count } item
+   *[other] { $count } items
+}
+gui-statusbar-selected = { $count } selected
+gui-statusbar-active = { $count } active
 
 # Status bar messages for finished actions
 gui-status-toggled = { $count ->

@@ -8,9 +8,9 @@ use crate::{
     event::UserEvent,
     gui_config::GuiConfig,
     i18n::Tr,
+    ui::main_view::MainView,
     window::{OsWindow, main_window_attributes},
 };
-use fluent_bundle::FluentArgs;
 use ggg::{
     app::bootstrap::Core, download::task::DownloadTask, ui::queue_ops::MAX_UNDO_BATCHES,
 };
@@ -41,6 +41,7 @@ pub struct GuiApp {
     status: Option<String>,
     /// Delete batches, newest last, for undo.
     undo: Vec<Vec<DownloadTask>>,
+    view: MainView,
     main: Option<OsWindow>,
     /// Earliest delayed repaint requested by egui, if any.
     repaint_at: Option<Instant>,
@@ -81,6 +82,7 @@ impl GuiApp {
             results,
             status: None,
             undo: Vec::new(),
+            view: MainView::default(),
             main: None,
             repaint_at: None,
         }
@@ -115,25 +117,20 @@ impl GuiApp {
     fn draw_main(&mut self) {
         self.drain_results();
         let status = self.status.clone();
-        let Some(main) = self.main.as_mut() else {
+        let Self {
+            main,
+            view,
+            tr,
+            gui_config,
+            ..
+        } = self;
+        let Some(main) = main.as_mut() else {
             return;
         };
         // Read once per frame; the borrow must not outlive this statement.
         let snapshot = self.snapshot.rx.borrow().clone();
-        let mut args = FluentArgs::new();
-        args.set("tasks", snapshot.task_count());
-        args.set("folders", snapshot.folders.len());
-        let summary = self.tr.t_args("gui-snapshot-summary", &args);
-        // Placeholder content until the real main view exists.
         main.redraw(|ui| {
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.label("ggg");
-                ui.label(&summary);
-                if let Some(status) = &status {
-                    ui.label(status);
-                }
-                ui.label("日本語の表示テスト: ダウンロード マネージャー");
-            });
+            view.show(ui, &snapshot, tr, gui_config, status.as_deref());
         });
     }
 }

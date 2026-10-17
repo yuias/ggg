@@ -2,7 +2,27 @@
 # Every key defined in en-US/gui.ftl must also be defined here.
 
 gui-app-title = ggg
-gui-snapshot-summary = { $folders } 個のフォルダーに { $tasks } 件のタスク
+
+# Folder tree
+gui-tree-folder = { $name } ({ $count })
+gui-tree-completed = 完了 ({ $count })
+
+# Table columns that have no shared string
+gui-column-added = 追加日時
+gui-column-completed = 完了日時
+gui-column-url = URL
+gui-history-search-hint = 完了したダウンロードを検索
+
+# Details panel
+gui-details-tab-info = 情報
+gui-details-tab-log = ログ
+gui-details-label-error = エラー:
+gui-details-label-progress = 進捗:
+
+# Status bar summary
+gui-statusbar-items = { $count } 項目
+gui-statusbar-selected = { $count } 項目を選択
+gui-statusbar-active = ダウンロード中 { $count } 件
 
 # Status bar messages for finished actions
 gui-status-toggled = { $count } 件のダウンロードを開始または一時停止しました。

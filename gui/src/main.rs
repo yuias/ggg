@@ -5,6 +5,7 @@ mod bridge;
 mod event;
 mod gui_config;
 mod i18n;
+mod ui;
 mod window;
 
 use anyhow::{Context as _, Result};

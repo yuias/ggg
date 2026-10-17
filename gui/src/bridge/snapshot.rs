@@ -27,11 +27,12 @@ const TICK_ACTIVE: Duration = Duration::from_millis(250);
 const TICK_IDLE: Duration = Duration::from_secs(1);
 
 /// Immutable view of the core, safe to read from the UI thread.
-// Most fields are read by the views added after the bridge itself.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct Snapshot {
+    // Read by the settings and dialog views.
+    #[allow(dead_code)]
     pub revision: u64,
+    #[allow(dead_code)]
     pub config: Arc<Config>,
     /// `(folder_id, display name)` in display order.
     pub folders: Vec<(String, String)>,
