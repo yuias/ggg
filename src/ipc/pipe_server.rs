@@ -1,8 +1,9 @@
-/// Windows Named Pipe server for receiving URLs from ggg-dnd GUI.
+/// Windows Named Pipe server for receiving URLs from ggg-dnd and the browser bridge.
 ///
-/// Listens on `\\.\pipe\ggg-dnd` (default) or `\\.\pipe\ggg-dnd-{pid}` (fallback).
+/// Listens on `\\.\pipe\ggg` (default, or `GGG_PIPE` when set) or
+/// `\\.\pipe\ggg-{pid}` (fallback).
 /// Each client connection is handled in a separate tokio task.
-use ggg_ipc::{IpcRequest, IpcResponse, DEFAULT_PIPE_NAME, PIPE_NAME_PREFIX};
+use ggg_ipc::{IpcRequest, IpcResponse, PIPE_NAME_PREFIX};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::sync::mpsc;
@@ -17,17 +18,18 @@ pub enum IpcEvent {
 /// Attempt to create a Named Pipe server, trying the default name first.
 /// Returns the pipe name that was successfully bound.
 fn resolve_pipe_name() -> String {
+    let default_name = ggg_ipc::default_pipe_name();
     // Try default name first by attempting to create a pipe instance
     match ServerOptions::new()
         .first_pipe_instance(true)
-        .create(DEFAULT_PIPE_NAME)
+        .create(&default_name)
     {
         Ok(_) => {
             // Successfully reserved the default name.
             // The instance is dropped here but that's fine —
             // the accept loop will re-create it.
-            tracing::info!("IPC pipe bound to default name: {}", DEFAULT_PIPE_NAME);
-            DEFAULT_PIPE_NAME.to_string()
+            tracing::info!("IPC pipe bound to default name: {}", default_name);
+            default_name
         }
         Err(_) => {
             let pid = std::process::id();
@@ -196,10 +198,10 @@ mod tests {
     /// blocking client, passes the client-side owner check: this exercises
     /// `ggg-ipc`'s client end to end, not just the pure `decide_owner` rule.
     /// Uses a unique name, not `DEFAULT_PIPE_NAME`, so it cannot collide with
-    /// a real ggg-dnd server already holding that name.
+    /// a real server already holding that name.
     #[tokio::test]
     async fn ggg_ipc_client_accepts_pipe_created_by_same_user() {
-        let pipe_name = format!(r"\\.\pipe\ggg-dnd-test-{}", uuid::Uuid::new_v4());
+        let pipe_name = format!(r"\\.\pipe\ggg-test-{}", uuid::Uuid::new_v4());
         let (event_tx, _event_rx) = mpsc::channel(1);
 
         let server = ServerOptions::new()

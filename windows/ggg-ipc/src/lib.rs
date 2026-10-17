@@ -13,7 +13,10 @@ pub mod protocol;
 #[cfg(windows)]
 pub mod client;
 
-pub use protocol::{IpcRequest, IpcResponse, DEFAULT_PIPE_NAME, PIPE_NAME_PREFIX};
+pub use protocol::{
+    default_pipe_name, pipe_name_from, IpcRequest, IpcResponse, DEFAULT_PIPE_NAME, PIPE_ENV,
+    PIPE_NAME_PREFIX,
+};
 
 #[cfg(windows)]
 pub use client::{ping, send_request, send_url, ClientError};

@@ -9,7 +9,7 @@
 //! until stdin reaches EOF, so it works with both `sendNativeMessage`
 //! (one-shot) and `connectNative` (persistent port) on the extension side.
 
-use ggg_ipc::{ClientError, IpcRequest, IpcResponse, DEFAULT_PIPE_NAME};
+use ggg_ipc::{ClientError, IpcRequest, IpcResponse};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
@@ -117,9 +117,9 @@ fn resolve_pipe(requested: Option<String>) -> String {
                 "bridge: ignoring 'pipe' override (allowed only in debug builds \
                  or with GGG_BRIDGE_ALLOW_PIPE_OVERRIDE set)"
             );
-            DEFAULT_PIPE_NAME.to_string()
+            ggg_ipc::default_pipe_name()
         }
-        None => DEFAULT_PIPE_NAME.to_string(),
+        None => ggg_ipc::default_pipe_name(),
     }
 }
 
