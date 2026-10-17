@@ -116,18 +116,19 @@ pub async fn retry_tasks(manager: &DownloadManager, state: &AppState, targets: &
     report
 }
 
-/// Remove `targets` as one batch. Each removed task gets status Deleted, goes
-/// to history and is returned, so the caller can offer an undo of the whole
-/// batch.
+/// Remove `targets` as one batch. Each removed task goes to history marked
+/// Deleted. The returned batch, kept by the caller for undo, holds the tasks
+/// as they were when removed: `restore_tasks` needs their pre-delete status.
 pub async fn delete_tasks(manager: &DownloadManager, targets: &[Uuid]) -> (Vec<DownloadTask>, OpReport) {
     let mut batch = Vec::new();
     let mut report = OpReport::default();
     let results = manager.remove_many(targets).await;
     for (id, result) in targets.iter().copied().zip(results) {
         match result {
-            Ok(Some(mut task)) => {
-                task.status = DownloadStatus::Deleted;
-                manager.add_to_history(task.clone()).await;
+            Ok(Some(task)) => {
+                let mut history_entry = task.clone();
+                history_entry.status = DownloadStatus::Deleted;
+                manager.add_to_history(history_entry).await;
                 batch.push(task);
             }
             Ok(None) => {}
@@ -141,22 +142,45 @@ pub async fn delete_tasks(manager: &DownloadManager, targets: &[Uuid]) -> (Vec<D
     (batch, report)
 }
 
-/// Re-enqueue a deleted batch (undo). `affected` counts tasks that were added
-/// again; a task refused as a duplicate is not counted, and a refused
-/// auto-start counts as `failed` while the task stays queued.
+/// Status a deleted task gets when it is queued again. The removal aborted a
+/// running download, so it comes back Paused rather than claiming to run.
+fn restored_status(status: DownloadStatus) -> DownloadStatus {
+    match status {
+        DownloadStatus::Pending | DownloadStatus::Paused | DownloadStatus::Error => status,
+        DownloadStatus::Downloading => DownloadStatus::Paused,
+        // Not produced by `delete_tasks`; a startable status is the safe fallback.
+        DownloadStatus::Completed | DownloadStatus::Deleted => DownloadStatus::Pending,
+    }
+}
+
+/// Re-enqueue a deleted batch (undo) and drop the history entries the delete
+/// created for it. `affected` counts tasks that were added again; a task
+/// refused as a duplicate is not counted and keeps its history entry, and a
+/// refused auto-start counts as `failed` while the task stays queued.
 pub async fn restore_tasks(manager: &DownloadManager, state: &AppState, batch: Vec<DownloadTask>) -> OpReport {
     let mut report = OpReport::default();
-    for task in batch {
+    for mut task in batch {
+        let id = task.id;
         let folder_id = task.folder_id.clone();
+        task.status = restored_status(task.status);
         match enqueue(manager, state, task, false, true).await {
             EnqueueOutcome::Duplicate => {}
             EnqueueOutcome::Added { started, start_error, .. } => {
+                // Only the entry the delete wrote: if auto-start already ran
+                // the task to completion, that newer entry must stay.
+                if manager
+                    .get_history_item(id)
+                    .await
+                    .is_some_and(|entry| entry.status == DownloadStatus::Deleted)
+                {
+                    manager.remove_from_history(id).await;
+                }
                 report.affected += 1;
                 if started {
                     tracing::debug!("Auto-started download in folder '{}'", folder_id);
                 } else if let Some(e) = start_error {
-                    // The task stays queued as Pending; a refused start must
-                    // not abort the rest of the batch.
+                    // The task stays queued with its restored status; a refused
+                    // start must not abort the rest of the batch.
                     tracing::warn!("Auto-start failed in folder '{}': {}", folder_id, e);
                     report.failed += 1;
                 }
@@ -341,14 +365,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_returns_batch_marked_deleted_and_in_history() {
+    async fn delete_returns_batch_with_original_status_and_marks_history_deleted() {
         let (manager, _state, ids) = queued(false, &["https://example.com/a.bin", "https://example.com/b.bin"]).await;
 
         let (batch, report) = delete_tasks(&manager, &ids).await;
 
         assert_eq!(report, OpReport { affected: 2, ..Default::default() });
         assert_eq!(batch.len(), 2);
-        assert!(batch.iter().all(|t| t.status == DownloadStatus::Deleted));
+        assert!(batch.iter().all(|t| t.status == DownloadStatus::Pending));
         for id in &ids {
             assert!(manager.get_by_id(*id).await.is_none());
             let in_history = manager.get_history_item(*id).await.expect("deleted task is in history");
@@ -387,6 +411,100 @@ mod tests {
         assert_eq!(report, OpReport { affected: 2, ..Default::default() });
         let restored: Vec<Uuid> = manager.get_folder_downloads(FOLDER).await.iter().map(|t| t.id).collect();
         assert_eq!(restored, ids);
+    }
+
+    // Queues one task per status; adding directly keeps `Downloading` free of
+    // a real download handle.
+    async fn queued_with_statuses(
+        manager: &DownloadManager,
+        state: &AppState,
+        statuses: &[DownloadStatus],
+    ) -> Vec<Uuid> {
+        let config = state.config.read().await.clone();
+        let mut ids = Vec::new();
+        for (i, status) in statuses.iter().enumerate() {
+            let url = format!("https://example.com/{i}.bin");
+            let mut task = build_task(&url, FOLDER, &config, &EnqueueOptions::default());
+            task.status = *status;
+            ids.push(task.id);
+            manager.add_download(task).await;
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn restore_resets_status_from_deleted() {
+        let state = AppState::new(config_with_folder(false));
+        let manager = DownloadManager::new();
+        let statuses = [
+            DownloadStatus::Pending,
+            DownloadStatus::Paused,
+            DownloadStatus::Error,
+            DownloadStatus::Downloading,
+        ];
+        let ids = queued_with_statuses(&manager, &state, &statuses).await;
+        let (batch, _) = delete_tasks(&manager, &ids).await;
+
+        restore_tasks(&manager, &state, batch).await;
+
+        let expected = [
+            DownloadStatus::Pending,
+            DownloadStatus::Paused,
+            DownloadStatus::Error,
+            DownloadStatus::Paused,
+        ];
+        for (id, expected) in ids.iter().zip(expected) {
+            let task = manager.get_by_id(*id).await.expect("restored");
+            assert_eq!(task.status, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_removes_history_entries_of_the_batch() {
+        let (manager, state, ids) = queued(false, &["https://example.com/a.bin", "https://example.com/b.bin"]).await;
+        let (batch, _) = delete_tasks(&manager, &ids).await;
+        assert_eq!(manager.history_len().await, 2);
+
+        restore_tasks(&manager, &state, batch).await;
+
+        assert_eq!(manager.history_len().await, 0);
+        for id in &ids {
+            assert!(manager.get_history_item(*id).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_unrelated_history() {
+        let (manager, state, ids) = queued(false, &["https://example.com/a.bin", "https://example.com/b.bin"]).await;
+        let mut finished = DownloadTask::new("https://example.com/done.bin".to_string(), PathBuf::from("dir"));
+        finished.status = DownloadStatus::Completed;
+        let finished_id = finished.id;
+        manager.add_to_history(finished).await;
+        // Only the first task is undone; the second stays deleted.
+        let (mut batch, _) = delete_tasks(&manager, &ids).await;
+        batch.truncate(1);
+
+        restore_tasks(&manager, &state, batch).await;
+
+        assert!(manager.get_history_item(finished_id).await.is_some());
+        assert!(manager.get_history_item(ids[0]).await.is_none());
+        assert!(manager.get_history_item(ids[1]).await.is_some());
+        assert_eq!(manager.history_len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_history_of_a_refused_duplicate() {
+        let state = AppState::new(config_with_folder(true));
+        let manager = DownloadManager::new();
+        let added = add_urls(&manager, &state, request(&["https://example.com/a.bin"])).await;
+        let (batch, _) = delete_tasks(&manager, &added.added).await;
+        // The same URL is queued again before the undo.
+        add_urls(&manager, &state, request(&["https://example.com/a.bin"])).await;
+
+        let report = restore_tasks(&manager, &state, batch).await;
+
+        assert_eq!(report.affected, 0);
+        assert!(manager.get_history_item(added.added[0]).await.is_some());
     }
 
     #[tokio::test]
