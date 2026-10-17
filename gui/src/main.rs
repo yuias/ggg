@@ -7,6 +7,7 @@ mod dnd;
 mod event;
 mod gui_config;
 mod i18n;
+mod instance;
 mod menu;
 mod platform;
 mod registration;
@@ -19,7 +20,7 @@ mod window;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use event::UserEvent;
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 use winit::event_loop::EventLoop;
 
 #[derive(Parser, Debug)]
@@ -32,9 +33,14 @@ struct Args {
     /// Log at TRACE level
     #[arg(short, long)]
     verbose: bool,
+
+    /// Links to add; a running instance for the same configuration receives
+    /// them instead of this process opening a second window
+    #[arg(value_name = "URL")]
+    urls: Vec<String>,
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let args = Args::parse();
 
     // Applied before the log appender is created so logs land under the override.
@@ -49,6 +55,13 @@ fn main() -> Result<()> {
         .thread_name("ggg-core")
         .build()
         .context("build tokio runtime")?;
+
+    // Before the core loads: a second start must not touch the queue files the
+    // running instance owns. Returning (not exiting) flushes the log guard.
+    let ipc = match instance::acquire(&rt, &args.urls) {
+        instance::Start::Primary(ipc) => ipc,
+        instance::Start::Done(code) => return Ok(code),
+    };
 
     // Core start-up needs the runtime context; blocking is fine before the loop starts.
     let core = rt.block_on(ggg::app::bootstrap::init_core())?;
@@ -82,8 +95,15 @@ fn main() -> Result<()> {
         tr,
         gui_config,
         event_loop.create_proxy(),
+        ipc,
     )
     .with_gui_config_path(gui_config_path.clone());
+    if !args.urls.is_empty() {
+        // Delivered once the loop runs, like a link from the pipe.
+        let _ = event_loop
+            .create_proxy()
+            .send_event(UserEvent::IpcText(args.urls.join("\n")));
+    }
     let run_result = event_loop.run_app(&mut app);
 
     // The loop is done, so blocking here cannot stall the UI.
@@ -102,5 +122,6 @@ fn main() -> Result<()> {
     drop(app);
     rt.shutdown_timeout(Duration::from_secs(3));
 
-    run_result.context("event loop")
+    run_result.context("event loop")?;
+    Ok(ExitCode::SUCCESS)
 }

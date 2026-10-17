@@ -2063,6 +2063,7 @@ dependencies = [
  "egui_system_font_provider",
  "fluent-bundle",
  "ggg",
+ "ggg-ipc",
  "muda",
  "pollster",
  "raw-window-handle",

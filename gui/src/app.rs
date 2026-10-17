@@ -10,6 +10,7 @@ use crate::{
     event::UserEvent,
     gui_config::{GuiConfig, WindowGeometry},
     i18n::Tr,
+    instance::GuiIpc,
     menu::MenuBar,
     platform,
     registration::{Plan, Resolved, Source, plan, resolve_urls},
@@ -128,6 +129,7 @@ impl GuiApp {
         tr: Tr,
         gui_config: GuiConfig,
         proxy: EventLoopProxy<UserEvent>,
+        ipc: GuiIpc,
     ) -> Self {
         let wake_proxy = proxy.clone();
         let snapshot = spawn_snapshot_task(&rt, core.manager.clone(), core.state.clone(), move || {
@@ -144,7 +146,7 @@ impl GuiApp {
                 let _ = action_proxy.send_event(UserEvent::ActionDone);
             },
         );
-        let pipe_name = start_ipc(&rt, &proxy);
+        let pipe_name = start_ipc(&rt, &proxy, ipc);
         Self {
             proxy,
             tr,
@@ -466,10 +468,11 @@ impl GuiApp {
 /// bound. Links arrive as `UserEvent::IpcText`, so nothing here blocks the
 /// event loop.
 #[cfg(windows)]
-fn start_ipc(rt: &Handle, proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
+fn start_ipc(rt: &Handle, proxy: &EventLoopProxy<UserEvent>, ipc: GuiIpc) -> Option<String> {
     use ggg::ipc::pipe_server::{IpcEvent, start_pipe_server};
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+    // The channel also carries what the instance pipe receives.
+    let GuiIpc { tx: event_tx, rx: mut event_rx } = ipc;
     // `start_pipe_server` spawns its accept loop and needs the runtime context.
     let pipe_name = {
         let _enter = rt.enter();
@@ -498,7 +501,7 @@ fn start_ipc(rt: &Handle, proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
 }
 
 #[cfg(not(windows))]
-fn start_ipc(_rt: &Handle, _proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
+fn start_ipc(_rt: &Handle, _proxy: &EventLoopProxy<UserEvent>, _ipc: GuiIpc) -> Option<String> {
     None
 }
 
@@ -678,7 +681,9 @@ impl GuiApp {
             platform::set_enabled(owner, false);
         }
         dialog.window.set_visible(true);
-        dialog.window.focus_window();
+        if let Some(hwnd) = platform::hwnd(&dialog.window) {
+            platform::bring_to_front(hwnd);
+        }
         dialog.window.request_redraw();
 
         let id = dialog.window.id();
@@ -718,7 +723,9 @@ impl GuiApp {
         self.settings = None;
         tracing::info!("closed {:?} window; main window enabled again", modal.kind);
         if let Some(main) = self.main_window() {
-            main.window.focus_window();
+            if let Some(hwnd) = platform::hwnd(&main.window) {
+                platform::bring_to_front(hwnd);
+            }
             main.window.request_redraw();
         }
         self.store_main_geometry();
@@ -1062,6 +1069,19 @@ impl ApplicationHandler<UserEvent> for GuiApp {
             }
             UserEvent::IpcText(text) => self.receive_ipc_text(event_loop, &text),
             UserEvent::Activate(urls) => {
+                // The open modal covers the main window, so it is what to raise.
+                let target = self
+                    .modal
+                    .as_ref()
+                    .and_then(|modal| self.windows.get(&modal.id))
+                    .or_else(|| self.main_window());
+                let foreground = target
+                    .and_then(|os| platform::hwnd(&os.window))
+                    .is_some_and(platform::bring_to_front);
+                tracing::info!(
+                    "activation request with {} URL(s); foreground={foreground}",
+                    urls.len()
+                );
                 if !urls.is_empty() {
                     self.receive_ipc_text(event_loop, &urls.join("\n"));
                 }

@@ -33,6 +33,7 @@ toml = "1.0"
 arboard = "3"
 
 [target.'cfg(windows)'.dependencies]
+ggg-ipc = { path = "../windows/ggg-ipc" }
 muda = { version = "0.21", default-features = false }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
