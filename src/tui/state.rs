@@ -142,45 +142,9 @@ impl SettingsSection {
     }
 }
 
-/// Application-level settings fields.
-///
-/// Order is display order within each `SettingsSection`, grouped by section
-/// (General, then Downloads, then Scripts) so `in_section` can filter `all()`
-/// without re-sorting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ApplicationSettingsField {
-    Language,
-    SkipDownloadPreview,
-    AutoLaunchDnd,
-    UserAgent,
-    ReferrerPolicy,
-    MaxRedirects,
-    RetryCount,
-    MaxConcurrent,
-    MaxConcurrentPerFolder,
-    MaxActiveFolders,
-    ScriptsEnabled,
-    DefaultDirectory,
-}
+pub use crate::ui::settings_fields::{ApplicationSettingsField, SettingsField};
 
 impl ApplicationSettingsField {
-    pub fn all() -> Vec<Self> {
-        vec![
-            Self::Language,
-            Self::SkipDownloadPreview,
-            Self::AutoLaunchDnd,
-            Self::UserAgent,
-            Self::ReferrerPolicy,
-            Self::MaxRedirects,
-            Self::RetryCount,
-            Self::MaxConcurrent,
-            Self::MaxConcurrentPerFolder,
-            Self::MaxActiveFolders,
-            Self::ScriptsEnabled,
-            Self::DefaultDirectory,
-        ]
-    }
-
     /// The tab this field is shown on.
     pub fn section(&self) -> SettingsSection {
         match self {
@@ -215,143 +179,14 @@ impl ApplicationSettingsField {
             field_count
         }
     }
-
-    /// Whether changing this field only takes effect after a restart.
-    /// `MaxConcurrent` applies live via `DownloadManager::set_max_concurrent`,
-    /// so it is not in this list; the others are read only at startup (see
-    /// `main.rs`, where the manager and its per-folder queues are built once).
-    /// `ScriptsEnabled` is included because the script executor thread is
-    /// only spawned when scripts are enabled at startup (`AppState::new_with_scripts`);
-    /// turning it on later leaves `script_sender` `None` for the rest of the
-    /// session, so scripts silently never run until a restart.
-    /// `DefaultDirectory` is not in this list either: it is read from the
-    /// shared config on every download/folder creation (`DownloadTask::new_with_folder`,
-    /// `download::manager`), never cached at startup, so an edit applies to
-    /// the next download without a restart.
-    pub fn requires_restart(&self) -> bool {
-        matches!(
-            self,
-            Self::Language
-                | Self::AutoLaunchDnd
-                | Self::RetryCount
-                | Self::MaxConcurrentPerFolder
-                | Self::MaxActiveFolders
-                | Self::ScriptsEnabled
-        )
-    }
-
-    /// Get translation key for label
-    pub fn label_key(&self) -> &str {
-        match self {
-            Self::MaxConcurrent => "settings-app-max-concurrent",
-            Self::MaxConcurrentPerFolder => "settings-app-max-concurrent-per-folder",
-            Self::MaxActiveFolders => "settings-app-max-active-folders",
-            Self::MaxRedirects => "settings-app-max-redirects",
-            Self::RetryCount => "settings-app-retry-count",
-            Self::UserAgent => "settings-app-user-agent",
-            Self::ReferrerPolicy => "settings-app-referrer-policy",
-            Self::ScriptsEnabled => "settings-app-scripts-enabled",
-            Self::SkipDownloadPreview => "settings-app-skip-download-preview",
-            Self::Language => "settings-app-language",
-            Self::AutoLaunchDnd => "settings-app-auto-launch-dnd",
-            Self::DefaultDirectory => "settings-app-default-directory",
-        }
-    }
-
-    /// Get translation key for description
-    pub fn description_key(&self) -> &str {
-        match self {
-            Self::MaxConcurrent => "settings-app-max-concurrent-desc",
-            Self::MaxConcurrentPerFolder => "settings-app-max-concurrent-per-folder-desc",
-            Self::MaxActiveFolders => "settings-app-max-active-folders-desc",
-            Self::MaxRedirects => "settings-app-max-redirects-desc",
-            Self::RetryCount => "settings-app-retry-count-desc",
-            Self::UserAgent => "settings-app-user-agent-desc",
-            Self::ReferrerPolicy => "settings-app-referrer-policy-desc",
-            Self::ScriptsEnabled => "settings-app-scripts-enabled-desc",
-            Self::SkipDownloadPreview => "settings-app-skip-download-preview-desc",
-            Self::Language => "settings-app-language-desc",
-            Self::AutoLaunchDnd => "settings-app-auto-launch-dnd-desc",
-            Self::DefaultDirectory => "settings-app-default-directory-desc",
-        }
-    }
-}
-
-/// Folder-level settings fields
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsField {
-    FolderName,
-    FolderSavePath,
-    FolderAutoDate,
-    FolderAutoStart,
-    FolderPreventDuplicateUrl,
-    FolderScripts,
-    FolderMaxConcurrent,
-    FolderUserAgent,
-    FolderReferrerPolicy,
-    FolderHeaders,
 }
 
 impl SettingsField {
-    /// All folder settings fields, in display order. The order must match the
-    /// index mapping used by the folder settings handlers.
-    pub fn all() -> Vec<Self> {
-        vec![
-            Self::FolderName,
-            Self::FolderSavePath,
-            Self::FolderAutoDate,
-            Self::FolderAutoStart,
-            Self::FolderPreventDuplicateUrl,
-            Self::FolderScripts,
-            Self::FolderMaxConcurrent,
-            Self::FolderUserAgent,
-            Self::FolderReferrerPolicy,
-            Self::FolderHeaders,
-        ]
-    }
-
-    /// Map a 0-based display index to its field.
-    pub fn from_index(index: usize) -> Option<Self> {
-        Self::all().into_iter().nth(index)
-    }
-
     /// Number of selectable rows in the folder editor: the fixed fields plus
     /// one row per script file (folder override), flattened into the same
     /// list rather than shown as a collapsible sub-list.
     pub fn row_count(script_file_count: usize) -> usize {
         Self::all().len() + script_file_count
-    }
-
-    /// Get translation key for label
-    pub fn label_key(&self) -> &str {
-        match self {
-            Self::FolderName => "settings-folder-name",
-            Self::FolderSavePath => "settings-folder-save-path",
-            Self::FolderAutoDate => "settings-folder-auto-date",
-            Self::FolderAutoStart => "settings-folder-auto-start",
-            Self::FolderPreventDuplicateUrl => "settings-folder-prevent-duplicate-url",
-            Self::FolderScripts => "settings-folder-scripts",
-            Self::FolderMaxConcurrent => "settings-folder-max-concurrent",
-            Self::FolderUserAgent => "settings-folder-user-agent",
-            Self::FolderReferrerPolicy => "settings-folder-referrer-policy",
-            Self::FolderHeaders => "settings-folder-headers",
-        }
-    }
-
-    /// Get translation key for description
-    pub fn description_key(&self) -> &str {
-        match self {
-            Self::FolderName => "settings-folder-name-desc",
-            Self::FolderSavePath => "settings-folder-save-path-desc",
-            Self::FolderAutoDate => "settings-folder-auto-date-desc",
-            Self::FolderAutoStart => "settings-folder-auto-start-desc",
-            Self::FolderPreventDuplicateUrl => "settings-folder-prevent-duplicate-url-desc",
-            Self::FolderScripts => "settings-folder-scripts-desc",
-            Self::FolderMaxConcurrent => "settings-folder-max-concurrent-desc",
-            Self::FolderUserAgent => "settings-folder-user-agent-desc",
-            Self::FolderReferrerPolicy => "settings-folder-referrer-policy-desc",
-            Self::FolderHeaders => "settings-folder-headers-desc",
-        }
     }
 }
 
