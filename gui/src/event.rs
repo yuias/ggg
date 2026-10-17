@@ -10,4 +10,8 @@ pub enum UserEvent {
     Snapshot,
     /// An action finished and its result is waiting in the results channel.
     ActionDone,
+    /// A menu bar item was chosen. `shift` is the Shift state at the click.
+    // Only the Windows menu sends it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Menu { id: String, shift: bool },
 }

@@ -530,6 +530,8 @@ impl MainView {
                         Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown => true,
                         Key::Home | Key::End | Key::Enter => true,
                         Key::Space => modifiers.command,
+                        // Interim: the shortcut table will own every command key
+                        // (Undo included) and this arm goes away with it.
                         Key::Z => modifiers.command && !modifiers.shift,
                         _ => false,
                     };

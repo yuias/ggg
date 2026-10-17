@@ -154,7 +154,7 @@ pub fn show(
         Modal::About => info_dialog(ctx, tr, "about_modal", "gui-about-title", |ui| {
             ui.label(RichText::new(tr.t("gui-app-title")).strong());
             let mut args = FluentArgs::new();
-            args.set("version", env!("CARGO_PKG_VERSION"));
+            args.set("version", ggg::VERSION);
             ui.label(tr.t_args("gui-about-version", &args));
             ui.label(tr.t("gui-about-description"));
         }),

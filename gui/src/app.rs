@@ -9,6 +9,8 @@ use crate::{
     event::UserEvent,
     gui_config::GuiConfig,
     i18n::Tr,
+    menu::MenuBar,
+    platform,
     ui::main_view::{MainView, ViewEnv, ViewOutput},
     window::{OsWindow, main_window_attributes},
 };
@@ -23,7 +25,7 @@ use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
-    window::WindowId,
+    window::{Theme, WindowId},
 };
 
 pub struct GuiApp {
@@ -44,6 +46,8 @@ pub struct GuiApp {
     undo: Vec<Vec<DownloadTask>>,
     view: MainView,
     main: Option<OsWindow>,
+    /// `None` when the platform has no native menu or building it failed.
+    menu: Option<MenuBar>,
     /// Set by the Exit command; the loop is left once the frame is done.
     exit_requested: bool,
     /// Earliest delayed repaint requested by egui, if any.
@@ -87,6 +91,7 @@ impl GuiApp {
             undo: Vec::new(),
             view: MainView::default(),
             main: None,
+            menu: None,
             exit_requested: false,
             repaint_at: None,
         }
@@ -131,6 +136,7 @@ impl GuiApp {
             view,
             tr,
             gui_config,
+            menu,
             ..
         } = self;
         let Some(main) = main.as_mut() else {
@@ -140,6 +146,9 @@ impl GuiApp {
         main.redraw(|ui| {
             output = view.show(ui, &snapshot, tr, gui_config, status.as_deref(), env);
         });
+        if let Some(menu) = menu {
+            menu.sync(&view.command_context(), gui_config.details_visible);
+        }
         for action in output.actions {
             self.dispatch(action);
         }
@@ -239,6 +248,16 @@ impl GuiApp {
     }
 }
 
+/// Puts the menu on the window and keeps the client size, so the status bar
+/// is not cut off: a menu bar takes room from the client area.
+fn attach_menu(menu: &MenuBar, window: &mut OsWindow, hwnd: isize, dark: bool) {
+    let size = window.window.inner_size();
+    menu.attach(hwnd, dark);
+    // winit adds the menu height to the outer size when it resizes.
+    let _ = window.window.request_inner_size(size);
+    window.resize(window.window.inner_size());
+}
+
 impl ApplicationHandler<UserEvent> for GuiApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // `resumed` can fire again on some platforms; keep the existing window.
@@ -250,8 +269,14 @@ impl ApplicationHandler<UserEvent> for GuiApp {
             main_window_attributes(&self.tr.t("gui-app-title")),
             self.proxy.clone(),
         ) {
-            Ok(window) => {
+            Ok(mut window) => {
                 tracing::info!("GUI main window created");
+                platform::forward_menu_events(self.proxy.clone());
+                self.menu = MenuBar::new(&self.tr);
+                if let (Some(menu), Some(hwnd)) = (&self.menu, platform::hwnd(&window.window)) {
+                    let dark = window.window.theme() == Some(Theme::Dark);
+                    attach_menu(menu, &mut window, hwnd, dark);
+                }
                 window.window.request_redraw();
                 self.main = Some(window);
             }
@@ -273,6 +298,11 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 return;
             }
             WindowEvent::Resized(size) => main.resize(*size),
+            WindowEvent::ThemeChanged(theme) => {
+                if let (Some(menu), Some(hwnd)) = (&self.menu, platform::hwnd(&main.window)) {
+                    menu.set_dark(hwnd, *theme == Theme::Dark);
+                }
+            }
             WindowEvent::RedrawRequested => {
                 self.draw_main();
                 if self.exit_requested {
@@ -302,6 +332,22 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 }
             }
             UserEvent::Snapshot | UserEvent::ActionDone => {
+                if let Some(main) = &self.main {
+                    main.window.request_redraw();
+                }
+            }
+            UserEvent::Menu { id, shift } => {
+                let Some(menu) = self.menu.as_mut() else {
+                    return;
+                };
+                // A check item flips itself on click; the next sync restores
+                // it if the command turns out to be refused.
+                menu.invalidate();
+                let Some(cmd) = menu.command(&id) else {
+                    return;
+                };
+                tracing::info!("menu command {cmd:?} shift={shift}");
+                self.run_command(cmd);
                 if let Some(main) = &self.main {
                     main.window.request_redraw();
                 }
