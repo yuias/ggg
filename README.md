@@ -112,7 +112,7 @@ auto-launch (`ggg-dnd`) and `ggg bridge install` (`ggg-bridge`) look for them.
 ### Drag and drop (ggg-dnd)
 
 - The whole window is an OLE drop target: drag a URL from your browser onto it.
-- It talks to `ggg` over the Named Pipe `\\.\pipe\ggg-dnd`.
+- It talks to `ggg` over the Named Pipe `\\.\pipe\ggg`.
 - It can be auto-launched from `ggg` with the `Auto Launch ggg-dnd` setting.
 
 ### Chrome extension (ggg-bridge)

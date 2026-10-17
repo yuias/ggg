@@ -1,7 +1,7 @@
 //! Windows Named Pipe server for the daemon control protocol.
 //!
-//! Frames `ControlRequest`/`ControlResponse` instead of the ggg-dnd bridge
-//! protocol (`crate::ipc::pipe_server`), and adds the single-instance bind
+//! Frames `ControlRequest`/`ControlResponse` instead of the link pipe
+//! (`ggg-ipc`) protocol (`crate::ipc::pipe_server`), and adds the single-instance bind
 //! used for the "only one daemon per config dir" guarantee. Unlike
 //! `pipe_server.rs`, which creates the next instance only after accepting a
 //! client on the current one, this module creates the next instance right
@@ -17,7 +17,7 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use super::client::{self, DaemonProbe};
 use super::protocol::{validate_pipe_name, ControlErrorCode, ControlRequest, ControlResponse};
 
-/// Caps a single request line, matching the bridge pipe's cap
+/// Caps a single request line, matching the link pipe's cap
 /// (`pipe_server.rs`).
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 

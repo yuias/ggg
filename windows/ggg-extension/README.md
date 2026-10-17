@@ -12,7 +12,7 @@ Sends URLs from the browser to ggg via the right-click context menu.
 |------------------|-------------------------------------------------------|
 | `background.js`  | MV3 service worker. Registers menu items, sends `add_url` to the native host. |
 | `manifest.json`  | Extension manifest (Manifest V3).                     |
-| `ggg-bridge.exe` | Native Messaging host. Translates stdio frames to `\\.\pipe\ggg-dnd`. |
+| `ggg-bridge.exe` | Native Messaging host. Translates stdio frames to `\\.\pipe\ggg`. |
 | `ggg`            | TUI app. Accepts URLs on the named pipe.              |
 
 The native host name is **`com.ggg.bridge`** and must match the host

@@ -1101,9 +1101,9 @@ mod tests {
     fn pipe_tooltip_names_the_pipe_in_every_locale() {
         for language in ["en-US", "ja-JP"] {
             let mut args = FluentArgs::new();
-            args.set("name", r"\\.\pipe\ggg-dnd-42");
+            args.set("name", r"\\.\pipe\ggg-42");
             let text = Tr::load(language).t_args("gui-statusbar-pipe-tooltip", &args);
-            assert!(text.contains(r"\\.\pipe\ggg-dnd-42"), "{language}: {text:?}");
+            assert!(text.contains(r"\\.\pipe\ggg-42"), "{language}: {text:?}");
         }
     }
 
