@@ -111,6 +111,29 @@ gui-button-close = Close
 
 # Add Downloads dialog
 gui-add-title = Add Downloads
+gui-add-urls = URLs (one per line)
+gui-add-expand = Expand URL ranges such as [1-10]
+gui-add-preview = { $count ->
+    [one] { $count } URL will be added
+   *[other] { $count } URLs will be added
+}
+gui-add-invalid-range = Invalid range pattern: { $url }
+gui-add-truncated = Only the first { $max } URLs will be added
+gui-add-folder = Folder
+gui-add-referrer = Referrer
+gui-add-referrer-hint = Empty = use the referrer policy
+gui-add-headers = Additional headers (Name: value, one per line)
+gui-add-save-as = Save as
+gui-add-save-as-hint = Leave empty to use the folder's location and the server's file name
+gui-add-save-as-disabled = Save as is available when exactly one URL will be added ({ $count } now)
+gui-add-start-now = Start immediately
+gui-add-error-no-urls = Enter at least one URL.
+gui-add-error-referrer = The referrer must not contain control characters.
+gui-add-error-header = Line { $line } of the headers is not a valid "Name: value" pair.
+gui-add-save-as-empty-name = Enter a file name after the folder.
+gui-add-save-as-invalid-name = Enter a valid file name (no \ / : * ? " < > |, no trailing dot or space)
+gui-add-save-as-relative-dir = The folder in "Save as" must be a full path, including the drive or network share.
+gui-add-save-as-invalid-dir = The folder in "Save as" contains a character that is not allowed: * ? " < > | or a control character.
 
 # Confirmations
 gui-confirm-title = Confirm Delete

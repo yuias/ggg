@@ -60,6 +60,26 @@ gui-button-close = 閉じる
 
 # Add Downloads dialog
 gui-add-title = ダウンロードの追加
+gui-add-urls = URL (1 行に 1 つ)
+gui-add-expand = [1-10] のような URL の範囲を展開する
+gui-add-preview = { $count } 件の URL を追加します
+gui-add-invalid-range = 範囲指定が正しくありません: { $url }
+gui-add-truncated = 先頭の { $max } 件のみ追加されます
+gui-add-folder = フォルダー
+gui-add-referrer = リファラー
+gui-add-referrer-hint = 空欄の場合はリファラーポリシーに従います
+gui-add-headers = 追加のヘッダー (名前: 値、1 行に 1 つ)
+gui-add-save-as = 名前を付けて保存
+gui-add-save-as-hint = 空欄の場合はフォルダーの保存先とサーバーのファイル名を使います
+gui-add-save-as-disabled = 「名前を付けて保存」は追加する URL がちょうど 1 件のときだけ使えます (現在 { $count } 件)
+gui-add-start-now = すぐに開始する
+gui-add-error-no-urls = URL を 1 つ以上入力してください。
+gui-add-error-referrer = リファラーに制御文字は使用できません。
+gui-add-error-header = ヘッダーの { $line } 行目が「名前: 値」の形式になっていません。
+gui-add-save-as-empty-name = フォルダーの後ろにファイル名を入力してください。
+gui-add-save-as-invalid-name = 有効なファイル名を入力してください（\ / : * ? " < > | は使用不可、末尾のドットと空白も不可）
+gui-add-save-as-relative-dir = 「名前を付けて保存」のフォルダーは、ドライブまたはネットワーク共有を含む完全なパスで指定してください。
+gui-add-save-as-invalid-dir = 「名前を付けて保存」のフォルダーに使用できない文字 (* ? " < > | と制御文字) が含まれています。
 
 # Confirmations
 gui-confirm-title = 削除の確認

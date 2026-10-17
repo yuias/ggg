@@ -11,8 +11,12 @@ use crate::{
     i18n::Tr,
     menu::MenuBar,
     platform,
+    registration::{Plan, Source, plan},
     render::SharedRender,
-    ui::main_view::{MainView, ViewEnv, ViewOutput},
+    ui::{
+        add_dialog::{self, AddDialog, AddDialogModel, AddOutcome},
+        main_view::{MainView, ViewEnv, ViewOutput},
+    },
     window::{
         ADD_DIALOG_MIN_SIZE, ADD_DIALOG_SIZE, OsWindow, PxRect, centered_on, dialog_attributes,
         dialog_size, main_window_attributes, overlaps_any,
@@ -48,11 +52,9 @@ struct OpenModal {
     owner: Option<isize>,
 }
 
-/// How a dialog frame ended.
-enum DialogOutcome {
-    Keep,
-    Accept,
-    Cancel,
+/// A window a command asked for; created from the event loop callback.
+enum OpenRequest {
+    AddDownloads { prefill: String, expand_checked: bool },
 }
 
 pub struct GuiApp {
@@ -77,7 +79,9 @@ pub struct GuiApp {
     main_id: Option<WindowId>,
     modal: Option<OpenModal>,
     /// Set by a command; the window is created from the event loop callback.
-    open_request: Option<ModalKind>,
+    open_request: Option<OpenRequest>,
+    /// Input of the open Add Downloads window; set exactly while it is open.
+    add_dialog: Option<AddDialog>,
     shared: SharedRender,
     /// Where `gui_config` is written when a dialog closes; `None` disables it.
     gui_config_path: Option<PathBuf>,
@@ -129,6 +133,7 @@ impl GuiApp {
             main_id: None,
             modal: None,
             open_request: None,
+            add_dialog: None,
             shared: SharedRender::new(),
             gui_config_path: None,
             menu: None,
@@ -281,7 +286,13 @@ impl GuiApp {
             }
             GuiCommand::Refresh => self.snapshot.refresh.notify_one(),
             GuiCommand::Exit => self.exit_requested = true,
-            GuiCommand::NewDownload => self.open_request = Some(ModalKind::AddDownloads),
+            GuiCommand::NewDownload => {
+                if let Plan::Dialog { expand_checked } =
+                    plan(Source::NewDownload, self.gui_config.expand_ranges_on_direct_add)
+                {
+                    self.open_add_dialog(String::new(), expand_checked);
+                }
+            }
             // The dialogs and windows behind these do not exist yet.
             GuiCommand::PasteUrls
             | GuiCommand::PasteUrlsDirect
@@ -326,38 +337,36 @@ fn monitor_rects(event_loop: &ActiveEventLoop) -> Vec<PxRect> {
         .collect()
 }
 
-/// Placeholder content of the Add Downloads window.
-fn add_dialog_ui(ui: &mut egui::Ui, tr: &Tr) -> DialogOutcome {
-    let mut outcome = DialogOutcome::Keep;
-    // A focused button owns Enter (egui activates it), so the default answer
-    // applies only while nothing has focus.
-    let (esc, enter) = ui.ctx().input_mut(|input| {
-        (
-            input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
-            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-        )
-    });
-    let nothing_focused = ui.ctx().memory(|m| m.focused().is_none());
-    egui::Panel::bottom("add_dialog_buttons").show(ui, |ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button(tr.t("gui-button-cancel")).clicked() {
-                outcome = DialogOutcome::Cancel;
-            }
-            if ui.button(tr.t("gui-button-ok")).clicked() {
-                outcome = DialogOutcome::Accept;
-            }
-        });
-    });
-    egui::CentralPanel::default().show(ui, |_ui| {});
-    if esc {
-        outcome = DialogOutcome::Cancel;
-    } else if enter && nothing_focused {
-        outcome = DialogOutcome::Accept;
-    }
-    outcome
-}
-
 impl GuiApp {
+    /// Asks for the Add Downloads window with `prefill` (URLs, one per line)
+    /// in the URL field. The window opens once the event loop is at hand. Does
+    /// nothing while another OS-modal window is open; callers that need to
+    /// tell the user check that first.
+    pub fn open_add_dialog(&mut self, prefill: String, expand_checked: bool) {
+        if self.modal.is_some() {
+            return;
+        }
+        self.open_request = Some(OpenRequest::AddDownloads { prefill, expand_checked });
+    }
+
+    fn open_add_downloads(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        prefill: String,
+        expand_checked: bool,
+    ) {
+        let folder_id = {
+            let snapshot = self.snapshot.rx.borrow();
+            add_dialog::initial_folder(self.view.target_folder(), &snapshot)
+        };
+        let model = AddDialogModel::new(prefill, expand_checked, folder_id);
+        self.add_dialog = Some(AddDialog::new(model));
+        self.open_modal(event_loop, ModalKind::AddDownloads);
+        if self.modal.is_none() {
+            self.add_dialog = None;
+        }
+    }
+
     /// Opens `kind` if no OS-modal window is open. The window is owned by the
     /// main window, which is disabled until the dialog closes.
     fn open_modal(&mut self, event_loop: &ActiveEventLoop, kind: ModalKind) {
@@ -465,6 +474,7 @@ impl GuiApp {
         }
         // Dropping the whole window releases the last handle to the native one.
         self.windows.remove(&id);
+        self.add_dialog = None;
         tracing::info!("closed {:?} window; main window enabled again", modal.kind);
         if let Some(main) = self.main_window() {
             main.window.focus_window();
@@ -483,28 +493,39 @@ impl GuiApp {
     }
 
     fn draw_dialog(&mut self, id: WindowId) {
-        let Some(kind) = self.modal.as_ref().filter(|m| m.id == id).map(|m| m.kind) else {
+        if !self.modal.as_ref().is_some_and(|m| m.id == id) {
+            return;
+        }
+        // Read once per frame; the borrow must not outlive this statement.
+        let snapshot = self.snapshot.rx.borrow().clone();
+        let Self {
+            windows,
+            add_dialog,
+            tr,
+            ..
+        } = self;
+        let (Some(dialog), Some(input)) = (windows.get_mut(&id), add_dialog.as_mut()) else {
             return;
         };
-        let Some(dialog) = self.windows.get_mut(&id) else {
-            return;
-        };
-        let mut outcome = DialogOutcome::Keep;
-        let tr = &self.tr;
-        dialog.redraw(|ui| match kind {
-            ModalKind::AddDownloads => outcome = add_dialog_ui(ui, tr),
-        });
+        let mut outcome = AddOutcome::Keep;
+        dialog.redraw(|ui| outcome = add_dialog::show(ui, tr, input, &snapshot.folders));
         match outcome {
-            DialogOutcome::Keep => {}
-            // The real dialog will hand its input to the caller here.
-            DialogOutcome::Accept | DialogOutcome::Cancel => self.close_modal(id),
+            AddOutcome::Keep => {}
+            AddOutcome::Submit(request) => {
+                self.dispatch(Action::Add(request));
+                self.close_modal(id);
+            }
+            AddOutcome::Cancel => self.close_modal(id),
         }
     }
 
     /// Runs what commands asked for while they had no event loop at hand.
     fn apply_requests(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(kind) = self.open_request.take() {
-            self.open_modal(event_loop, kind);
+        match self.open_request.take() {
+            Some(OpenRequest::AddDownloads { prefill, expand_checked }) => {
+                self.open_add_downloads(event_loop, prefill, expand_checked);
+            }
+            None => {}
         }
         if self.exit_requested {
             event_loop.exit();
@@ -677,61 +698,5 @@ impl ApplicationHandler<UserEvent> for GuiApp {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use egui_kittest::{Harness, kittest::Queryable};
-    use std::{cell::Cell, rc::Rc};
-
-    fn dialog() -> (Harness<'static, ()>, Rc<Cell<u8>>) {
-        // 0 = still open, 1 = accepted, 2 = cancelled.
-        let state = Rc::new(Cell::new(0u8));
-        let tr = Tr::load("en-US");
-        let out = state.clone();
-        let harness = Harness::builder()
-            .with_size(egui::vec2(400.0, 300.0))
-            .build_ui(move |ui| match add_dialog_ui(ui, &tr) {
-                DialogOutcome::Keep => {}
-                DialogOutcome::Accept => out.set(1),
-                DialogOutcome::Cancel => out.set(2),
-            });
-        (harness, state)
-    }
-
-    #[test]
-    fn ok_button_accepts() {
-        let (mut harness, state) = dialog();
-        harness.run();
-        assert_eq!(state.get(), 0);
-        harness.get_by_label("OK").click();
-        harness.run();
-        assert_eq!(state.get(), 1);
-    }
-
-    #[test]
-    fn cancel_button_and_esc_cancel() {
-        let (mut harness, state) = dialog();
-        harness.run();
-        harness.get_by_label("Cancel").click();
-        harness.run();
-        assert_eq!(state.get(), 2);
-
-        let (mut harness, state) = dialog();
-        harness.run();
-        harness.key_press(egui::Key::Escape);
-        harness.run();
-        assert_eq!(state.get(), 2);
-    }
-
-    #[test]
-    fn enter_accepts_only_while_nothing_has_focus() {
-        let (mut harness, state) = dialog();
-        harness.run();
-        harness.key_press(egui::Key::Enter);
-        harness.run();
-        assert_eq!(state.get(), 1);
     }
 }

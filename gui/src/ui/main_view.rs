@@ -84,8 +84,6 @@ pub struct MainView {
 
 impl MainView {
     /// Folder that new downloads go to.
-    // Read by the add flows.
-    #[allow(dead_code)]
     pub fn target_folder(&self) -> Option<&str> {
         self.target_folder.as_deref()
     }
