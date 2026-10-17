@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod bridge;
 mod event;
 mod i18n;
 mod window;
@@ -48,7 +49,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("create event loop")?;
-    let mut app = app::GuiApp::new(event_loop.create_proxy(), tr);
+    let mut app = app::GuiApp::new(rt.handle().clone(), core, tr, event_loop.create_proxy());
     let run_result = event_loop.run_app(&mut app);
 
     // The loop is done, so blocking here cannot stall the UI.
@@ -58,7 +59,6 @@ fn main() -> Result<()> {
     }
 
     drop(app);
-    drop(core);
     rt.shutdown_timeout(Duration::from_secs(3));
 
     run_result.context("event loop")

@@ -2,3 +2,4 @@
 # Shared strings stay in the other files; add a key here only when the GUI needs its own.
 
 gui-app-title = ggg
+gui-snapshot-summary = { $tasks } tasks in { $folders } folders

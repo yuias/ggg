@@ -28,8 +28,6 @@ impl Tr {
         self.0.get(key)
     }
 
-    // Used by later views that interpolate values.
-    #[allow(dead_code)]
     pub fn t_args(&self, key: &str, args: &FluentArgs) -> String {
         self.0.get_with_args(key, Some(args))
     }
