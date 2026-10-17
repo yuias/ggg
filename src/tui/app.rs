@@ -177,7 +177,7 @@ impl TuiApp {
                 } else {
                     // Non-text-input modes: register only if the paste is a downloadable URL.
                     let trimmed = text.trim();
-                    if Self::is_valid_download_url(trimmed) {
+                    if crate::util::url_input::is_valid_download_url(trimmed) {
                         tracing::info!("Paste recognized as URL in mode {:?}, queuing", self.state.ui_mode);
                         if let Err(e) = self.add_download_from_paste(trimmed).await {
                             tracing::error!("Failed to add download from paste: {}", e);
@@ -1105,7 +1105,7 @@ impl TuiApp {
             TextEdit::Submit => {
                 // Check if search query is actually a URL
                 let query = self.state.input_buffer.trim().to_string();
-                if Self::is_valid_download_url(&query) {
+                if crate::util::url_input::is_valid_download_url(&query) {
                     tracing::info!("Search input detected as URL, adding to download queue: {}", query);
                     if let Err(e) = self.add_download_from_paste(&query).await {
                         tracing::error!("Failed to add download from search: {}", e);
@@ -3011,18 +3011,6 @@ impl TuiApp {
         Ok(())
     }
 
-    /// Check if text is a valid URL with a scheme that can be downloaded
-    /// Uses url crate to validate, accepts schemes that reqwest can handle
-    fn is_valid_download_url(text: &str) -> bool {
-        match url::Url::parse(text) {
-            Ok(parsed) => {
-                // Check if scheme is supported by our HTTP client (reqwest)
-                matches!(parsed.scheme(), "http" | "https" | "ftp" | "ftps")
-            }
-            Err(_) => false,
-        }
-    }
-
     /// Add download task and auto-start if folder setting enabled
     async fn add_download_with_auto_start(&mut self, task: crate::download::task::DownloadTask) -> Result<()> {
         let folder_id = task.folder_id.clone();
@@ -3260,44 +3248,6 @@ fn auto_launch_ggg_dnd(pipe_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_valid_download_url_http() {
-        assert!(TuiApp::is_valid_download_url("http://example.com/file.zip"));
-        assert!(TuiApp::is_valid_download_url("https://example.com/file.zip"));
-    }
-
-    #[test]
-    fn test_is_valid_download_url_ftp() {
-        assert!(TuiApp::is_valid_download_url("ftp://example.com/file.zip"));
-        assert!(TuiApp::is_valid_download_url("ftps://example.com/file.zip"));
-    }
-
-    #[test]
-    fn test_is_valid_download_url_invalid_scheme() {
-        assert!(!TuiApp::is_valid_download_url("javascript:alert('test')"));
-        assert!(!TuiApp::is_valid_download_url("data:text/plain,hello"));
-        assert!(!TuiApp::is_valid_download_url("file:///etc/passwd"));
-        assert!(!TuiApp::is_valid_download_url("mailto:user@example.com"));
-    }
-
-    #[test]
-    fn test_is_valid_download_url_malformed() {
-        assert!(!TuiApp::is_valid_download_url("not a url"));
-        assert!(!TuiApp::is_valid_download_url("htp://typo.com"));
-        assert!(!TuiApp::is_valid_download_url("://missing-scheme.com"));
-        assert!(!TuiApp::is_valid_download_url(""));
-    }
-
-    #[test]
-    fn test_is_valid_download_url_with_query_and_fragment() {
-        assert!(TuiApp::is_valid_download_url(
-            "https://example.com/file.zip?download=true#section"
-        ));
-        assert!(TuiApp::is_valid_download_url(
-            "http://example.com/path/to/file?param1=value1&param2=value2"
-        ));
-    }
 
     /// Builds a `TuiApp` in memory only; no config/queue/history I/O happens,
     /// so this needs no `set_config_dir_override`.
