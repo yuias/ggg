@@ -26,6 +26,7 @@ gui-statusbar-items = { $count ->
 }
 gui-statusbar-selected = { $count } selected
 gui-statusbar-active = { $count } active
+gui-statusbar-pipe-tooltip = Receiving links from ggg-dnd and the browser extension on { $name }
 
 # Status bar messages for finished actions
 gui-status-toggled = { $count ->

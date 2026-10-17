@@ -171,6 +171,7 @@ impl MainView {
         tr: &Tr,
         config: &mut GuiConfig,
         status: Option<&str>,
+        pipe_name: Option<&str>,
         env: ViewEnv,
     ) -> ViewOutput {
         self.env = env;
@@ -204,13 +205,24 @@ impl MainView {
         let pasted = pressed.pasted;
         let summary = status_summary(snapshot, rows.len(), self.selection.len(), tr);
 
+        let pipe_tip = pipe_name.map(|name| {
+            let mut args = FluentArgs::new();
+            args.set("name", name);
+            tr.t_args("gui-statusbar-pipe-tooltip", &args)
+        });
         Panel::bottom("status_bar").show(ui, |ui| {
             ui.horizontal(|ui| {
+                let with_tip = |response: egui::Response| match &pipe_tip {
+                    Some(tip) => {
+                        response.on_hover_text(tip);
+                    }
+                    None => {}
+                };
                 if let Some(status) = status {
-                    ui.label(status);
+                    with_tip(ui.label(status));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(summary);
+                    with_tip(ui.label(summary));
                 });
             });
         });
@@ -722,7 +734,7 @@ mod tests {
         Harness::builder()
             .with_size(egui::vec2(900.0, 600.0))
             .build_ui(move |ui| {
-                view.show(ui, &snapshot, &tr, &mut config, None, ViewEnv::default());
+                view.show(ui, &snapshot, &tr, &mut config, None, None, ViewEnv::default());
             })
     }
 
@@ -820,7 +832,7 @@ mod tests {
         Harness::builder()
             .with_size(size)
             .build_ui(move |ui| {
-                view.show(ui, &snapshot, &tr, &mut config.borrow_mut(), None, ViewEnv::default());
+                view.show(ui, &snapshot, &tr, &mut config.borrow_mut(), None, None, ViewEnv::default());
             })
     }
 
@@ -1083,7 +1095,7 @@ mod tests {
             .with_size(egui::vec2(900.0, 600.0))
             .build_ui(move |ui| {
                 let env = ViewEnv { undo_depth: undo_depth.get(), os_modal_open: false };
-                let out = view.borrow_mut().show(ui, &snapshot, &tr, &mut config, None, env);
+                let out = view.borrow_mut().show(ui, &snapshot, &tr, &mut config, None, None, env);
                 actions.borrow_mut().extend(out.actions);
                 commands.borrow_mut().extend(out.commands);
                 pasted.borrow_mut().extend(out.pasted);

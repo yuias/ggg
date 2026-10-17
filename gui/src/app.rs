@@ -70,6 +70,9 @@ pub struct GuiApp {
     #[allow(dead_code)]
     core: Core,
     snapshot: SnapshotHandle,
+    /// Pipe that ggg-dnd and the bridge send links to; set once at start-up.
+    /// `None` where there is no pipe server.
+    pipe_name: Option<String>,
     actions: Actions,
     results: ActionResults,
     /// Text for the status bar; replaced by each finished action.
@@ -125,6 +128,7 @@ impl GuiApp {
                 let _ = action_proxy.send_event(UserEvent::ActionDone);
             },
         );
+        let pipe_name = start_ipc(&rt, &core, &proxy);
         Self {
             proxy,
             tr,
@@ -132,6 +136,7 @@ impl GuiApp {
             rt,
             core,
             snapshot,
+            pipe_name,
             actions,
             results,
             status: None,
@@ -198,6 +203,7 @@ impl GuiApp {
     fn draw_main(&mut self) {
         self.drain_results();
         let status = self.status.clone();
+        let pipe_name = self.pipe_name.clone();
         let env = ViewEnv {
             undo_depth: self.undo.len(),
             os_modal_open: self.modal.is_some(),
@@ -218,7 +224,7 @@ impl GuiApp {
         };
         let mut output = ViewOutput::default();
         main.redraw(|ui| {
-            output = view.show(ui, &snapshot, tr, gui_config, status.as_deref(), env);
+            output = view.show(ui, &snapshot, tr, gui_config, status.as_deref(), pipe_name.as_deref(), env);
         });
         if let Some(menu) = menu {
             menu.sync(&view.command_context(), gui_config.details_visible);
@@ -398,6 +404,44 @@ impl GuiApp {
             | GuiCommand::About => {}
         }
     }
+}
+
+/// Starts the pipe server for ggg-dnd and the browser bridge and returns the
+/// pipe name it bound. Links arrive as `UserEvent::IpcText`, so nothing here
+/// blocks the event loop.
+#[cfg(windows)]
+fn start_ipc(rt: &Handle, core: &Core, proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
+    use ggg::ipc::pipe_server::{IpcEvent, start_pipe_server};
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(32);
+    // `start_pipe_server` spawns its accept loop and needs the runtime context.
+    let pipe_name = {
+        let _enter = rt.enter();
+        let (pipe_name, _server) = start_pipe_server(event_tx);
+        pipe_name
+    };
+    tracing::info!("IPC pipe server started: {pipe_name}");
+
+    let proxy = proxy.clone();
+    rt.spawn(async move {
+        while let Some(IpcEvent::UrlReceived(text)) = event_rx.recv().await {
+            // The loop is gone during shutdown; stop forwarding then.
+            if proxy.send_event(UserEvent::IpcText(text)).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Not inside a loop callback: the config read is a one-off at start-up.
+    if rt.block_on(core.state.config.read()).general.auto_launch_dnd {
+        ggg::ipc::dnd_launch::auto_launch_ggg_dnd(&pipe_name);
+    }
+    Some(pipe_name)
+}
+
+#[cfg(not(windows))]
+fn start_ipc(_rt: &Handle, _core: &Core, _proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
+    None
 }
 
 /// Puts the menu on the window and keeps the client size, so the status bar
@@ -781,6 +825,14 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                     main.window.request_redraw();
                 }
             }
+            UserEvent::IpcText(text) => {
+                tracing::info!("received {} byte(s) over the IPC pipe", text.len());
+                self.register(Source::Ipc, &text);
+                self.apply_requests(event_loop);
+                if let Some(main) = self.main_window() {
+                    main.window.request_redraw();
+                }
+            }
             UserEvent::Menu { id, shift } => {
                 let Some(menu) = self.menu.as_mut() else {
                     return;
@@ -823,6 +875,16 @@ impl ApplicationHandler<UserEvent> for GuiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipe_tooltip_names_the_pipe_in_every_locale() {
+        for language in ["en-US", "ja-JP"] {
+            let mut args = FluentArgs::new();
+            args.set("name", r"\\.\pipe\ggg-dnd-42");
+            let text = Tr::load(language).t_args("gui-statusbar-pipe-tooltip", &args);
+            assert!(text.contains(r"\\.\pipe\ggg-dnd-42"), "{language}: {text:?}");
+        }
+    }
 
     #[test]
     fn registration_statuses_exist_in_every_locale() {

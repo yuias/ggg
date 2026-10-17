@@ -23,6 +23,7 @@ gui-details-label-progress = 進捗:
 gui-statusbar-items = { $count } 項目
 gui-statusbar-selected = { $count } 項目を選択
 gui-statusbar-active = ダウンロード中 { $count } 件
+gui-statusbar-pipe-tooltip = ggg-dnd とブラウザー拡張機能からのリンクを { $name } で受け付けています
 
 # Status bar messages for finished actions
 gui-status-toggled = { $count } 件のダウンロードを開始または一時停止しました。

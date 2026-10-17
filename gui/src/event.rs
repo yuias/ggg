@@ -19,4 +19,8 @@ pub enum UserEvent {
     // Only the Windows drop target sends it.
     #[cfg_attr(not(windows), allow(dead_code))]
     Drop(DropPayload),
+    /// URL text received on the ggg-dnd / bridge pipe.
+    // Only the Windows pipe server sends it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    IpcText(String),
 }
