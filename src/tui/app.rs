@@ -3043,6 +3043,14 @@ pub async fn run_tui(
                             break;
                         }
                     }
+                    // The TUI has no window to raise; only the URLs matter.
+                    crate::ipc::pipe_server::IpcEvent::Activate(urls) => {
+                        for url in urls {
+                            if ipc_tx.send(TuiEvent::IpcUrl(url)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
                 }
             }
         });

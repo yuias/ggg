@@ -480,9 +480,13 @@ fn start_ipc(rt: &Handle, proxy: &EventLoopProxy<UserEvent>) -> Option<String> {
 
     let proxy = proxy.clone();
     rt.spawn(async move {
-        while let Some(IpcEvent::UrlReceived(text)) = event_rx.recv().await {
+        while let Some(event) = event_rx.recv().await {
+            let event = match event {
+                IpcEvent::UrlReceived(text) => UserEvent::IpcText(text),
+                IpcEvent::Activate(urls) => UserEvent::Activate(urls),
+            };
             // The loop is gone during shutdown; stop forwarding then.
-            if proxy.send_event(UserEvent::IpcText(text)).is_err() {
+            if proxy.send_event(event).is_err() {
                 break;
             }
         }
@@ -832,6 +836,16 @@ impl GuiApp {
         }
     }
 
+    /// Registers URL text that arrived over the link pipe.
+    fn receive_ipc_text(&mut self, event_loop: &ActiveEventLoop, text: &str) {
+        tracing::info!("received {} byte(s) over the IPC pipe", text.len());
+        self.register(Source::Ipc, text);
+        self.apply_requests(event_loop);
+        if let Some(main) = self.main_window() {
+            main.window.request_redraw();
+        }
+    }
+
     /// Runs what commands asked for while they had no event loop at hand.
     fn apply_requests(&mut self, event_loop: &ActiveEventLoop) {
         match self.open_request.take() {
@@ -1046,12 +1060,10 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                     main.window.request_redraw();
                 }
             }
-            UserEvent::IpcText(text) => {
-                tracing::info!("received {} byte(s) over the IPC pipe", text.len());
-                self.register(Source::Ipc, &text);
-                self.apply_requests(event_loop);
-                if let Some(main) = self.main_window() {
-                    main.window.request_redraw();
+            UserEvent::IpcText(text) => self.receive_ipc_text(event_loop, &text),
+            UserEvent::Activate(urls) => {
+                if !urls.is_empty() {
+                    self.receive_ipc_text(event_loop, &urls.join("\n"));
                 }
             }
             UserEvent::Menu { id, shift } => {

@@ -23,4 +23,8 @@ pub enum UserEvent {
     // Only the Windows pipe server sends it.
     #[cfg_attr(not(windows), allow(dead_code))]
     IpcText(String),
+    /// Another start of the GUI asked this one to come forward and add URLs.
+    // Only the Windows pipe server sends it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Activate(Vec<String>),
 }
