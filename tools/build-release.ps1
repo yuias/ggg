@@ -95,7 +95,7 @@ function New-Package {
         # Helpers must sit next to ggg: `ggg bridge install` and ggg-dnd
         # auto-launch both look in the directory of the ggg executable.
         $binaries = @("ggg$ExeSuffix")
-        if ($IsWindows) { $binaries += @("ggg-dnd$ExeSuffix", "ggg-bridge$ExeSuffix") }
+        if ($IsWindows) { $binaries += @("ggg-dnd$ExeSuffix", "ggg-bridge$ExeSuffix", "ggg-gui$ExeSuffix") }
         foreach ($bin in $binaries) {
             $src = Join-Path $ReleaseDir $bin
             if (-not (Test-Path $src -PathType Leaf)) { throw "Missing build output: $src" }
