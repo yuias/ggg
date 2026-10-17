@@ -8,10 +8,16 @@
 //! response is wrapped and sent back over stdout. The host stays alive
 //! until stdin reaches EOF, so it works with both `sendNativeMessage`
 //! (one-shot) and `connectNative` (persistent port) on the extension side.
+//!
+//! When no ggg process serves the default pipe, the bridge starts the
+//! `ggg-gui.exe` next to its own executable and retries (see `launch`).
+
+mod launch;
 
 use ggg_ipc::{ClientError, IpcRequest, IpcResponse};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
+use std::time::Duration;
 
 /// Inbound message from the Chrome extension.
 ///
@@ -91,7 +97,7 @@ fn handle_payload(payload: &[u8]) -> BridgeResponse {
         BridgeRequest::Ping { pipe } => (resolve_pipe(pipe), IpcRequest::Ping),
     };
 
-    match ggg_ipc::send_request(&pipe_name, &ipc_request) {
+    match send_starting_gui(&pipe_name, &ipc_request) {
         Ok(IpcResponse::Ok { message }) => BridgeResponse::Ok { message },
         Ok(IpcResponse::Pong) => BridgeResponse::Pong,
         Ok(IpcResponse::Error { message }) => BridgeResponse::Error { message },
@@ -102,6 +108,44 @@ fn handle_payload(payload: &[u8]) -> BridgeResponse {
             message: e.to_string(),
         },
     }
+}
+
+/// Send the request; if nothing serves the default pipe, start the sibling GUI
+/// once, wait for it to answer and send the request again.
+///
+/// Only a missing pipe starts the GUI: a busy or foreign-owned pipe means some
+/// process is there already, and a `pipe` override from the extension never
+/// starts anything.
+fn send_starting_gui(
+    pipe_name: &str,
+    request: &IpcRequest,
+) -> Result<IpcResponse, ClientError> {
+    let err = match ggg_ipc::send_request(pipe_name, request) {
+        Err(ClientError::Connect(e))
+            if e.kind() == io::ErrorKind::NotFound && pipe_name == ggg_ipc::default_pipe_name() =>
+        {
+            e
+        }
+        other => return other,
+    };
+
+    if launch::launch_gui() && wait_for_pong(pipe_name) {
+        return ggg_ipc::send_request(pipe_name, request);
+    }
+    Err(ClientError::Connect(err))
+}
+
+fn wait_for_pong(pipe_name: &str) -> bool {
+    launch::wait_until(
+        || {
+            matches!(
+                ggg_ipc::send_request_timeout(pipe_name, &IpcRequest::Ping, Duration::from_secs(1)),
+                Ok(IpcResponse::Pong)
+            )
+        },
+        launch::LAUNCH_WAIT,
+        launch::POLL_INTERVAL,
+    )
 }
 
 /// Resolve the target pipe name. The `pipe` field comes from untrusted
