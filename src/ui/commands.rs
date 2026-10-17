@@ -57,7 +57,7 @@ pub enum Command {
 /// Variants carry machine-readable data rather than pre-translated strings, so
 /// the command layer stays free of any i18n / presentation dependency. The
 /// display layer is responsible for turning a `CommandError` into a localized,
-/// user-facing message (the TUI does this in `tui::localize_command_error`).
+/// user-facing message (`ui::command_i18n::localize_command_error` does this for every front end).
 /// The [`std::fmt::Display`] impl provides a plain-English fallback suitable for
 /// logging or for consumers without a translation catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
