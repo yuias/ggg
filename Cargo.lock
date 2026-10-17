@@ -2035,6 +2035,7 @@ dependencies = [
  "egui-winit",
  "egui_extras",
  "egui_system_font_provider",
+ "fluent-bundle",
  "ggg",
  "pollster",
  "raw-window-handle",

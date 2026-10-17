@@ -2,6 +2,7 @@
 
 mod app;
 mod event;
+mod i18n;
 mod window;
 
 use anyhow::{Context as _, Result};
@@ -41,11 +42,13 @@ fn main() -> Result<()> {
     // Core start-up needs the runtime context; blocking is fine before the loop starts.
     let core = rt.block_on(ggg::app::bootstrap::init_core())?;
     let manager = core.manager.clone();
+    let language = rt.block_on(core.state.config.read()).general.language.clone();
+    let tr = i18n::Tr::load(&language);
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("create event loop")?;
-    let mut app = app::GuiApp::new(event_loop.create_proxy());
+    let mut app = app::GuiApp::new(event_loop.create_proxy(), tr);
     let run_result = event_loop.run_app(&mut app);
 
     // The loop is done, so blocking here cannot stall the UI.

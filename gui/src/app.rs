@@ -2,6 +2,7 @@
 
 use crate::{
     event::UserEvent,
+    i18n::Tr,
     window::{OsWindow, main_window_attributes},
 };
 use std::time::Instant;
@@ -14,15 +15,17 @@ use winit::{
 
 pub struct GuiApp {
     proxy: EventLoopProxy<UserEvent>,
+    tr: Tr,
     main: Option<OsWindow>,
     /// Earliest delayed repaint requested by egui, if any.
     repaint_at: Option<Instant>,
 }
 
 impl GuiApp {
-    pub fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub fn new(proxy: EventLoopProxy<UserEvent>, tr: Tr) -> Self {
         Self {
             proxy,
+            tr,
             main: None,
             repaint_at: None,
         }
@@ -50,7 +53,7 @@ impl ApplicationHandler<UserEvent> for GuiApp {
         }
         match OsWindow::new(
             event_loop,
-            main_window_attributes("ggg"),
+            main_window_attributes(&self.tr.t("gui-app-title")),
             self.proxy.clone(),
         ) {
             Ok(window) => {
