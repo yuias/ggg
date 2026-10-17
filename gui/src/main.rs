@@ -11,6 +11,7 @@ mod menu;
 mod platform;
 mod registration;
 mod render;
+mod settings;
 mod shortcuts;
 mod ui;
 mod window;
