@@ -20,6 +20,18 @@ use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+/// Target name for a completion script's `newFilename`, or `None` when the
+/// rename must not happen: the user chose the name when adding, and that
+/// choice wins over a script. Scripts are untrusted, so the result is
+/// sanitized to a bare file name that cannot escape the download directory.
+fn script_rename_target(task: &DownloadTask, new_name: &str) -> Option<String> {
+    if task.user_filename.is_some() {
+        return None;
+    }
+    let safe_name = sanitize_filename(new_name);
+    (!safe_name.is_empty()).then_some(safe_name)
+}
+
 /// Lifecycle events broadcast by the [`DownloadManager`].
 ///
 /// Consumers (TUI, GUI, …) can `subscribe()` to react to state changes without
@@ -878,7 +890,15 @@ impl DownloadManager {
         // would silently discard that dedup and point the resume at an
         // unrelated file that happens to have the original name.
         if !is_resuming {
-            if let Some(server_filename) = info.filename {
+            if let Some(ref user_filename) = task.user_filename {
+                // Re-based on every fresh start: the stored `filename` may
+                // carry a dedupe suffix that was only valid in a directory
+                // the task has since left. Sanitized here as well because a
+                // queue.toml can hold any value, and the name is joined onto
+                // the save directory.
+                task.filename = sanitize_filename(user_filename);
+                task.log_info(format!("Filename chosen by user: {}", task.filename));
+            } else if let Some(server_filename) = info.filename {
                 task.filename = sanitize_filename(&server_filename);
                 task.log_info(format!("Filename from server: {}", task.filename));
             } else if let Some(ref final_url) = info.final_url {
@@ -1286,31 +1306,42 @@ impl DownloadManager {
                     // sanitize_filename strips path separators and other unsafe
                     // characters, preventing the rename from escaping file_dir.
                     if let Some(new_name) = modified_ctx.new_filename {
-                        let safe_name = sanitize_filename(&new_name);
-                        if safe_name.is_empty() {
-                            task.log_warn(format!(
-                                "Script newFilename '{}' rejected (empty after sanitization)",
-                                new_name
-                            ));
-                        } else {
-                            // Check for collision with existing files before renaming
-                            let final_name =
-                                crate::file::naming::ensure_unique_filename(&file_dir, &safe_name);
-                            let new_path = file_dir.join(&final_name);
-                            tracing::debug!(
-                                from = ?file_path_for_ops,
-                                to = ?new_path,
-                                "Renaming file by script"
-                            );
-                            if let Err(e) = std::fs::rename(&file_path_for_ops, &new_path) {
-                                tracing::error!(
+                        match script_rename_target(&task, &new_name) {
+                            // moveToPath below still applies: it changes the
+                            // directory, not the name.
+                            None if task.user_filename.is_some() => {
+                                task.log_info(format!(
+                                    "Script newFilename '{}' ignored: file name chosen by user",
+                                    new_name
+                                ));
+                            }
+                            None => {
+                                task.log_warn(format!(
+                                    "Script newFilename '{}' rejected (empty after sanitization)",
+                                    new_name
+                                ));
+                            }
+                            Some(safe_name) => {
+                                // Check for collision with existing files before renaming
+                                let final_name = crate::file::naming::ensure_unique_filename(
+                                    &file_dir, &safe_name,
+                                );
+                                let new_path = file_dir.join(&final_name);
+                                tracing::debug!(
                                     from = ?file_path_for_ops,
                                     to = ?new_path,
-                                    "Failed to rename file: {}", e
+                                    "Renaming file by script"
                                 );
-                            } else {
-                                task.filename = final_name;
-                                task.log_info("File renamed by script".to_string());
+                                if let Err(e) = std::fs::rename(&file_path_for_ops, &new_path) {
+                                    tracing::error!(
+                                        from = ?file_path_for_ops,
+                                        to = ?new_path,
+                                        "Failed to rename file: {}", e
+                                    );
+                                } else {
+                                    task.filename = final_name;
+                                    task.log_info("File renamed by script".to_string());
+                                }
                             }
                         }
                     }
@@ -3720,6 +3751,312 @@ mod tests {
         );
         let content = std::fs::read(temp_dir.path().join(&siblings[0])).unwrap();
         assert_eq!(content, full_data);
+    }
+
+    /// Points the config directory at a scratch directory for the lifetime of
+    /// the guard. Completing a download appends to the completion log under
+    /// the config directory, and an unredirected test once wiped real user
+    /// folders. Resetting in `Drop` also covers a failing assertion.
+    struct ConfigIsolation {
+        _dir: tempfile::TempDir,
+    }
+
+    impl ConfigIsolation {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            crate::util::paths::set_config_dir_override(Some(dir.path().to_path_buf()));
+            unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+            Self { _dir: dir }
+        }
+    }
+
+    impl Drop for ConfigIsolation {
+        fn drop(&mut self) {
+            crate::util::paths::set_config_dir_override(None);
+            unsafe { std::env::remove_var("GGG_TEST_MODE") };
+        }
+    }
+
+    const USER_FILENAME_BODY: &[u8] = b"complete file contents";
+
+    /// Mounts a HEAD + GET pair for `request_path`; the HEAD optionally
+    /// carries a Content-Disposition header.
+    async fn mount_user_filename_server(
+        server: &wiremock::MockServer,
+        request_path: &str,
+        content_disposition: Option<&str>,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let mut head = ResponseTemplate::new(200)
+            .append_header("Content-Length", USER_FILENAME_BODY.len().to_string())
+            .append_header("Accept-Ranges", "bytes")
+            .append_header("ETag", "\"v1\"");
+        if let Some(value) = content_disposition {
+            head = head.append_header("Content-Disposition", value);
+        }
+        Mock::given(method("HEAD"))
+            .and(path(request_path))
+            .respond_with(head)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(request_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(USER_FILENAME_BODY.to_vec())
+                    .append_header("Content-Length", USER_FILENAME_BODY.len().to_string())
+                    .append_header("Accept-Ranges", "bytes")
+                    .append_header("ETag", "\"v1\""),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Starts `id` and waits for its `Completed` event.
+    async fn start_and_wait_completed(manager: &DownloadManager, id: Uuid) {
+        let mut events = manager.subscribe();
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        assert_eq!(
+            manager
+                .start_download(id, None, config)
+                .await
+                .expect("start must succeed"),
+            StartOutcome::Started
+        );
+        let wait_for_completed = async {
+            loop {
+                match events.recv().await {
+                    Ok(DownloadEvent::Completed { task_id }) if task_id == id => return,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event channel closed before Completed: {e}"),
+                }
+            }
+        };
+        tokio::time::timeout(tokio::time::Duration::from_secs(10), wait_for_completed)
+            .await
+            .expect("did not observe Completed within timeout");
+    }
+
+    fn file_names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn user_filename_overrides_content_disposition() {
+        let _isolation = ConfigIsolation::new();
+        let mock_server = wiremock::MockServer::start().await;
+        mount_user_filename_server(
+            &mock_server,
+            "/download",
+            Some("attachment; filename=\"server.bin\""),
+        )
+        .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/download", mock_server.uri()),
+            temp_dir.path().to_path_buf(),
+        );
+        task.folder_id = "folder1".to_string();
+        task.set_user_filename("mine.bin".to_string());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        start_and_wait_completed(&manager, id).await;
+
+        assert_eq!(file_names_in(temp_dir.path()), vec!["mine.bin".to_string()]);
+        assert_eq!(
+            std::fs::read(temp_dir.path().join("mine.bin")).unwrap(),
+            USER_FILENAME_BODY
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn user_filename_with_path_components_stays_in_save_dir() {
+        let _isolation = ConfigIsolation::new();
+        let mock_server = wiremock::MockServer::start().await;
+        mount_user_filename_server(&mock_server, "/download", None).await;
+
+        let parent = tempfile::tempdir().unwrap();
+        let save_dir = parent.path().join("save");
+        std::fs::create_dir(&save_dir).unwrap();
+
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/download", mock_server.uri()),
+            save_dir.clone(),
+        );
+        task.folder_id = "folder1".to_string();
+        // Set directly: a queue.toml can carry any value, so the download path
+        // must not trust the field.
+        task.user_filename = Some(format!("..{}escaped.bin", std::path::MAIN_SEPARATOR));
+        let id = task.id;
+        manager.add_download(task).await;
+
+        start_and_wait_completed(&manager, id).await;
+
+        assert_eq!(
+            file_names_in(parent.path()),
+            vec!["save".to_string()],
+            "nothing may be written next to the save directory"
+        );
+        let saved = file_names_in(&save_dir);
+        assert_eq!(saved.len(), 1, "expected one file in the save dir, got {saved:?}");
+        assert!(saved[0].contains("escaped.bin"), "unexpected name {}", saved[0]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn user_filename_overrides_redirect_name() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let _isolation = ConfigIsolation::new();
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/download"))
+            .respond_with(
+                ResponseTemplate::new(302).append_header("Location", "/other/name.bin"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(
+                ResponseTemplate::new(302).append_header("Location", "/other/name.bin"),
+            )
+            .mount(&mock_server)
+            .await;
+        mount_user_filename_server(&mock_server, "/other/name.bin", None).await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/download", mock_server.uri()),
+            temp_dir.path().to_path_buf(),
+        );
+        task.folder_id = "folder1".to_string();
+        task.set_user_filename("mine.bin".to_string());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        start_and_wait_completed(&manager, id).await;
+
+        assert_eq!(file_names_in(temp_dir.path()), vec!["mine.bin".to_string()]);
+        assert_eq!(
+            std::fs::read(temp_dir.path().join("mine.bin")).unwrap(),
+            USER_FILENAME_BODY
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn user_filename_is_deduped_against_existing_file() {
+        let _isolation = ConfigIsolation::new();
+        let mock_server = wiremock::MockServer::start().await;
+        mount_user_filename_server(&mock_server, "/download", None).await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("mine.bin"), b"older file").unwrap();
+
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/download", mock_server.uri()),
+            temp_dir.path().to_path_buf(),
+        );
+        task.folder_id = "folder1".to_string();
+        task.set_user_filename("mine.bin".to_string());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        start_and_wait_completed(&manager, id).await;
+
+        assert_eq!(
+            std::fs::read(temp_dir.path().join("mine.bin")).unwrap(),
+            b"older file",
+            "the pre-existing file must stay untouched"
+        );
+        // A completed task leaves the queue, so the final name is read from
+        // the directory.
+        let deduped: Vec<String> = file_names_in(temp_dir.path())
+            .into_iter()
+            .filter(|name| name != "mine.bin")
+            .collect();
+        assert_eq!(deduped.len(), 1, "expected one deduped file, got {deduped:?}");
+        assert!(
+            deduped[0].starts_with("mine[") && deduped[0].ends_with("].bin"),
+            "expected a deduped name, got {}",
+            deduped[0]
+        );
+        assert_eq!(
+            std::fs::read(temp_dir.path().join(&deduped[0])).unwrap(),
+            USER_FILENAME_BODY
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn user_filename_rebased_after_change_save_path() {
+        let _isolation = ConfigIsolation::new();
+        let mock_server = wiremock::MockServer::start().await;
+        mount_user_filename_server(&mock_server, "/download", None).await;
+
+        let old_dir = tempfile::tempdir().unwrap();
+        let new_dir = tempfile::tempdir().unwrap();
+        let manager = DownloadManager::with_retry_settings(3, 0);
+        let mut task = DownloadTask::new(
+            format!("{}/download", mock_server.uri()),
+            old_dir.path().to_path_buf(),
+        );
+        task.folder_id = "folder1".to_string();
+        // The stored name carries a dedupe suffix that was only needed in the
+        // old directory.
+        task.filename = "mine[123].bin".to_string();
+        task.user_filename = Some("mine.bin".to_string());
+        let id = task.id;
+        manager.add_download(task).await;
+
+        manager
+            .change_save_path(id, new_dir.path().to_path_buf())
+            .await
+            .expect("pending task accepts a new save path");
+
+        start_and_wait_completed(&manager, id).await;
+
+        assert_eq!(file_names_in(new_dir.path()), vec!["mine.bin".to_string()]);
+        assert!(file_names_in(old_dir.path()).is_empty());
+    }
+
+    #[test]
+    fn script_rename_skipped_for_user_filename() {
+        let mut task = DownloadTask::new("https://host/f.bin".to_string(), ".".into());
+        task.set_user_filename("mine.bin".to_string());
+        assert_eq!(script_rename_target(&task, "script.bin"), None);
+    }
+
+    #[test]
+    fn script_rename_applies_without_user_filename() {
+        let task = DownloadTask::new("https://host/f.bin".to_string(), ".".into());
+        assert_eq!(
+            script_rename_target(&task, "script.bin"),
+            Some("script.bin".to_string())
+        );
+        // Scripts are untrusted: the target is a bare, sanitized file name.
+        assert_eq!(
+            script_rename_target(&task, "../evil.bin"),
+            Some(sanitize_filename("../evil.bin"))
+        );
     }
 
     /// The other route into the same hazard: an earlier attempt fails before

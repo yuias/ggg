@@ -297,6 +297,7 @@ mod tests {
             last_status_code: None,
             retry_count: 0,
             filename_settled: false,
+            user_filename: None,
         }
     }
 

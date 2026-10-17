@@ -78,6 +78,13 @@ pub struct DownloadTask {
     /// the field) default to `false`, the safe choice.
     #[serde(default)]
     pub filename_settled: bool,
+    /// File name the user chose when adding (GUI "Save as"). When set, a fresh
+    /// start uses it instead of the server/redirect name; it is still deduped
+    /// against existing files. Kept separately from `filename` because that
+    /// field may carry a dedupe suffix valid only in an earlier directory.
+    /// `#[serde(default)]`: an older queue.toml loads as `None`.
+    #[serde(default)]
+    pub user_filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +142,7 @@ impl DownloadTask {
             retry_count: 0,
             last_status_code: None,
             filename_settled: false,
+            user_filename: None,
         };
         task.logs.push(LogEntry::info("Download task created"));
         task
@@ -186,9 +194,19 @@ impl DownloadTask {
             retry_count: 0,
             last_status_code: None,
             filename_settled: false,
+            user_filename: None,
         };
         task.logs.push(LogEntry::info(format!("Download task created in folder '{}'", folder_id)));
         task
+    }
+
+    /// Records a user-chosen file name, sanitized to a bare file name so it
+    /// cannot leave the save directory. `filename` is set too so the queue
+    /// shows the chosen name before the download starts.
+    pub fn set_user_filename(&mut self, name: String) {
+        let safe_name = crate::file::naming::sanitize_filename(&name);
+        self.filename = safe_name.clone();
+        self.user_filename = Some(safe_name);
     }
 
     /// Add an info log entry
@@ -341,5 +359,27 @@ mod header_tests {
         assert!(task.remove_header("x-test"));
         assert!(task.headers.is_empty());
         assert!(!task.remove_header("x-test"));
+    }
+}
+
+#[cfg(test)]
+mod user_filename_tests {
+    use super::{DownloadTask, PathBuf};
+
+    #[test]
+    fn queue_task_without_user_filename_deserializes_as_none() {
+        let mut task = DownloadTask::new("https://host/f.bin".to_string(), PathBuf::from("."));
+        task.set_user_filename("mine.bin".to_string());
+
+        let mut table = toml::Table::try_from(&task).expect("task serializes to a TOML table");
+        assert!(
+            table.remove("user_filename").is_some(),
+            "a task with a chosen name must serialize the key"
+        );
+        let legacy = toml::to_string(&table).expect("table serializes");
+
+        let loaded: DownloadTask = toml::from_str(&legacy).expect("older queue.toml still loads");
+        assert_eq!(loaded.user_filename, None);
+        assert_eq!(loaded.filename, "mine.bin");
     }
 }
