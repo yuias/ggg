@@ -14,3 +14,4 @@ pub mod dnd_launch;
 pub mod pipe_server;
 
 pub mod control;
+pub mod instance;
