@@ -109,6 +109,9 @@ gui-button-delete = Delete
 gui-button-move = Move
 gui-button-close = Close
 
+# Add Downloads dialog
+gui-add-title = Add Downloads
+
 # Confirmations
 gui-confirm-title = Confirm Delete
 gui-confirm-delete-folder = { $count ->

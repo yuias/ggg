@@ -1,7 +1,7 @@
 //! Win32 details that winit does not expose. Non-Windows builds get inert
 //! stand-ins so the rest of the crate needs no `cfg`.
 
-use winit::window::Window;
+use winit::window::{Window, WindowAttributes};
 
 use crate::event::UserEvent;
 
@@ -49,3 +49,32 @@ pub fn forward_menu_events(proxy: winit::event_loop::EventLoopProxy<UserEvent>) 
 
 #[cfg(not(windows))]
 pub fn forward_menu_events(_proxy: winit::event_loop::EventLoopProxy<UserEvent>) {}
+
+/// Makes the window an owned popup of `owner`: it stays above it, shares its
+/// taskbar entry and Alt+Tab group, and is destroyed with it.
+#[cfg(windows)]
+pub fn owned_by(attributes: WindowAttributes, owner: isize) -> WindowAttributes {
+    use winit::platform::windows::WindowAttributesExtWindows as _;
+    attributes.with_owner_window(owner)
+}
+
+#[cfg(not(windows))]
+pub fn owned_by(attributes: WindowAttributes, _owner: isize) -> WindowAttributes {
+    attributes
+}
+
+/// Enables or disables mouse and keyboard input of a window. The main window is
+/// disabled while a dialog it owns is open, which is what makes the dialog
+/// modal for the OS (a click on the disabled window beeps).
+#[cfg(windows)]
+pub fn set_enabled(hwnd: isize, enabled: bool) {
+    use windows::Win32::{Foundation::HWND, UI::Input::KeyboardAndMouse::EnableWindow};
+    // SAFETY: `hwnd` comes from a live winit window of this thread. A stale
+    // handle only makes the call fail.
+    unsafe {
+        let _ = EnableWindow(HWND(hwnd as *mut std::ffi::c_void), enabled);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_enabled(_hwnd: isize, _enabled: bool) {}

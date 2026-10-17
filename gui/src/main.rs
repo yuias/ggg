@@ -9,6 +9,7 @@ mod i18n;
 mod menu;
 mod platform;
 mod registration;
+mod render;
 mod shortcuts;
 mod ui;
 mod window;
@@ -75,7 +76,8 @@ fn main() -> Result<()> {
         tr,
         gui_config,
         event_loop.create_proxy(),
-    );
+    )
+    .with_gui_config_path(gui_config_path.clone());
     let run_result = event_loop.run_app(&mut app);
 
     // The loop is done, so blocking here cannot stall the UI.

@@ -1084,6 +1084,14 @@ mod tests {
         (harness, rig)
     }
 
+    #[test]
+    fn os_modal_window_disables_every_command() {
+        let mut view = MainView::default();
+        assert!(!view.command_context().modal_open);
+        view.env = ViewEnv { undo_depth: 0, os_modal_open: true };
+        assert!(view.command_context().modal_open);
+    }
+
     fn id_of(snapshot: &Snapshot, folder: &str, index: usize) -> Uuid {
         snapshot.folder_downloads[folder][index].id
     }

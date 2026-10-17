@@ -7,26 +7,53 @@ use crate::{
     },
     commands::{GuiCommand, find_task},
     event::UserEvent,
-    gui_config::GuiConfig,
+    gui_config::{GuiConfig, WindowGeometry},
     i18n::Tr,
     menu::MenuBar,
     platform,
+    render::SharedRender,
     ui::main_view::{MainView, ViewEnv, ViewOutput},
-    window::{OsWindow, main_window_attributes},
+    window::{
+        ADD_DIALOG_MIN_SIZE, ADD_DIALOG_SIZE, OsWindow, PxRect, centered_on, dialog_attributes,
+        dialog_size, main_window_attributes, overlaps_any,
+    },
 };
 use ggg::{
     app::bootstrap::Core,
     download::task::DownloadTask,
     ui::queue_ops::{MAX_UNDO_BATCHES, open_in_file_manager},
 };
-use std::time::Instant;
+use std::{collections::HashMap, path::PathBuf, time::Instant};
 use tokio::runtime::Handle;
 use winit::{
     application::ApplicationHandler,
+    dpi::{LogicalSize, PhysicalPosition},
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     window::{Theme, WindowId},
 };
+
+/// Windows the app opens on top of the main one. Each is OS-modal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModalKind {
+    AddDownloads,
+}
+
+/// The OS-modal window that is open now. The main window is disabled until it
+/// closes, so there is at most one.
+struct OpenModal {
+    id: WindowId,
+    kind: ModalKind,
+    /// Main window handle that was disabled; `None` where there is no such call.
+    owner: Option<isize>,
+}
+
+/// How a dialog frame ended.
+enum DialogOutcome {
+    Keep,
+    Accept,
+    Cancel,
+}
 
 pub struct GuiApp {
     proxy: EventLoopProxy<UserEvent>,
@@ -45,7 +72,15 @@ pub struct GuiApp {
     /// Delete batches, newest last, for undo.
     undo: Vec<Vec<DownloadTask>>,
     view: MainView,
-    main: Option<OsWindow>,
+    /// Every open OS window, the main one included.
+    windows: HashMap<WindowId, OsWindow>,
+    main_id: Option<WindowId>,
+    modal: Option<OpenModal>,
+    /// Set by a command; the window is created from the event loop callback.
+    open_request: Option<ModalKind>,
+    shared: SharedRender,
+    /// Where `gui_config` is written when a dialog closes; `None` disables it.
+    gui_config_path: Option<PathBuf>,
     /// `None` when the platform has no native menu or building it failed.
     menu: Option<MenuBar>,
     /// Set by the Exit command; the loop is left once the frame is done.
@@ -90,11 +125,27 @@ impl GuiApp {
             status: None,
             undo: Vec::new(),
             view: MainView::default(),
-            main: None,
+            windows: HashMap::new(),
+            main_id: None,
+            modal: None,
+            open_request: None,
+            shared: SharedRender::new(),
+            gui_config_path: None,
             menu: None,
             exit_requested: false,
             repaint_at: None,
         }
+    }
+
+    /// Makes dialogs write `gui_config` to `path` when they close, so their
+    /// geometry survives a crash.
+    pub fn with_gui_config_path(mut self, path: Option<PathBuf>) -> Self {
+        self.gui_config_path = path;
+        self
+    }
+
+    fn main_window(&self) -> Option<&OsWindow> {
+        self.main_id.and_then(|id| self.windows.get(&id))
     }
 
     /// Current GUI state, written to disk by the caller once the loop ends.
@@ -127,19 +178,20 @@ impl GuiApp {
         let status = self.status.clone();
         let env = ViewEnv {
             undo_depth: self.undo.len(),
-            os_modal_open: false,
+            os_modal_open: self.modal.is_some(),
         };
         // Read once per frame; the borrow must not outlive this statement.
         let snapshot = self.snapshot.rx.borrow().clone();
         let Self {
-            main,
+            windows,
+            main_id,
             view,
             tr,
             gui_config,
             menu,
             ..
         } = self;
-        let Some(main) = main.as_mut() else {
+        let Some(main) = main_id.and_then(|id| windows.get_mut(&id)) else {
             return;
         };
         let mut output = ViewOutput::default();
@@ -160,6 +212,11 @@ impl GuiApp {
     /// Runs a command from a menu, shortcut or context menu. Commands that
     /// are not enabled right now are dropped.
     pub fn run_command(&mut self, cmd: GuiCommand) {
+        // The view learns about a new dialog only on its next frame, so a
+        // command queued in between has to be refused here.
+        if self.modal.is_some() {
+            return;
+        }
         let snapshot = self.snapshot.rx.borrow().clone();
         // Enabled state is checked again here: an earlier command of the same
         // batch may have opened a dialog.
@@ -191,8 +248,8 @@ impl GuiApp {
                     .filter_map(|id| find_task(&snapshot, id))
                     .map(|task| task.url.as_str())
                     .collect();
-                if let Some(main) = &self.main {
-                    main.ctx.copy_text(urls.join("\n"));
+                if let Some(main) = self.main_window() {
+                    main.ctx().copy_text(urls.join("\n"));
                     // The copy is delivered with the next frame's output.
                     main.window.request_redraw();
                 }
@@ -224,9 +281,9 @@ impl GuiApp {
             }
             GuiCommand::Refresh => self.snapshot.refresh.notify_one(),
             GuiCommand::Exit => self.exit_requested = true,
+            GuiCommand::NewDownload => self.open_request = Some(ModalKind::AddDownloads),
             // The dialogs and windows behind these do not exist yet.
-            GuiCommand::NewDownload
-            | GuiCommand::PasteUrls
+            GuiCommand::PasteUrls
             | GuiCommand::PasteUrlsDirect
             | GuiCommand::OpenSettings
             | GuiCommand::FolderSettings => {
@@ -258,15 +315,232 @@ fn attach_menu(menu: &MenuBar, window: &mut OsWindow, hwnd: isize, dark: bool) {
     window.resize(window.window.inner_size());
 }
 
+/// Monitors as physical px rectangles.
+fn monitor_rects(event_loop: &ActiveEventLoop) -> Vec<PxRect> {
+    event_loop
+        .available_monitors()
+        .map(|m| {
+            let (pos, size) = (m.position(), m.size());
+            (pos.x, pos.y, size.width, size.height)
+        })
+        .collect()
+}
+
+/// Placeholder content of the Add Downloads window.
+fn add_dialog_ui(ui: &mut egui::Ui, tr: &Tr) -> DialogOutcome {
+    let mut outcome = DialogOutcome::Keep;
+    // A focused button owns Enter (egui activates it), so the default answer
+    // applies only while nothing has focus.
+    let (esc, enter) = ui.ctx().input_mut(|input| {
+        (
+            input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+        )
+    });
+    let nothing_focused = ui.ctx().memory(|m| m.focused().is_none());
+    egui::Panel::bottom("add_dialog_buttons").show(ui, |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(tr.t("gui-button-cancel")).clicked() {
+                outcome = DialogOutcome::Cancel;
+            }
+            if ui.button(tr.t("gui-button-ok")).clicked() {
+                outcome = DialogOutcome::Accept;
+            }
+        });
+    });
+    egui::CentralPanel::default().show(ui, |_ui| {});
+    if esc {
+        outcome = DialogOutcome::Cancel;
+    } else if enter && nothing_focused {
+        outcome = DialogOutcome::Accept;
+    }
+    outcome
+}
+
+impl GuiApp {
+    /// Opens `kind` if no OS-modal window is open. The window is owned by the
+    /// main window, which is disabled until the dialog closes.
+    fn open_modal(&mut self, event_loop: &ActiveEventLoop, kind: ModalKind) {
+        if self.modal.is_some() {
+            return;
+        }
+        let Some(main) = self.main_window() else {
+            return;
+        };
+        let owner = platform::hwnd(&main.window);
+        let scale = main.window.scale_factor();
+
+        let (title, default_size, min_size, saved) = match kind {
+            ModalKind::AddDownloads => (
+                self.tr.t("gui-add-title"),
+                ADD_DIALOG_SIZE,
+                ADD_DIALOG_MIN_SIZE,
+                self.gui_config.add_dialog,
+            ),
+        };
+        let min = LogicalSize::new(min_size.0, min_size.1);
+        let monitors = monitor_rects(event_loop);
+        let saved = saved.filter(|g| {
+            let px = |logical: u32| (f64::from(logical) * scale) as u32;
+            overlaps_any((g.x, g.y, px(g.width), px(g.height)), &monitors)
+        });
+        let size = dialog_size(saved, default_size, min_size);
+
+        let mut attributes = dialog_attributes(&title, size, min);
+        if let Some(owner) = owner {
+            attributes = platform::owned_by(attributes, owner);
+        }
+        // The main window's outer rectangle, for centring.
+        let main_outer = main.window.outer_position().ok().map(|pos| {
+            let outer = main.window.outer_size();
+            (pos.x, pos.y, outer.width, outer.height)
+        });
+        // Creating the window near the main window's centre keeps its scale
+        // factor right from the first frame; the decorations are unknown yet.
+        let start = saved.map(|g| (g.x, g.y)).or_else(|| {
+            main_outer.map(|outer| {
+                centered_on(
+                    outer,
+                    ((size.width * scale) as u32, (size.height * scale) as u32),
+                )
+            })
+        });
+        if let Some((x, y)) = start {
+            attributes = attributes.with_position(PhysicalPosition::new(x, y));
+        }
+
+        let dialog = match OsWindow::new(event_loop, attributes, &mut self.shared, self.proxy.clone())
+        {
+            Ok(dialog) => dialog,
+            Err(e) => {
+                tracing::error!("Failed to open the {kind:?} window: {e:#}");
+                return;
+            }
+        };
+        if saved.is_none() {
+            // The decorations are known only now, so refine the estimate.
+            if let Some(outer) = main_outer {
+                let own = dialog.window.outer_size();
+                let (x, y) = centered_on(outer, (own.width, own.height));
+                dialog.window.set_outer_position(PhysicalPosition::new(x, y));
+            }
+        }
+
+        // Disabling comes after every fallible step, so a failed open never
+        // leaves the main window unusable.
+        if let Some(owner) = owner {
+            platform::set_enabled(owner, false);
+        }
+        dialog.window.set_visible(true);
+        dialog.window.focus_window();
+        dialog.window.request_redraw();
+
+        let id = dialog.window.id();
+        self.windows.insert(id, dialog);
+        self.modal = Some(OpenModal { id, kind, owner });
+        tracing::info!("opened {kind:?} window; main window disabled={}", owner.is_some());
+        // The main window now shows its commands as disabled.
+        if let Some(main) = self.main_window() {
+            main.window.request_redraw();
+        }
+    }
+
+    /// Closes the OS-modal window `id`: remembers its geometry, enables the
+    /// main window again and only then destroys the dialog, so Windows
+    /// activates the main window instead of another application.
+    fn close_modal(&mut self, id: WindowId) {
+        let Some(modal) = self.modal.take_if(|m| m.id == id) else {
+            return;
+        };
+        if let Some(dialog) = self.windows.get(&id) {
+            let geometry = window_geometry(&dialog.window);
+            match modal.kind {
+                ModalKind::AddDownloads => {
+                    self.gui_config.add_dialog = geometry.or(self.gui_config.add_dialog);
+                }
+            }
+        }
+        if let Some(owner) = modal.owner {
+            platform::set_enabled(owner, true);
+        }
+        // Dropping the whole window releases the last handle to the native one.
+        self.windows.remove(&id);
+        tracing::info!("closed {:?} window; main window enabled again", modal.kind);
+        if let Some(main) = self.main_window() {
+            main.window.focus_window();
+            main.window.request_redraw();
+        }
+        self.save_gui_config();
+    }
+
+    fn save_gui_config(&self) {
+        let Some(path) = &self.gui_config_path else {
+            return;
+        };
+        if let Err(e) = self.gui_config.save_to(path) {
+            tracing::warn!("Failed to save GUI state: {e:#}");
+        }
+    }
+
+    fn draw_dialog(&mut self, id: WindowId) {
+        let Some(kind) = self.modal.as_ref().filter(|m| m.id == id).map(|m| m.kind) else {
+            return;
+        };
+        let Some(dialog) = self.windows.get_mut(&id) else {
+            return;
+        };
+        let mut outcome = DialogOutcome::Keep;
+        let tr = &self.tr;
+        dialog.redraw(|ui| match kind {
+            ModalKind::AddDownloads => outcome = add_dialog_ui(ui, tr),
+        });
+        match outcome {
+            DialogOutcome::Keep => {}
+            // The real dialog will hand its input to the caller here.
+            DialogOutcome::Accept | DialogOutcome::Cancel => self.close_modal(id),
+        }
+    }
+
+    /// Runs what commands asked for while they had no event loop at hand.
+    fn apply_requests(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(kind) = self.open_request.take() {
+            self.open_modal(event_loop, kind);
+        }
+        if self.exit_requested {
+            event_loop.exit();
+        }
+    }
+
+    fn request_redraw_all(&self) {
+        for window in self.windows.values() {
+            window.window.request_redraw();
+        }
+    }
+}
+
+/// Outer position in physical px and inner size in logical px.
+fn window_geometry(window: &winit::window::Window) -> Option<WindowGeometry> {
+    let pos = window.outer_position().ok()?;
+    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    Some(WindowGeometry {
+        x: pos.x,
+        y: pos.y,
+        width: size.width.round() as u32,
+        height: size.height.round() as u32,
+        maximized: false,
+    })
+}
+
 impl ApplicationHandler<UserEvent> for GuiApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // `resumed` can fire again on some platforms; keep the existing window.
-        if self.main.is_some() {
+        if self.main_id.is_some() {
             return;
         }
         match OsWindow::new(
             event_loop,
             main_window_attributes(&self.tr.t("gui-app-title")),
+            &mut self.shared,
             self.proxy.clone(),
         ) {
             Ok(mut window) => {
@@ -278,7 +552,9 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                     attach_menu(menu, &mut window, hwnd, dark);
                 }
                 window.window.request_redraw();
-                self.main = Some(window);
+                let id = window.window.id();
+                self.windows.insert(id, window);
+                self.main_id = Some(id);
             }
             Err(e) => {
                 tracing::error!("Failed to create the main window: {e:#}");
@@ -288,51 +564,85 @@ impl ApplicationHandler<UserEvent> for GuiApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let Some(main) = self.main.as_mut().filter(|w| w.window.id() == id) else {
+        if self.modal.as_ref().is_some_and(|m| m.id == id) {
+            match &event {
+                WindowEvent::CloseRequested => {
+                    self.close_modal(id);
+                    return;
+                }
+                WindowEvent::RedrawRequested => {
+                    self.draw_dialog(id);
+                    return;
+                }
+                WindowEvent::Resized(size) => {
+                    if let Some(dialog) = self.windows.get_mut(&id) {
+                        dialog.resize(*size);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(dialog) = self.windows.get_mut(&id) {
+                if dialog.on_window_event(&event) {
+                    dialog.window.request_redraw();
+                }
+            }
             return;
-        };
+        }
+        if self.main_id != Some(id) {
+            return;
+        }
 
         match &event {
             WindowEvent::CloseRequested => {
+                if let Some(modal) = self.modal.as_ref().map(|m| m.id) {
+                    self.close_modal(modal);
+                }
                 event_loop.exit();
                 return;
             }
-            WindowEvent::Resized(size) => main.resize(*size),
+            WindowEvent::Resized(size) => {
+                if let Some(main) = self.windows.get_mut(&id) {
+                    main.resize(*size);
+                }
+            }
             WindowEvent::ThemeChanged(theme) => {
-                if let (Some(menu), Some(hwnd)) = (&self.menu, platform::hwnd(&main.window)) {
+                if let (Some(menu), Some(hwnd)) = (
+                    &self.menu,
+                    self.main_window().and_then(|w| platform::hwnd(&w.window)),
+                ) {
                     menu.set_dark(hwnd, *theme == Theme::Dark);
                 }
             }
             WindowEvent::RedrawRequested => {
                 self.draw_main();
-                if self.exit_requested {
-                    event_loop.exit();
-                }
+                self.apply_requests(event_loop);
                 return;
             }
             _ => {}
         }
 
-        if main.on_window_event(&event) {
-            main.window.request_redraw();
+        if let Some(main) = self.windows.get_mut(&id) {
+            if main.on_window_event(&event) {
+                main.window.request_redraw();
+            }
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Repaint { window, delay } => {
-                let Some(main) = self.main.as_ref().filter(|w| w.window.id() == window) else {
+                let Some(target) = self.windows.get(&window) else {
                     return;
                 };
                 if delay.is_zero() {
-                    main.window.request_redraw();
+                    target.window.request_redraw();
                 } else {
                     let at = Instant::now() + delay;
                     self.repaint_at = Some(self.repaint_at.map_or(at, |old| old.min(at)));
                 }
             }
             UserEvent::Snapshot | UserEvent::ActionDone => {
-                if let Some(main) = &self.main {
+                if let Some(main) = self.main_window() {
                     main.window.request_redraw();
                 }
             }
@@ -348,7 +658,8 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 };
                 tracing::info!("menu command {cmd:?} shift={shift}");
                 self.run_command(cmd);
-                if let Some(main) = &self.main {
+                self.apply_requests(event_loop);
+                if let Some(main) = self.main_window() {
                     main.window.request_redraw();
                 }
             }
@@ -359,13 +670,68 @@ impl ApplicationHandler<UserEvent> for GuiApp {
         match self.repaint_at {
             Some(at) if at <= Instant::now() => {
                 self.repaint_at = None;
-                if let Some(main) = &self.main {
-                    main.window.request_redraw();
-                }
+                // The request does not say which window asked.
+                self.request_redraw_all();
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui_kittest::{Harness, kittest::Queryable};
+    use std::{cell::Cell, rc::Rc};
+
+    fn dialog() -> (Harness<'static, ()>, Rc<Cell<u8>>) {
+        // 0 = still open, 1 = accepted, 2 = cancelled.
+        let state = Rc::new(Cell::new(0u8));
+        let tr = Tr::load("en-US");
+        let out = state.clone();
+        let harness = Harness::builder()
+            .with_size(egui::vec2(400.0, 300.0))
+            .build_ui(move |ui| match add_dialog_ui(ui, &tr) {
+                DialogOutcome::Keep => {}
+                DialogOutcome::Accept => out.set(1),
+                DialogOutcome::Cancel => out.set(2),
+            });
+        (harness, state)
+    }
+
+    #[test]
+    fn ok_button_accepts() {
+        let (mut harness, state) = dialog();
+        harness.run();
+        assert_eq!(state.get(), 0);
+        harness.get_by_label("OK").click();
+        harness.run();
+        assert_eq!(state.get(), 1);
+    }
+
+    #[test]
+    fn cancel_button_and_esc_cancel() {
+        let (mut harness, state) = dialog();
+        harness.run();
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        assert_eq!(state.get(), 2);
+
+        let (mut harness, state) = dialog();
+        harness.run();
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert_eq!(state.get(), 2);
+    }
+
+    #[test]
+    fn enter_accepts_only_while_nothing_has_focus() {
+        let (mut harness, state) = dialog();
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+        assert_eq!(state.get(), 1);
     }
 }

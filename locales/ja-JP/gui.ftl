@@ -58,6 +58,9 @@ gui-button-delete = 削除
 gui-button-move = 移動
 gui-button-close = 閉じる
 
+# Add Downloads dialog
+gui-add-title = ダウンロードの追加
+
 # Confirmations
 gui-confirm-title = 削除の確認
 gui-confirm-delete-folder = 「{ $name }」の { $count } 件のダウンロードをすべて削除しますか？
