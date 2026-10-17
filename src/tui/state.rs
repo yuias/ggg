@@ -2,6 +2,7 @@ use super::item_editor::ItemEditorState;
 use crate::app::state::AppState;
 use crate::download::manager::DownloadManager;
 use crate::download::task::DownloadTask;
+use crate::ui::queue_view::{QueueView, view_rows};
 use crate::util::i18n::LocalizationManager;
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
@@ -812,28 +813,15 @@ impl TuiState {
     /// - For folder nodes: returns tasks from that folder directly (no filtering)
     /// - For completed node: returns history items with optional search filter
     pub fn current_downloads(&self) -> Vec<&DownloadTask> {
-        if self.is_viewing_completed_node() {
-            // History view with search; lowercase the query once, not per item.
-            if self.search_query.is_empty() {
-                return self.history_items.iter().collect();
-            }
-            let query = self.search_query.to_lowercase();
-            self.history_items
-                .iter()
-                .filter(|task| task.filename.to_lowercase().contains(&query))
-                .collect()
+        let view = if self.is_viewing_completed_node() {
+            QueueView::History
         } else {
-            // Direct folder access - no filtering needed
             match self.selected_folder_id_from_tree() {
-                Some(folder_id) => {
-                    self.folder_downloads
-                        .get(folder_id)
-                        .map(|tasks| tasks.iter().collect())
-                        .unwrap_or_default()
-                }
-                None => Vec::new(),
+                Some(folder_id) => QueueView::Folder(folder_id.to_string()),
+                None => return Vec::new(),
             }
-        }
+        };
+        view_rows(&self.folder_downloads, &self.history_items, &view, &self.search_query)
     }
 
     /// Backwards compatibility alias for filtered_downloads
