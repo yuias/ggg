@@ -3,3 +3,5 @@
 pub mod details;
 pub mod main_view;
 pub mod queue_table;
+pub mod selection;
+pub mod sort;
