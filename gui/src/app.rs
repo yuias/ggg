@@ -79,9 +79,9 @@ pub struct GuiApp {
     #[allow(dead_code)]
     core: Core,
     snapshot: SnapshotHandle,
-    /// Pipe that ggg-dnd and the bridge send links to; set once at start-up.
-    /// `None` where there is no pipe server.
-    pipe_name: Option<String>,
+    /// Pipe that ggg-dnd and the bridge send links to. `None` where there is
+    /// no pipe server.
+    shared_pipe: Option<SharedPipe>,
     actions: Actions,
     results: ActionResults,
     /// Text for the status bar; replaced by each finished action.
@@ -146,7 +146,7 @@ impl GuiApp {
                 let _ = action_proxy.send_event(UserEvent::ActionDone);
             },
         );
-        let pipe_name = start_ipc(&rt, &proxy, ipc);
+        let shared_pipe = start_ipc(&rt, &proxy, ipc);
         Self {
             proxy,
             tr,
@@ -154,7 +154,7 @@ impl GuiApp {
             rt,
             core,
             snapshot,
-            pipe_name,
+            shared_pipe,
             actions,
             results,
             status: None,
@@ -260,7 +260,7 @@ impl GuiApp {
     fn draw_main(&mut self) {
         self.drain_results();
         let status = self.status.clone();
-        let pipe_name = self.pipe_name.clone();
+        let pipe_name = self.shared_pipe.as_ref().map(|pipe| pipe.name().to_string());
         let env = ViewEnv {
             undo_depth: self.undo.len(),
             os_modal_open: self.modal.is_some(),
@@ -464,22 +464,81 @@ impl GuiApp {
     }
 }
 
-/// Starts the pipe server for the browser bridge and returns the pipe name it
-/// bound. Links arrive as `UserEvent::IpcText`, so nothing here blocks the
-/// event loop.
+/// The link pipe server: where ggg-dnd and the bridge send links.
 #[cfg(windows)]
-fn start_ipc(rt: &Handle, proxy: &EventLoopProxy<UserEvent>, ipc: GuiIpc) -> Option<String> {
+struct SharedPipe {
+    name: String,
+    /// Whether `name` is the default one. When it is not, another process
+    /// held the default when this one started.
+    holds_default: bool,
+    server: tokio::task::JoinHandle<()>,
+    tx: tokio::sync::mpsc::Sender<ggg::ipc::pipe_server::IpcEvent>,
+}
+
+#[cfg(windows)]
+impl SharedPipe {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Moves from the fallback name to the default one once its previous
+    /// owner is gone. Returns whether the name changed.
+    fn reclaim_default(&mut self, rt: &Handle) -> bool {
+        use ggg::ipc::pipe_server::{claim_pipe, serve_pipe};
+
+        if self.holds_default {
+            return false;
+        }
+        let default_name = ggg_ipc::default_pipe_name();
+        // Claiming and serving need the runtime context.
+        let _enter = rt.enter();
+        match claim_pipe(&default_name) {
+            Ok(claimed) => {
+                let server = serve_pipe(claimed, self.tx.clone());
+                std::mem::replace(&mut self.server, server).abort();
+                self.name = default_name;
+                self.holds_default = true;
+                tracing::info!("reclaimed shared pipe {}", self.name);
+                true
+            }
+            Err(e) => {
+                tracing::debug!("shared pipe {default_name} is still taken: {e}");
+                false
+            }
+        }
+    }
+}
+
+/// No pipe server exists off Windows, so there is nothing to describe.
+#[cfg(not(windows))]
+enum SharedPipe {}
+
+#[cfg(not(windows))]
+impl SharedPipe {
+    fn name(&self) -> &str {
+        match *self {}
+    }
+
+    fn reclaim_default(&mut self, _rt: &Handle) -> bool {
+        match *self {}
+    }
+}
+
+/// Starts the pipe server for the browser bridge. Links arrive as
+/// `UserEvent::IpcText`, so nothing here blocks the event loop.
+#[cfg(windows)]
+fn start_ipc(rt: &Handle, proxy: &EventLoopProxy<UserEvent>, ipc: GuiIpc) -> Option<SharedPipe> {
     use ggg::ipc::pipe_server::{IpcEvent, start_pipe_server};
 
     // The channel also carries what the instance pipe receives.
     let GuiIpc { tx: event_tx, rx: mut event_rx } = ipc;
     // `start_pipe_server` spawns its accept loop and needs the runtime context.
-    let pipe_name = {
+    let (name, server) = {
         let _enter = rt.enter();
-        let (pipe_name, _server) = start_pipe_server(event_tx);
-        pipe_name
+        start_pipe_server(event_tx.clone())
     };
-    tracing::info!("IPC pipe server started: {pipe_name}");
+    tracing::info!("IPC pipe server started: {name}");
+    let holds_default = name == ggg_ipc::default_pipe_name();
 
     let proxy = proxy.clone();
     rt.spawn(async move {
@@ -497,11 +556,11 @@ fn start_ipc(rt: &Handle, proxy: &EventLoopProxy<UserEvent>, ipc: GuiIpc) -> Opt
 
     // ggg-dnd is not launched here: it only exists because the TUI cannot
     // take drops, and this window has its own drop target.
-    Some(pipe_name)
+    Some(SharedPipe { name, holds_default, server, tx: event_tx })
 }
 
 #[cfg(not(windows))]
-fn start_ipc(_rt: &Handle, _proxy: &EventLoopProxy<UserEvent>, _ipc: GuiIpc) -> Option<String> {
+fn start_ipc(_rt: &Handle, _proxy: &EventLoopProxy<UserEvent>, _ipc: GuiIpc) -> Option<SharedPipe> {
     None
 }
 
@@ -1084,6 +1143,15 @@ impl ApplicationHandler<UserEvent> for GuiApp {
                 );
                 if !urls.is_empty() {
                     self.receive_ipc_text(event_loop, &urls.join("\n"));
+                }
+                // A GUI that started while the TUI held the default name sits
+                // on the fallback. The bridge starts a second GUI when no one
+                // serves the default name, and that start ends up here.
+                if let Some(pipe) = self.shared_pipe.as_mut()
+                    && pipe.reclaim_default(&self.rt)
+                {
+                    // The status bar tooltip names the pipe.
+                    self.request_redraw_all();
                 }
             }
             UserEvent::Menu { id, shift } => {

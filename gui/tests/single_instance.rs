@@ -156,3 +156,46 @@ fn different_config_dirs_run_side_by_side() {
     assert!(a.running() && b.running(), "both instances must keep running");
     assert_ne!(a.id(), b.id());
 }
+
+#[test]
+fn activation_reclaims_free_shared_pipe() {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let tmp = temp_config();
+    let config: PathBuf = tmp.path().to_path_buf();
+    let shared = unique_pipe();
+
+    // Holds the shared name first, so the primary has to fall back to a
+    // per-process name. Pipe creation needs a reactor context.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    let held = {
+        let _enter = rt.enter();
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&shared)
+            .expect("claim the shared pipe name")
+    };
+
+    let mut primary = Gui::spawn(&config, &shared, &[]);
+    wait_for_instance_pipe(&mut primary, &config);
+    // Proves the fallback path was taken, not a lucky reclaim later.
+    wait_for_log(&config, "using fallback", Duration::from_secs(10));
+
+    // The previous owner goes away; the next activation takes the name over.
+    drop(held);
+    let mut second = Gui::spawn(&config, &shared, &[]);
+    let status = second
+        .wait_exit(Duration::from_secs(15))
+        .expect("second ggg-gui did not exit within 15 s");
+    assert!(status.success(), "second ggg-gui exit status: {status:?}");
+
+    let primary_pid = primary.id();
+    let reclaimed = wait_until(Duration::from_secs(10), || {
+        ggg_ipc::server_process_id(&shared).is_ok_and(|pid| pid == primary_pid)
+    });
+    assert!(reclaimed, "the primary did not take over {shared}");
+    wait_for_log(&config, "reclaimed shared pipe", Duration::from_secs(10));
+}
