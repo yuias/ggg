@@ -8,6 +8,7 @@ mod gui_config;
 mod i18n;
 mod menu;
 mod platform;
+mod registration;
 mod shortcuts;
 mod ui;
 mod window;
