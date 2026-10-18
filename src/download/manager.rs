@@ -177,6 +177,10 @@ struct ClaimSet {
 const CLAIM_WAIT_BUDGET: std::time::Duration =
     std::time::Duration::from_millis(crate::app::config::DEFAULT_CLAIM_WAIT_MS);
 
+/// Start of the task log line written when the active folder limit rejects a
+/// start; also used to avoid writing that line twice in a row.
+const FOLDER_LIMIT_LOG_PREFIX: &str = "Not started: active folder limit reached";
+
 #[derive(Clone)]
 pub struct DownloadManager {
     /// Per-folder download queues
@@ -539,10 +543,30 @@ impl DownloadManager {
         // Try to activate folder (check active folder limit)
         let folder_id = task.folder_id.clone();
         if !self.try_activate_folder(&folder_id).await {
+            let active_count = self.active_folders.read().await.len();
+            // The rejection is otherwise visible only in the app log, so a task
+            // that stays Pending looks stuck. Log it once on the task itself;
+            // repeated start attempts would only add identical lines.
+            if let Some(queue) = self.get_folder_queue(&folder_id).await {
+                let limit = self.parallel_folder_count;
+                queue
+                    .modify(id, |t| {
+                        let already_logged = t
+                            .logs
+                            .last()
+                            .is_some_and(|e| e.message.starts_with(FOLDER_LIMIT_LOG_PREFIX));
+                        if !already_logged {
+                            t.log_info(format!(
+                                "{FOLDER_LIMIT_LOG_PREFIX} ({active_count}/{limit}). Will start when another folder finishes (auto-start) or when started again."
+                            ));
+                        }
+                    })
+                    .await;
+            }
             return Err(anyhow::anyhow!(
                 "Cannot start download: folder '{}' cannot be activated ({} folders already active, max active folders: {})",
                 folder_id,
-                self.active_folders.read().await.len(),
+                active_count,
                 self.parallel_folder_count
             ));
         }
@@ -2894,6 +2918,32 @@ mod tests {
             manager.try_activate_folder("folder2").await,
             "destination folder must be activatable after the move"
         );
+    }
+
+    #[tokio::test]
+    async fn start_rejected_by_folder_limit_logs_once_on_task() {
+        let manager = DownloadManager::with_config(3, 3, 1, 3, 5);
+        assert!(manager.try_activate_folder("folder1").await);
+
+        let mut task = DownloadTask::new("https://example.com/a.bin".to_string(), "/tmp".into());
+        task.folder_id = "folder2".to_string();
+        let id = task.id;
+        manager.add_download(task).await;
+
+        let config = Arc::new(tokio::sync::RwLock::new(Config::default()));
+        for _ in 0..2 {
+            assert!(manager.start_download(id, None, config.clone()).await.is_err());
+        }
+
+        let task = manager.get_by_id(id).await.expect("task still exists");
+        assert_eq!(task.status, DownloadStatus::Pending);
+        let limit_lines: Vec<_> = task
+            .logs
+            .iter()
+            .filter(|e| e.message.starts_with(FOLDER_LIMIT_LOG_PREFIX))
+            .collect();
+        assert_eq!(limit_lines.len(), 1, "repeated rejections must not repeat the line");
+        assert!(limit_lines[0].message.contains("(1/1)"));
     }
 
     #[tokio::test]
