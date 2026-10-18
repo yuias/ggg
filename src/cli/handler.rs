@@ -193,14 +193,7 @@ pub(crate) fn parse_task_id(id_str: &str) -> Result<Uuid> {
     Uuid::parse_str(id_str).map_err(|_| anyhow::anyhow!("Invalid UUID format"))
 }
 
-/// Validate a download URL: must parse and use a scheme the HTTP client
-/// supports. Mirrors the TUI's `is_valid_download_url`.
-pub(crate) fn is_valid_download_url(text: &str) -> bool {
-    match url::Url::parse(text) {
-        Ok(parsed) => matches!(parsed.scheme(), "http" | "https" | "ftp" | "ftps"),
-        Err(_) => false,
-    }
-}
+pub(crate) use crate::util::url_input::is_valid_download_url;
 
 /// List all downloads, applying the same status/folder filters and header
 /// redaction whether or not a daemon is routing this request (see

@@ -12,7 +12,7 @@ Sends URLs from the browser to ggg via the right-click context menu.
 |------------------|-------------------------------------------------------|
 | `background.js`  | MV3 service worker. Registers menu items, sends `add_url` to the native host. |
 | `manifest.json`  | Extension manifest (Manifest V3).                     |
-| `ggg-bridge.exe` | Native Messaging host. Translates stdio frames to `\\.\pipe\ggg-dnd`. |
+| `ggg-bridge.exe` | Native Messaging host. Translates stdio frames to `\\.\pipe\ggg`. |
 | `ggg`            | TUI app. Accepts URLs on the named pipe.              |
 
 The native host name is **`com.ggg.bridge`** and must match the host
@@ -31,7 +31,17 @@ manifest installed by `ggg bridge install`.
      re-running install is fine).
    - This writes `%LOCALAPPDATA%\ggg\com.ggg.bridge.json` and a registry
      value at `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.ggg.bridge`.
-4. Start ggg. Right-click any link or page and pick "Add link to ggg".
+4. Right-click any link or page and pick "Add link to ggg". If ggg is not
+   running, the bridge starts the GUI (see below).
+
+## When ggg is not running
+
+If nothing serves the pipe, `ggg-bridge.exe` starts `ggg-gui.exe` from its own
+directory, waits up to 10 seconds for it to answer, then delivers the link. Put
+`ggg-gui.exe` next to `ggg-bridge.exe` for this to work; the bridge does not
+search `PATH` and starts the GUI on the default configuration directory. When
+`ggg-gui.exe` is missing or does not answer in time, the extension reports that
+ggg is not running. The TUI is never started this way.
 
 ## Uninstall
 

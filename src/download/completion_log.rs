@@ -144,6 +144,7 @@ mod tests {
             retry_count: 0,
             last_status_code: Some(200),
             filename_settled: false,
+            user_filename: None,
         };
 
         let entry = CompletedEntry::from(&task);
@@ -209,6 +210,7 @@ mod tests {
             retry_count: 0,
             last_status_code: Some(200),
             filename_settled: false,
+            user_filename: None,
         };
 
         // Should not panic (may fail if permissions issue)

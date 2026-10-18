@@ -29,19 +29,26 @@ fn hashed_pipe_name(normalized: &str) -> String {
     format!("{CONTROL_PIPE_PREFIX}{:016x}", fnv1a64(normalized))
 }
 
-/// `CONTROL_PIPE_PREFIX` + 16 lowercase hex chars of FNV-1a 64 over the
-/// config dir string (made absolute with `std::path::absolute`, lowercased,
-/// trailing `\`/`/` trimmed). The env var, if set and non-empty, wins.
+/// 16 lowercase hex chars of FNV-1a 64 over the config dir string (made
+/// absolute with `std::path::absolute`, lowercased, trailing `\`/`/`
+/// trimmed). Shared by every per-config-dir pipe name so the same directory
+/// maps to the same key however it is spelled.
+pub fn config_dir_key(config_dir: &std::path::Path) -> String {
+    let absolute = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+    let normalized = absolute.to_string_lossy().to_lowercase();
+    let normalized = normalized.trim_end_matches(['\\', '/']);
+    format!("{:016x}", fnv1a64(normalized))
+}
+
+/// `CONTROL_PIPE_PREFIX` + [`config_dir_key`]. The env var, if set and
+/// non-empty, wins.
 pub fn control_pipe_name(config_dir: &std::path::Path) -> String {
     if let Ok(name) = std::env::var(CONTROL_PIPE_ENV) {
         if !name.is_empty() {
             return name;
         }
     }
-    let absolute = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
-    let normalized = absolute.to_string_lossy().to_lowercase();
-    let normalized = normalized.trim_end_matches(['\\', '/']);
-    hashed_pipe_name(normalized)
+    format!("{CONTROL_PIPE_PREFIX}{}", config_dir_key(config_dir))
 }
 
 /// `\\.\pipe\` (ASCII case-insensitive) + a non-empty name without `\`,
@@ -532,6 +539,17 @@ mod tests {
         let a = control_pipe_name(std::path::Path::new("./some/config/dir-a"));
         let b = control_pipe_name(std::path::Path::new("./some/config/dir-b"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    #[serial(control_pipe_env)]
+    fn control_pipe_name_is_prefix_plus_config_dir_key() {
+        unsafe { std::env::remove_var(CONTROL_PIPE_ENV) };
+        let dir = std::path::Path::new("./some/config/dir");
+        assert_eq!(
+            control_pipe_name(dir),
+            format!("{CONTROL_PIPE_PREFIX}{}", config_dir_key(dir))
+        );
     }
 
     #[test]

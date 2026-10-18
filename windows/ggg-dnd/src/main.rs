@@ -57,7 +57,7 @@ fn main() {
     // Determine pipe name from command-line args or use default
     let pipe_name = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| r"\\.\pipe\ggg-dnd".to_string());
+        .unwrap_or_else(ggg_ipc::default_pipe_name);
 
     let state = Arc::new(Mutex::new(AppState::new(pipe_name.clone())));
 

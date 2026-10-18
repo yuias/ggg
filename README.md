@@ -112,7 +112,7 @@ auto-launch (`ggg-dnd`) and `ggg bridge install` (`ggg-bridge`) look for them.
 ### Drag and drop (ggg-dnd)
 
 - The whole window is an OLE drop target: drag a URL from your browser onto it.
-- It talks to `ggg` over the Named Pipe `\\.\pipe\ggg-dnd`.
+- It talks to `ggg` over the Named Pipe `\\.\pipe\ggg`.
 - It can be auto-launched from `ggg` with the `Auto Launch ggg-dnd` setting.
 
 ### Chrome extension (ggg-bridge)
@@ -139,6 +139,42 @@ The extension itself must be removed manually from `chrome://extensions`.
 
 See [`windows/ggg-extension/README.md`](windows/ggg-extension/README.md) for
 extension details.
+
+#### Starting the GUI from the extension
+
+When nothing serves the link pipe, `ggg-bridge.exe` starts `ggg-gui.exe` and
+delivers the link once the GUI answers (it waits up to 10 seconds). The
+bridge looks only for `ggg-gui.exe` in its own directory, so keep the two files
+side by side. It starts the GUI without arguments, so the GUI uses the default
+configuration directory. If `ggg-gui.exe` is missing, or the GUI does not
+answer in time, the extension reports that ggg is not running. Nothing is
+started when a process already owns the pipe.
+
+### GUI instances (ggg-gui)
+
+```bash
+ggg-gui [--config DIR] [URL]...
+```
+
+Only one GUI runs per configuration directory. Starting `ggg-gui` again for the
+same directory brings the running window to the foreground (the Settings window
+if it is open), adds any URLs given on the command line, and exits with
+status 0. GUIs started with different `--config` directories run
+independently.
+
+The GUI and the TUI share the link pipe `\\.\pipe\ggg`, and the first one to
+start owns it. If the TUI owns it, a GUI that starts later listens on
+`\\.\pipe\ggg-<pid>` (shown in its status-bar tooltip), and the bridge keeps
+talking to the TUI. After the TUI quits, a GUI on such a fallback pipe takes
+over `\\.\pipe\ggg` the next time it is activated; a link sent from the
+extension triggers that, because the bridge then starts a second GUI that
+activates the first.
+
+Set `GGG_PIPE` to a pipe name of the form `\\.\pipe\<name>` to move the link
+pipe for every ggg program started with that variable, for example in tests
+or scripts that must not meet a running ggg. Values that are not of that form
+are ignored. Use it together with `--config` or `GGG_CONFIG_DIR` to keep such
+a run away from your real configuration.
 
 ### Internals
 
@@ -221,7 +257,7 @@ pwsh tools/build-release.ps1 -SkipBuild -OutputDir out
 
 ### Limitations
 
-- No GUI version (by design — TUI is the primary interface)
+- `ggg-gui` is Windows-only for now; it builds elsewhere but has no menu bar, drop target or link pipe there
 - Single-threaded downloads per file (chunk-based multi-connection acceleration not yet implemented)
 - `ggg-dnd` and `ggg-bridge` are Windows-only
 

@@ -14,3 +14,7 @@ path = "src/main.rs"
 ggg-ipc = { path = "../ggg-ipc" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3.8"
+uuid = { version = "1", features = ["v4"] }

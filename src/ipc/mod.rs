@@ -9,6 +9,9 @@ pub mod protocol {
 }
 
 #[cfg(windows)]
+pub mod dnd_launch;
+#[cfg(windows)]
 pub mod pipe_server;
 
 pub mod control;
+pub mod instance;

@@ -4,7 +4,7 @@ use crate::download::{manager::DownloadManager, task::DownloadTask};
 use serde::{Deserialize, Serialize};
 
 /// Commands that can be invoked from the TUI
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 pub enum Command {
     AddDownload { urls: Vec<String> },
@@ -47,6 +47,11 @@ pub enum Command {
     ToggleScriptFile { filename: String },
     ToggleFolderScriptFile { folder_id: String, filename: String },
     ReloadScripts,
+    /// Absolute counterpart of `ToggleScriptFile`, for draft-based editors.
+    SetScriptFileEnabled { filename: String, enabled: bool },
+    /// Absolute counterpart of `ToggleFolderScriptFile`. `None` removes the
+    /// folder override so the file inherits the application value.
+    SetFolderScriptFileOverride { folder_id: String, filename: String, value: Option<bool> },
 
     // Config management
     ReloadConfig,
@@ -57,7 +62,7 @@ pub enum Command {
 /// Variants carry machine-readable data rather than pre-translated strings, so
 /// the command layer stays free of any i18n / presentation dependency. The
 /// display layer is responsible for turning a `CommandError` into a localized,
-/// user-facing message (the TUI does this in `tui::localize_command_error`).
+/// user-facing message (`ui::command_i18n::localize_command_error` does this for every front end).
 /// The [`std::fmt::Display`] impl provides a plain-English fallback suitable for
 /// logging or for consumers without a translation catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -791,6 +796,67 @@ pub async fn handle_command(
             }
         }
 
+        Command::SetScriptFileEnabled { filename, enabled } => {
+            let result = commit_config_edit(&state, |config| {
+                config.scripts.script_files.insert(filename.clone(), enabled);
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({
+                        "status": "ok",
+                        "filename": filename,
+                        "enabled": enabled
+                    }),
+                },
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
+        Command::SetFolderScriptFileOverride { folder_id, filename, value } => {
+            let result = commit_config_edit(&state, |config| {
+                let folder_config = config
+                    .folders
+                    .get_mut(&folder_id)
+                    .ok_or_else(|| CommandError::FolderNotFound { folder: folder_id.clone() })?;
+
+                match value {
+                    Some(enabled) => {
+                        folder_config
+                            .script_files
+                            .get_or_insert_with(std::collections::HashMap::new)
+                            .insert(filename.clone(), enabled);
+                    }
+                    None => {
+                        if let Some(script_files) = folder_config.script_files.as_mut() {
+                            script_files.remove(&filename);
+                            // An empty map means "inherit everything", the same
+                            // state as no map.
+                            if script_files.is_empty() {
+                                folder_config.script_files = None;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .await;
+
+            match result {
+                Ok(()) => CommandResponse::Success {
+                    data: serde_json::json!({
+                        "status": "ok",
+                        "folder_id": folder_id,
+                        "filename": filename,
+                        "value": value
+                    }),
+                },
+                Err(e) => CommandResponse::Error(e),
+            }
+        }
+
         Command::ReloadScripts => {
             // Send reload message to script executor
             if let Some(ref script_sender) = state.script_sender {
@@ -902,6 +968,121 @@ mod tests {
 
         assert!(matches!(response, CommandResponse::Success { .. }));
         assert_eq!(manager.get_max_concurrent().await, 7);
+    }
+
+    /// Redirects config persistence to a temp directory for the lifetime of the
+    /// guard. `Config::save` deletes folder directories it does not know, so a
+    /// test that saves must never reach the real config. Resetting in `Drop`
+    /// also covers a failing assertion.
+    struct ConfigIsolation {
+        _dir: tempfile::TempDir,
+    }
+
+    impl ConfigIsolation {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            crate::util::paths::set_config_dir_override(Some(dir.path().to_path_buf()));
+            unsafe { std::env::set_var("GGG_TEST_MODE", "1") };
+            Self { _dir: dir }
+        }
+    }
+
+    impl Drop for ConfigIsolation {
+        fn drop(&mut self) {
+            crate::util::paths::set_config_dir_override(None);
+            unsafe { std::env::remove_var("GGG_TEST_MODE") };
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_script_file_enabled_persists() {
+        let _isolation = ConfigIsolation::new();
+        let state = state_with(Config::default());
+
+        let off = handle_command(
+            Command::SetScriptFileEnabled { filename: "a.js".to_string(), enabled: false },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(off, CommandResponse::Success { .. }), "got {off:?}");
+        assert_eq!(state.config.read().await.scripts.script_files.get("a.js"), Some(&false));
+        // Set absolutely, not toggled: repeating the command keeps the value.
+        let again = handle_command(
+            Command::SetScriptFileEnabled { filename: "a.js".to_string(), enabled: false },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(again, CommandResponse::Success { .. }), "got {again:?}");
+        assert_eq!(state.config.read().await.scripts.script_files.get("a.js"), Some(&false));
+
+        let on = handle_command(
+            Command::SetScriptFileEnabled { filename: "a.js".to_string(), enabled: true },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(on, CommandResponse::Success { .. }), "got {on:?}");
+        assert_eq!(state.config.read().await.scripts.script_files.get("a.js"), Some(&true));
+
+        // The value reached disk, not just memory.
+        let reloaded = Config::load().expect("config saved in the isolated directory loads");
+        assert_eq!(reloaded.scripts.script_files.get("a.js"), Some(&true));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_folder_script_override_none_removes_key() {
+        let _isolation = ConfigIsolation::new();
+        let mut config = Config::default();
+        config.folders.insert(
+            "folder-1".to_string(),
+            FolderConfig { name: "Downloads".to_string(), ..FolderConfig::default() },
+        );
+        let state = state_with(config);
+
+        let set = handle_command(
+            Command::SetFolderScriptFileOverride {
+                folder_id: "folder-1".to_string(),
+                filename: "a.js".to_string(),
+                value: Some(false),
+            },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(set, CommandResponse::Success { .. }), "got {set:?}");
+        assert_eq!(
+            state.config.read().await.folders["folder-1"].script_files.as_ref().and_then(|m| m.get("a.js")),
+            Some(&false)
+        );
+
+        let cleared = handle_command(
+            Command::SetFolderScriptFileOverride {
+                folder_id: "folder-1".to_string(),
+                filename: "a.js".to_string(),
+                value: None,
+            },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(cleared, CommandResponse::Success { .. }), "got {cleared:?}");
+        assert!(state.config.read().await.folders["folder-1"].script_files.is_none());
+
+        let missing = handle_command(
+            Command::SetFolderScriptFileOverride {
+                folder_id: "nope".to_string(),
+                filename: "a.js".to_string(),
+                value: None,
+            },
+            state.clone(),
+            DownloadManager::new(),
+        )
+        .await;
+        assert!(matches!(missing, CommandResponse::Error(CommandError::FolderNotFound { .. })), "got {missing:?}");
     }
 
     #[tokio::test]

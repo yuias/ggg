@@ -9,3 +9,6 @@ pub mod ui;
 pub mod util;
 
 pub use app::{config::Config, state::AppState};
+
+/// Product version, shown by front ends that have their own crate version.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
